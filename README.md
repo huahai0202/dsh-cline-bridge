@@ -1,24 +1,25 @@
 # opencode-free-bridge
 
-**OpenCode Zen 免费模型原生无感桥接器 — 专为 DeepSeek Harness (DSH) 打造。**
+**OpenCode Zen & Cline 渠道增强桥接器 — 专为 DeepSeek Harness (DSH) 打造。**
 
-无需 API Key，无需额外注册，不增加冗余提供商分组，直接激活 DSH 原生自带的 `opencode` 渠道。
+无需复杂代理，无需在 DSH 界面手动填写繁琐的客户端自定义头，直接赋能 DSH 原生 `opencode` 渠道及 `cline` 官方中转渠道。
 
 ---
 
 ## ✨ 特性
 
-- **原生渠道无感集成**：直接赋能 DSH 自带的 `opencode` 渠道，模型列表整洁，无需使用带第三方前缀的独立 Adapter。
-- **全套官方 CLI 协议特征注入**：
-  - 自动模拟官方 CLI User-Agent 与 Client 特征；
-  - 动态生成符合规范的 `X-Session-Id`、`x-opencode-session`、`x-session-affinity`，彻底解决 `MissingSessionID` 报错；
-  - 每轮请求自动生成唯一 `x-opencode-request` 与项目上下文标识。
-- **智能免密兜底**：
-  - 未配置 Key（或误填 URL）时，自动无感使用官方匿名通道（`Bearer public`）；
-  - 配置了个人真实 Key 时，自动保留并透传，无缝支持全量付费模型。
+- **多渠道官方协议特征自动注入**：
+  - **OpenCode Zen 渠道 (`opencode.ai/zen`)**：
+    - 自动模拟官方 CLI User-Agent 与 Client 特征；
+    - 动态生成符合规范的 `X-Session-Id`、`x-opencode-session`、`x-session-affinity`，彻底解决 `MissingSessionID` 报错；
+    - 每轮请求自动生成唯一 `x-opencode-request` 与上下文标识；
+    - 未配置 Key（或误填 URL）时自动使用官方匿名通道（`Bearer public`）。
+  - **Cline 渠道 (`api.cline.bot`)**：
+    - 自动注入完整的 Cline 官方客户端特征头（`user-agent: Cline/4.1.16`、`x-client-type: cline-vscode`、`x-platform: vscode`、`http-referer` 等）；
+    - 鉴权完全由用户在 DSH 设置中配置的 Key 决定，原生透传直通，不设代码层内置 Key 兜底。
 - **100% 流量精准隔离**：
-  - 仅在网络请求目标为 `opencode.ai/zen` 时介入；
-  - 对 DeepSeek 官方模型、OpenAI、Claude、Gemini 等其他渠道 100% 原样直通，零副作用。
+  - 仅在网络请求目标为 `opencode.ai/zen` 或 `api.cline.bot` 时介入；
+  - 对 DeepSeek 官方模型、OpenAI、Claude、Gemini 等其他所有渠道 100% 原样直通，零副作用。
 - **纯原生轻量中间件**：体积仅数 KB，基于 DSH Cordis 插件架构，支持热插拔与无残留卸载。
 
 ---
@@ -35,14 +36,15 @@ dsh plugin --profile web add github:huahai0202/opencode-free-bridge
 
 ## 🚀 使用说明
 
-1. **重启 DSH**：
-   ```bash
-   dsh web
-   ```
-2. **选择模型**：
-   在 DSH 网页界面的模型选择器中，直接进入原生 **`opencode`** 分组，选择可用模型（如 `MiMo V2.5 Free` 等）。
-3. **开始对话**：
-   无需在设置中填写任何 API Key，即可直接发送消息。
+### 1. OpenCode Zen
+- 重启 DSH：`dsh web`
+- 在模型选择器中直接进入 **`opencode`** 分组，无需填写 Key 即可畅享免费模型。
+
+### 2. Cline 渠道
+在 DSH 的 `settings.yaml` 中配置 `cline` 提供方（或在 DSH Web 设置中添加自定义提供方）：
+- Base URL: `https://api.cline.bot/api/v1`
+- 协议: `OpenAI Compatible` (`openai-completions`)
+- 请求头无需手动复制，插件会自动拦截补全全部官方认证头部。
 
 ---
 

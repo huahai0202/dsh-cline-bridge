@@ -13,7 +13,7 @@ export function apply(ctx) {
       url = input.url
     }
 
-    // 仅精准拦截目标为 OpenCode Zen 的所有请求（包括 /v1/models 和 /v1/chat/completions 等）
+    // 1. 目标为 OpenCode Zen 的所有请求（包括 /v1/models 和 /v1/chat/completions 等）
     if (url && url.includes('opencode.ai/zen')) {
       const headers = new Headers(init?.headers || (input instanceof Request ? input.headers : {}))
 
@@ -44,6 +44,28 @@ export function apply(ctx) {
       ) {
         headers.set('authorization', 'Bearer public')
       }
+
+      if (input instanceof Request) {
+        const newRequest = new Request(input, { ...init, headers })
+        return originalFetch.call(this, newRequest)
+      }
+
+      return originalFetch.call(this, input, { ...init, headers })
+    }
+
+    // 2. 目标为 Cline 官方中转 API (api.cline.bot) 的所有请求
+    if (url && url.includes('api.cline.bot')) {
+      const headers = new Headers(init?.headers || (input instanceof Request ? input.headers : {}))
+
+      // 仅注入 Cline 官方客户端协议特征头，鉴权密钥完全遵循用户在 DSH 的设置直通，不设内置兜底
+      headers.set('http-referer', 'https://cline.bot')
+      headers.set('x-title', 'Cline')
+      headers.set('user-agent', 'Cline/4.1.16')
+      headers.set('x-conversion-version', '4.1.16')
+      headers.set('x-platform-version', '1.106.0')
+      headers.set('x-client-version', '4.1.16')
+      headers.set('x-platform', 'vscode')
+      headers.set('x-client-type', 'cline-vscode')
 
       if (input instanceof Request) {
         const newRequest = new Request(input, { ...init, headers })
