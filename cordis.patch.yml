@@ -1,0 +1,4 @@
+- insert:
+    - id: opencode-free-bridge
+      name: 'opencode-free-bridge'
+      config: {}

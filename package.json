@@ -1,0 +1,26 @@
+{
+  "name": "opencode-free-bridge",
+  "version": "1.0.0",
+  "description": "OpenCode Zen Free Bridge for DeepSeek Harness (DSH): native channel enhancement, no API key needed.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/huahai0202/opencode-free-bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/huahai0202/opencode-free-bridge/issues"
+  },
+  "homepage": "https://github.com/huahai0202/opencode-free-bridge#readme",
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
