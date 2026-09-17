@@ -21,7 +21,7 @@ const root = join(here, '..')
 const CHECKS = [
   { name: 'zen-check', file: 'zen-check.mjs', what: 'Zen 头部形状、会话稳定性、渠道隔离' },
   { name: 'cline-key', file: 'cline-key-check.mjs', what: 'Cline 多 Key 轮换、粘性选 Key、冷却与持久化' },
-  { name: 'cline-panel', file: 'cline-panel-check.mjs', what: '设置面板：只读/导入路由契约 + 浏览器半边渲染' },
+  { name: 'cline-panel', file: 'cline-panel-check.mjs', what: '设置面板：只读/导入/重置路由契约 + 统计持久化 + 浏览器半边渲染' },
 ]
 
 const argv = process.argv.slice(2)

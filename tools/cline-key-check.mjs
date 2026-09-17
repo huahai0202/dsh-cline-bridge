@@ -454,6 +454,53 @@ const since = (n) => seen.slice(n)
   check('N3c 新增的 key 无需重启即可承接轮换', rg2.status === 200 && ag2.some((x) => x.key === 'z5'), attemptsText(ag2))
 }
 
+// ─ P. 用量统计跨重启：计数 / token / 粘性基准都从状态文件恢复 ─────
+// 这些数字过去只活在内存里，插件一更新（= DSH 重启）就全变 0。
+{
+  const statePath = join(TEST_STATE_DIR, `state-${++stateSeq}.json`)
+  rmSync(statePath, { force: true })
+  const config = { clineKeys: ['k1', 'k3', 'k2'], clineMatch: match, quotaStatePath: statePath }
+  // 池内的 label 是 8 位哈希（与插件同一算法）；上面的 tag() 只是「短 key 原样显示」的日志用版本
+  const label8 = (value) => {
+    let h = 0x811c9dc5
+    for (let i = 0; i < value.length; i++) {
+      h ^= value.charCodeAt(i)
+      h = Math.imul(h, 0x01000193) >>> 0
+    }
+    return h.toString(16).padStart(8, '0')
+  }
+
+  // 插入顺序是 k1 → k3 → k2，而本次先用过一次 k2：这样「粘性按 lastUsedAt 恢复」
+  // 与「没恢复、按插入顺序且 lastUsedAt=0」会给出**不同**的备用 key（k2 vs k3），
+  // 于是下面那条断言才真的在测「恢复」而不是在测巧合。
+  mount(config)
+  const r1 = await call('k2')
+  ctxFlush()
+  const totals1 = lastCtx.__opencodeFreeBridge.statsTotals()
+  const row1 = ctxStatus().keys.find((k) => k.label === label8('k2'))
+  check('P1 统计已落盘（累计计数 + 统计起点）', r1.status === 200 && totals1.clineRequests === 1 && totals1.since > 0, JSON.stringify(totals1))
+  // 这个 mock 的回包不带 usage，所以 token 在这里恒为 0（token 采集另有专测）；
+  // 这里要钉的是「计数确实记在这把 key 上」，P4 再钉它跨重启没丢。
+  check('P2 用过的 key 记下了请求计数', row1?.stats?.sent === 1 && row1?.stats?.ok === 1, JSON.stringify(row1?.stats))
+
+  // 模拟插件更新 / DSH 重启：同一份状态文件，全新实例
+  mount(config)
+  const totals2 = lastCtx.__opencodeFreeBridge.statsTotals()
+  const row2 = ctxStatus().keys.find((k) => k.label === label8('k2'))
+  check('P3 重启后累计计数与统计起点沿用', totals2.clineRequests === 1 && totals2.since === totals1.since, JSON.stringify(totals2))
+  check('P4 重启后该 key 的计数与 token 仍在',
+    row2?.stats?.sent === row1?.stats?.sent && row2?.stats?.tokens?.input === row1?.stats?.tokens?.input,
+    JSON.stringify(row2?.stats))
+
+  const n = mark()
+  const r2 = await call('k1')
+  const a2 = since(n)
+  check('P5 重启后粘性延续：备用 key 仍是上次那把（k2 而不是插入顺序更前的 k3）',
+    r2.status === 200 && a2.at(-1)?.key === 'k2', attemptsText(a2))
+  ctxFlush()
+  rmSync(statePath, { force: true })
+}
+
 dispose()
 rmSync(TEST_STATE_DIR, { recursive: true, force: true })
 server.closeAllConnections?.()

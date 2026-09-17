@@ -45,8 +45,8 @@ export function apply(ctx, config) {
   // 不再发一次注定失败的请求（报文里的恢复时刻就是依据）。默认开启，可配置关闭。
   const allCoolingFailFast = config?.allCoolingFailFast !== false
   const failFastMinMs = Number.isFinite(config?.failFastMinMs) ? Math.max(0, config.failFastMinMs) : DEFAULT_FAIL_FAST_MIN_MS
-  // 设置面板里「导入 Key」的写入口（POST 路由）。默认开启；置 false 则整条写路由拒绝服务
-  // （只读面板照常），供不需要这条通道的部署关掉。
+  // 设置面板的写入口（导入 Key / 重置统计两条 POST 路由）。默认开启；置 false 则写路由
+  // 一律拒绝服务（只读面板照常），供不需要这条通道的部署关掉。
   const keyImportEnabled = config?.keyImport !== false
   // 允许导入写入的 ref 名单：与 key-pool 读盘用的是同一份（未列出的 ref 一律不碰）
   const wantedKeyRefs = Array.isArray(config?.clineKeyRefs) ? config.clineKeyRefs : DEFAULT_CLINE_KEY_REFS
@@ -65,6 +65,17 @@ export function apply(ctx, config) {
     failFasts: 0,
     lastDecision: '',
   }
+  // 跨重启恢复：累计计数与「最近决策」是上次进程留下的，插件更新 / DSH 重启不该把它们清零。
+  // 池内每把 key 的用量由 key-pool 在登记时按 8 位标签自行恢复（同一个文件）。
+  const restoredTotals = quotaStore.totals()
+  const restoredDiag = quotaStore.diagnostics()
+  // 「统计自 … 起」：首次运行取当下，之后一直沿用上次的起点，重置时才改写
+  let statsSince = restoredTotals.since || Date.now()
+  diag.statsSince = statsSince
+  diag.clineRequests = restoredTotals.clineRequests
+  diag.rotations = restoredTotals.rotations
+  diag.failFasts = restoredTotals.failFasts
+  diag.lastRequests = Array.isArray(restoredDiag.lastRequests) ? restoredDiag.lastRequests.slice(-3) : []
   const pool = createKeyPool(quotaStore, diag, (message) => log(message))
   // 额外 key 与请求无关，尽早加载；失败也不影响主链路
   void pool.ensureExtras(ctx, config).catch(() => {})
@@ -198,6 +209,15 @@ export function apply(ctx, config) {
         diag.poolSize = pool.size // 每轮决策时刷新，避免沿用 ensureExtras 里被 TTL 节流前的旧值
         diag.lastDecision = reason
         quotaStore.setDiagnostics({ ...diag, pool: pool.snapshot().map((e) => ({ label: e.label, cooling: e.cooling })) })
+        // 计数与「最近决策」一并落到 totals / diagnostics：三个决策点（正常发、换 key、快速失败）
+        // 都会经过这里，所以不需要在每处 += 1 之后各自补一次写盘
+        diag.statsSince = statsSince
+        quotaStore.setTotals({
+          since: statsSince,
+          clineRequests: diag.clineRequests,
+          rotations: diag.rotations,
+          failFasts: diag.failFasts,
+        })
       }
       decide('inspecting')
 
@@ -356,6 +376,7 @@ export function apply(ctx, config) {
   //   · 正文带上限（MAX_IMPORT_BODY），超限立刻断开。
   // 除此之外它只写 refs 段里名单内的 ref，且回包只带 ref / 哈希标签 / 掩码——没有 Key 原文。
   const importPath = '/opencode-free-bridge/cline-keys/import'
+  const resetPath = '/opencode-free-bridge/cline-keys/stats/reset'
 
   /** ref → 当前值：凭据服务优先（反映 DSH 眼里的真实值），服务缺席或未就绪时直读文件。 */
   const readClineKeyRefs = async () => {
@@ -394,14 +415,57 @@ export function apply(ctx, config) {
     writeCredentialKeyToFile(ref, value)
   }
 
-  const handleKeyImport = async (req, res) => {
-    if (!keyImportEnabled) return sendJson(res, 403, { error: 'key import is disabled (config.keyImport = false)' })
-    if (req.method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' })
-    if (!isTrustedRequest(req)) return sendJson(res, 403, { error: 'untrusted request' })
-    const contentType = String(req.headers?.['content-type'] ?? '')
-    if (!/^application\/json\b/i.test(contentType)) {
-      return sendJson(res, 415, { error: 'content-type must be application/json' })
+  /** 写路由共用的三道闸：总开关、只收 POST、同源。返回 false 表示已经回过包。
+   *  只读路由不经过这里（它另有 GET/HEAD 的白名单）。 */
+  const passWriteGuard = (req, res) => {
+    if (!keyImportEnabled) {
+      sendJson(res, 403, { error: 'panel write routes are disabled (config.keyImport = false)' })
+      return false
     }
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { error: 'method not allowed' })
+      return false
+    }
+    if (!isTrustedRequest(req)) {
+      sendJson(res, 403, { error: 'untrusted request' })
+      return false
+    }
+    return true
+  }
+
+  /** 写路由还必须带 application/json：内容类型不简单的请求会被浏览器先发预检，
+   *  跨站表单/文本这类「简单请求」因此根本进不来——这是没有 CSRF token 时的关键一道闸。 */
+  const isJsonRequest = (req) => /^application\/json\b/i.test(String(req.headers?.['content-type'] ?? ''))
+
+  /** 重置统计：计数、token、最近决策全部归零（冷却与额度不动——那是服务端的事实）。 */
+  const handleStatsReset = async (req, res) => {
+    if (!passWriteGuard(req, res)) return
+    if (!isJsonRequest(req)) return sendJson(res, 415, { error: 'content-type must be application/json' })
+    try {
+      // 空正文也要读完，否则连接会一直半开着
+      await readJsonBody(req, 1024)
+    } catch (error) {
+      if (error?.code === 'PAYLOAD_TOO_LARGE') return sendJson(res, 413, { error: String(error.message) })
+      // 正文不是 JSON 也无所谓：重置不需要任何入参
+    }
+    pool.resetStats()
+    diag.clineRequests = 0
+    diag.rotations = 0
+    diag.failFasts = 0
+    diag.lastRequests = []
+    diag.lastDecision = 'stats-reset'
+    statsSince = Date.now()
+    diag.statsSince = statsSince
+    quotaStore.setTotals({ since: statsSince, clineRequests: 0, rotations: 0, failFasts: 0 })
+    quotaStore.setDiagnostics({ ...diag, pool: pool.snapshot().map((e) => ({ label: e.label, cooling: e.cooling })) })
+    quotaStore.flush()
+    log('统计已重置（计数、token、最近决策归零；冷却与额度未动）')
+    return sendJson(res, 200, { ok: true, since: statsSince, totals: quotaStore.totals(), poolSize: pool.size })
+  }
+
+  const handleKeyImport = async (req, res) => {
+    if (!passWriteGuard(req, res)) return
+    if (!isJsonRequest(req)) return sendJson(res, 415, { error: 'content-type must be application/json' })
 
     let payload
     try {
@@ -516,12 +580,28 @@ export function apply(ctx, config) {
           }),
         'opencode-free-bridge: cline key import route',
       )
+      webCtx.effect(
+        () =>
+          webCtx.webServer.register({
+            kind: 'exact',
+            path: resetPath,
+            handler: (req, res) => {
+              handleStatsReset(req, res).catch((error) => {
+                if (!res.headersSent) sendJson(res, 500, { error: String(error?.message ?? error) })
+              })
+            },
+          }),
+        'opencode-free-bridge: cline stats reset route',
+      )
     })
   }
 
   // 自检工具用的观察入口（不含 key 原文）
   ctx.__opencodeFreeBridge = {
     clineKeys: () => pool.snapshot(),
+    /** 累计计数与统计起点（自检用来断言「跨重启没丢」）。 */
+    statsTotals: () => quotaStore.totals(),
+    resetStats: () => pool.resetStats(),
     status: (options) => statusRoute.build(options),
     routePath: statusRoute.path,
     // 强制立刻重扫一次额外 key 来源（自检用；运行期新增 ref 的正式路径是 5 分钟自动复扫）

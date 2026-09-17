@@ -206,6 +206,7 @@ function mount(config = {}) {
 
 const READ_PATH = '/opencode-free-bridge/cline-keys'
 const IMPORT_PATH = '/opencode-free-bridge/cline-keys/import'
+const RESET_PATH = '/opencode-free-bridge/cline-keys/stats/reset'
 
 /** 假请求：带正文的那几条会按真实流式形状分两片投递 data、再 end，
  *  这样「带上限的正文读取」真的走到累加与上限分支。 */
@@ -287,11 +288,12 @@ const ctxStatusOf = (options) => lastCtx?.__opencodeFreeBridge?.status?.(options
 // ───────────────────────── 1. 路由注册与契约 ─────────────────────────
 {
   mount({ skipCoolingRequestKey: true })
-  check('H1 只在 ctx.inject([\'webServer\']) 里注册路由（不门控整个插件）', routes.length === 2, `routes=${routes.length}`)
+  check('H1 只在 ctx.inject([\'webServer\']) 里注册路由（不门控整个插件）', routes.length === 3, `routes=${routes.length}`)
   const readRoute = routes.find((row) => row.path === READ_PATH)
   const importRoute = routes.find((row) => row.path === IMPORT_PATH)
-  check('H2 只读 / 导入两条路由都是 exact 匹配且路径固定',
-    Boolean(readRoute && importRoute) && [readRoute, importRoute].every((row) => row.kind === 'exact'),
+  const resetRoute = routes.find((row) => row.path === RESET_PATH)
+  check('H2 只读 / 导入 / 重置统计三条路由都是 exact 匹配且路径固定',
+    Boolean(readRoute && importRoute && resetRoute) && [readRoute, importRoute, resetRoute].every((row) => row.kind === 'exact'),
     routes.map((row) => `${row.kind} ${row.path}`).join(' + '))
 
   const ok = await callRoute()
@@ -653,6 +655,80 @@ const ctxStatusOf = (options) => lastCtx?.__opencodeFreeBridge?.status?.(options
     parsed.values.join('|'))
 }
 
+// ───────────────── 4g. 统计跨重启持久化 + 重置统计 ─────────────────
+// 以前这些数字只活在内存里：插件一更新（= DSH 重启）就全变 0，看着像「白用了」。
+// 现在统计与冷却共用同一个状态文件，按 8 位哈希标签恢复——这一组就是钉住这件事。
+{
+  const statePath = join(TEST_STATE_DIR, `stats-${++stateSeq}.json`)
+  rmSync(statePath, { force: true })
+  const baseConfig = { clineKeys: [SECRET_A, SECRET_B], quotaStatePath: statePath, skipCoolingRequestKey: true }
+  const send = async () =>
+    (await globalThis.fetch(ENDPOINT, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${SECRET_A}` },
+      body: JSON.stringify({ model: CAP_ONLY_MODEL, messages: [] }),
+    })).text()
+
+  mount(baseConfig)
+  await send()
+  await new Promise((r) => setTimeout(r, 60)) // token 采集在响应体被读完之后才回来
+  const before = await callRoute()
+  const beforeA = (before.json.keys ?? []).find((k) => k.label === label8(SECRET_A))
+  const beforeB = (before.json.keys ?? []).find((k) => k.label === label8(SECRET_B))
+  lastCtx?.__opencodeFreeBridge?.flushQuotaState?.()
+
+  const rawDisk = readFileSync(statePath, 'utf8')
+  const disk = JSON.parse(rawDisk)
+  check('P1 统计随状态文件落盘（usage + totals 两段）',
+    Object.keys(disk.usage ?? {}).length >= 2 && disk.totals?.clineRequests === 1 && disk.totals?.rotations === 1,
+    `usage=${Object.keys(disk.usage ?? {}).length} totals=${JSON.stringify(disk.totals)}`)
+  check('P2 落盘文件里既没有 key 原文，也没有掩码', !rawDisk.includes(SECRET_A) && !rawDisk.includes(MASK_A) && !rawDisk.includes(SECRET_B))
+  check('P3 落盘统计按 8 位哈希标签索引', Object.keys(disk.usage ?? {}).every((label) => /^[0-9a-f]{8}$/.test(label)), Object.keys(disk.usage ?? {}).join(','))
+  check('P4 落盘里有按模型的 token 明细', Number(disk.usage?.[label8(SECRET_B)]?.models?.[CAP_ONLY_MODEL]?.tokens?.input) > 0, JSON.stringify(disk.usage?.[label8(SECRET_B)]?.models ?? {}))
+  check('P5 载荷带统计起点 totals.since', before.json.totals.since > 0, String(before.json.totals.since))
+
+  // 模拟插件更新 / DSH 重启：同一份状态文件，全新实例
+  mount(baseConfig)
+  const after = await callRoute()
+  const afterA = (after.json.keys ?? []).find((k) => k.label === label8(SECRET_A))
+  const afterB = (after.json.keys ?? []).find((k) => k.label === label8(SECRET_B))
+  check('P6 重启后全局计数还在', after.json.totals.clineRequests === 1 && after.json.totals.rotations === 1, JSON.stringify(after.json.totals))
+  check('P7 重启后每把 key 的发送 / 成功 / 限流计数还在',
+    afterA?.stats.sent === 1 && afterA?.stats.limited === 1 && afterB?.stats.ok === 1 && afterB?.stats.sent === 1,
+    `A=${JSON.stringify(afterA?.stats)} B=${JSON.stringify(afterB?.stats)}`)
+  check('P8 重启后 token 用量还在（key 级 + 按模型）',
+    afterB?.stats.tokens.input === beforeB?.stats.tokens.input && afterB?.models?.[CAP_ONLY_MODEL]?.tokens?.input === beforeB?.models?.[CAP_ONLY_MODEL]?.tokens?.input && afterB?.stats.tokens.input > 0,
+    `${JSON.stringify(afterB?.stats.tokens)} vs ${JSON.stringify(beforeB?.stats.tokens)}`)
+  check('P9 重启后统计起点沿用上次（不是重启时刻）', after.json.totals.since === before.json.totals.since, `${after.json.totals.since} vs ${before.json.totals.since}`)
+  check('P10 重启后「最近决策」也还在', (after.json.recent ?? []).length >= 1, `recent=${(after.json.recent ?? []).length}`)
+
+  // 重置统计：计数归零，但冷却（服务端事实）不许动
+  const getOnReset = await callRoute({ path: RESET_PATH })
+  check('P11 重置路由拒绝非 POST（405）', getOnReset.status === 405, `status=${getOnReset.status}`)
+  const untrustedReset = await callRoute({ path: RESET_PATH, method: 'POST', contentType: 'application/json', referer: 'http://evil.example/x', body: '{}' })
+  check('P12 重置路由同样要求同源（403）', untrustedReset.status === 403, `status=${untrustedReset.status}`)
+  const plainReset = await callRoute({ path: RESET_PATH, method: 'POST', contentType: 'text/plain', body: '{}' })
+  check('P13 重置路由要求 application/json（415）', plainReset.status === 415, `status=${plainReset.status}`)
+  await new Promise((r) => setTimeout(r, 5))
+  const reset = await callRoute({ path: RESET_PATH, method: 'POST', contentType: 'application/json', body: '{}' })
+  check('P14 重置返回 200 且计数清零', reset.status === 200 && reset.json.totals.clineRequests === 0 && reset.json.totals.rotations === 0 && reset.json.totals.failFasts === 0, JSON.stringify(reset.json.totals))
+  const afterReset = await callRoute()
+  check('P15 重置后每把 key 的计数与 token 归零',
+    (afterReset.json.keys ?? []).every((k) => k.stats.sent === 0 && k.stats.ok === 0 && k.stats.limited === 0 && k.stats.tokens.input === 0 && k.models?.[CAP_ONLY_MODEL]?.tokens?.input === 0),
+    JSON.stringify((afterReset.json.keys ?? []).map((k) => k.stats)))
+  check('P16 重置不动冷却（那是服务端的事实）', (afterReset.json.keys ?? []).some((k) => (k.cooling ?? []).length > 0), JSON.stringify((afterReset.json.keys ?? []).map((k) => k.cooling)))
+  check('P17 重置把统计起点改到当下', afterReset.json.totals.since > before.json.totals.since, `${afterReset.json.totals.since} > ${before.json.totals.since}`)
+  check('P18 重置后「最近决策」清空', (afterReset.json.recent ?? []).length === 0, `recent=${(afterReset.json.recent ?? []).length}`)
+
+  // 重置也落盘：再来一次「重启」，确认磁盘上确实归零了
+  lastCtx?.__opencodeFreeBridge?.flushQuotaState?.()
+  const afterResetDisk = JSON.parse(readFileSync(statePath, 'utf8'))
+  check('P19 重置结果落盘（磁盘上的计数与 token 也归零）',
+    afterResetDisk.totals?.clineRequests === 0 && Number(afterResetDisk.usage?.[label8(SECRET_B)]?.stats?.tokens?.input) === 0,
+    JSON.stringify(afterResetDisk.totals))
+  check('P20 重置后统计起点也写进了磁盘', Number(afterResetDisk.totals?.since) === afterReset.json.totals.since, String(afterResetDisk.totals?.since))
+}
+
 // 主机半边测完再关 mock 服务器（G 组还要发请求，不能提前关）
 dispose()
 server.closeAllConnections?.()
@@ -785,6 +861,7 @@ const CLIENT_SOURCE = readFileSync(new URL('../lib/client.js', import.meta.url),
 const MODULE_ID = 'opencode-free-bridge'
 const ROUTE = '/opencode-free-bridge/cline-keys'
 const CLIENT_IMPORT_ROUTE = '/opencode-free-bridge/cline-keys/import'
+const CLIENT_RESET_ROUTE = '/opencode-free-bridge/cline-keys/stats/reset'
 
 /** 把客户端半边装进 vm 沙箱，返回它的模块导出。 */
 function loadClientBundle() {
@@ -1191,7 +1268,7 @@ async function renderPanel(payload, { fetchError = null } = {}) {
     updatedAt: Date.now(),
     models: [{ id: 'cline-free/deepseek-v4.1-flash', lastUsedAt: 0 }],
     currentModel: 'cline-free/deepseek-v4.1-flash',
-    totals: { poolSize: 1, clineRequests: 0, rotations: 0, failFasts: 0 },
+    totals: { poolSize: 1, clineRequests: 0, rotations: 0, failFasts: 0, since: Date.now() - 3600_000 },
     keys: [{ index: 1, label: 'db694bbf', preview: 'sk_c…ead1', source: 'request', cooling: [], stats: { sent: 0, ok: 0, limited: 0, lastUsedAt: 0, tokens: {} }, models: {} }],
     recent: [],
   }
@@ -1200,9 +1277,11 @@ async function renderPanel(payload, { fetchError = null } = {}) {
     imported: [{ ref: 'CLINE_API_KEY_2', label: '1c4dd756', preview: 'sk-i…4444' }],
     duplicates: [], rejected: [], failed: [], refsFree: 7, poolSize: 2, maxKeys: 20,
   }
+  const resetReply = { ok: true, since: Date.now(), totals: { since: Date.now(), clineRequests: 0, rotations: 0, failFasts: 0 }, poolSize: 1 }
   bundle.sandbox.fetch = async (url, init) => {
     const method = (init && init.method) || 'GET'
     calls.push({ url, method, headers: (init && init.headers) || {}, body: init && init.body })
+    if (url === CLIENT_RESET_ROUTE) return { ok: true, status: 200, json: async () => resetReply }
     if (method === 'POST') return { ok: true, status: 200, json: async () => importReply }
     return { ok: true, status: 200, json: async () => payload }
   }
@@ -1253,6 +1332,28 @@ async function renderPanel(payload, { fetchError = null } = {}) {
   for (const fn of escListeners) fn({ key: 'Escape' })
   tree = await bundle.mini.render(Component, {})
   check('N10 Esc 能关掉弹窗', !findNode(tree, (n) => n.props && n.props.className === '_dsh_ofb_dialog'))
+
+  const panelText = textOf(tree).join(' | ')
+  check('N11 面板给出累计统计的起点（说明跨重启保留）', panelText.includes('统计自') && panelText.includes('跨重启保留'), panelText.split(' | ').filter((x) => x.includes('统计自')).join(''))
+
+  const resetButton = findNode(tree, (n) => n.type === 'button' && textOf(n).join('') === '重置统计')
+  check('N12 顶部有「重置统计」按钮', Boolean(resetButton))
+  const armedPromise = resetButton ? resetButton.props.onClick() : undefined
+  if (armedPromise && typeof armedPromise.then === 'function') await armedPromise
+  tree = await bundle.mini.render(Component, {})
+  const confirmButton = findNode(tree, (n) => n.type === 'button' && textOf(n).join('') === '确认重置')
+  check('N13 第一次点击只变成「确认重置」（两段式，防误触）',
+    Boolean(confirmButton) && !calls.some((c) => c.url === CLIENT_RESET_ROUTE),
+    calls.map((c) => c.url).join(' | '))
+  const pendingReset = confirmButton ? confirmButton.props.onClick() : undefined
+  await new Promise((r) => setTimeout(r, 20))
+  if (pendingReset && typeof pendingReset.then === 'function') await pendingReset
+  tree = await bundle.mini.render(Component, {})
+  const resetCall = calls.find((c) => c.url === CLIENT_RESET_ROUTE)
+  check('N14 第二次点击才真的 POST 重置统计',
+    Boolean(resetCall) && resetCall.method === 'POST' && resetCall.headers['content-type'] === 'application/json',
+    resetCall ? resetCall.method + ' ' + resetCall.headers['content-type'] : 'no POST')
+  check('N15 重置后有结果提示并自动重拉数据', textOf(tree).join(' | ').includes('统计已重置'), textOf(tree).split ? '' : '')
   bundle.mini.dispose()
 }
 
