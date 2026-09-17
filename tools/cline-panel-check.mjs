@@ -323,6 +323,13 @@ function findNode(node, predicate) {
   return undefined
 }
 
+/** 表格表头文本，用于断言列集合（列数是接口的一部分，增删列必须同步改断言）。 */
+function table_headers(tree) {
+  const head = findNode(tree, (n) => n.type === 'thead')
+  if (!head) return []
+  return textOf(head).map((text) => text.trim()).filter(Boolean)
+}
+
 const CLIENT_SOURCE = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
 const MODULE_ID = 'opencode-free-bridge'
 const ROUTE = '/opencode-free-bridge/cline-keys'
@@ -384,7 +391,7 @@ async function renderPanel(payload, { fetchError = null } = {}) {
       if (!Array.isArray(deps) || !deps.includes('locale')) return undefined
       return callback({
         get: () => ({
-          register: (ns, locale) => { dictionaries.push([ns, locale]); return () => {} },
+          register: (ns, locale, dict) => { dictionaries.push([ns, locale, dict]); return () => {} },
           getSnapshot: () => ({ active: 'zh-CN' }),
         }),
         effect: (factory) => factory(),
@@ -400,7 +407,7 @@ async function renderPanel(payload, { fetchError = null } = {}) {
 {
   const payload = {
     plugin: MODULE_ID,
-    version: '1.6.0',
+    version: '1.6.1',
     updatedAt: Date.now(),
     settings: {
       clineMatch: 'cline.bot', clineCooldownMs: 900000, failFastMinMs: 300000,
@@ -432,6 +439,11 @@ async function renderPanel(payload, { fetchError = null } = {}) {
   check('C4 座位 id/order/locale 齐备', registered[0].options.id === MODULE_ID && typeof registered[0].options.order === 'number' && registered[0].options.locale === 'opencodeFreeBridge', JSON.stringify(registered[0].options))
   check('C5 座位标签是可调用 thunk（切换语言无需重注册）', typeof registered[0].options.label === 'function' && registered[0].options.label() === 'Cline Key', String(registered[0].options.label?.()))
   check('C6 zh/en 两套字典都注册进 DSH locale', dictionaries.length === 2 && dictionaries.some((d) => d[1] === 'zh') && dictionaries.some((d) => d[1] === 'en'), JSON.stringify(dictionaries.map((d) => d[1])))
+  // 漏译不会报错，只会让界面回退成键名，所以这里必须自己盯住两套字典的键集合一致
+  const zhKeys = Object.keys(dictionaries.find((d) => d[1] === 'zh')?.[2] ?? {}).sort()
+  const enKeys = Object.keys(dictionaries.find((d) => d[1] === 'en')?.[2] ?? {}).sort()
+  check('C6b zh/en 字典键集合完全一致', zhKeys.length > 0 && zhKeys.join('|') === enKeys.join('|'),
+    `zh=${zhKeys.length} en=${enKeys.length}${zhKeys.join('|') === enKeys.join('|') ? '' : ' 差异=' + zhKeys.filter((k) => !enKeys.includes(k)).concat(enKeys.filter((k) => !zhKeys.includes(k))).join(',')}`)
   check('C7 样式只注入一次 <style> 并带 plugin 标记', bundle.styleTags.length === 1 && bundle.styleTags[0].dataset.plugin === MODULE_ID, `tags=${bundle.styleTags.length}`)
 
   check('C8 渲染出标题', text.includes('Cline Key 使用情况'), text.split('\n').slice(0, 3).join(' / '))
@@ -440,13 +452,13 @@ async function renderPanel(payload, { fetchError = null } = {}) {
   check('C11 渲染出哈希标签', text.includes('db694bbf') && text.includes('761f9875'))
   check('C12 渲染出冷却模型与恢复倒计时', text.includes('cline-free/deepseek-v4.1-flash') && /2[01]h\d\dm/.test(text), (/[0-9]+h[0-9]{2}m/.exec(text) ?? ['none'])[0])
   check('C13 渲染出状态药丸（可用/冷却中）', text.includes('冷却中') && text.includes('可用'))
-  check('C14 渲染出来源标签（DSH 主 Key / 凭据文件 ref）', text.includes('DSH 请求头') && text.includes('.credentials.yaml: CLINE_API_KEY_2'))
+  check('C14 表格里没有「来源」这一列', !table_headers(tree).some((h) => /来源|source/i.test(h)) && !text.includes('.credentials.yaml: CLINE_API_KEY_2') && !text.includes('DSH 请求头'), table_headers(tree).join(' | '))
   check('C15 渲染出用量计数 发送/成功/限流', text.includes('12 / 11 / 1') && text.includes('4 / 4 / 0'))
-  check('C16 渲染出统计卡数值', text.includes('61') && text.includes('1.6.0'))
+  check('C16 渲染出统计卡数值', text.includes('61') && text.includes('1.6.1'))
   check('C17 渲染出最近决策', text.includes('最近决策') && text.includes('rotated a→b'))
   check('C18 渲染出运行参数', text.includes('运行参数') && text.includes('15分钟'))
-  check('C19 渲染出掩码说明', text.includes('首尾各 4 位'))
-  check('C20 详情卡里出现 key 池表格表头', text.includes('冷却模型 / 恢复') && text.includes('发送 / 成功 / 限流'))
+  check('C19 面板里没有掩码说明文字', !text.includes('首尾各 4 位') && !text.includes('掩码预览'))
+  check('C20 详情卡里出现 key 池表格表头（且只有 6 列）', text.includes('冷却模型 / 恢复') && text.includes('发送 / 成功 / 限流') && table_headers(tree).length === 6, table_headers(tree).join(' | '))
 
   // 关键 DOM 结构：表格确实有 2 行数据
   const table = findNode(tree, (n) => n.type === 'table')
@@ -460,7 +472,7 @@ async function renderPanel(payload, { fetchError = null } = {}) {
 {
   // 空池：应给出空态而不是空白
   const empty = await renderPanel({
-    plugin: MODULE_ID, version: '1.6.0', updatedAt: Date.now(),
+    plugin: MODULE_ID, version: '1.6.1', updatedAt: Date.now(),
     settings: { maskKeyPreview: true }, totals: { poolSize: 0, readyKeys: 0, coolingKeys: 0 }, extras: {}, keys: [], recent: [],
   })
   const emptyText = textOf(empty.tree).join('\n')
