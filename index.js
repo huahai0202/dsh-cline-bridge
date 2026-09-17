@@ -1,6 +1,6 @@
 export const name = 'opencode-free-bridge'
 
-const PLUGIN_VERSION = '1.4.2'
+const PLUGIN_VERSION = '1.4.3'
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -295,9 +295,11 @@ function writeKeyTo(headers, key, target) {
 }
 
 /** 从 DSH 凭据服务读取额外 key（首选路径）。
- *  dsh-credentials / dsh-llm-pi-ai 都用 `ctx.get('credentials')`，这里同时兜一下直接属性访问。 */
+ *  dsh-credentials / dsh-llm-pi-ai 都用 `ctx.get('credentials')`；这里再兜两条：
+ *  根上下文的 get，以及直接属性访问（声明式注入的服务会挂成属性）。 */
 function resolveCredentialService(ctx) {
-  for (const access of [() => ctx?.get?.('credentials'), () => ctx?.credentials]) {
+  const accesses = [() => ctx?.get?.('credentials'), () => ctx?.root?.get?.('credentials'), () => ctx?.credentials]
+  for (const access of accesses) {
     try {
       const service = access()
       if (service?.resolve) return service
