@@ -1,6 +1,6 @@
 export const name = 'opencode-free-bridge'
 
-const PLUGIN_VERSION = '1.4.1'
+const PLUGIN_VERSION = '1.4.2'
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -94,7 +94,7 @@ function canonicalSession(hint, fallback) {
 // 重试窗口以小时计，退避等待毫无意义，只能换 key。本插件位于 openai SDK 之下、
 // pi-ai 的 retryProviderRequest 之上，是唯一能「换 key 重发」的层次：只要换 key 后拿到
 // 成功响应就直接返回，pi-ai 根本看不到那次 429。
-const DEFAULT_CLINE_MATCH = 'api.cline.bot'
+const DEFAULT_CLINE_MATCH = 'cline.bot'
 const DEFAULT_CLINE_COOLDOWN_MS = 15 * 60 * 1000
 const DEFAULT_FAIL_FAST_MIN_MS = 5 * 60 * 1000
 const MAX_ROTATE_ATTEMPTS = 6
@@ -599,12 +599,33 @@ export function apply(ctx, config) {
 
       const authTarget = readAuthTarget(headers)
       const requestKey = readKeyOf(headers, authTarget)
+      const hasAuthorization = Boolean(headers.get('authorization'))
+      const hasApiKey = Boolean(headers.get('x-api-key'))
       if (requestKey) pool.register(requestKey)
       // 额外 key 必须在首次判定前就位，否则「全池冷却」与「挑备用 key」都会失真
       await pool.ensureExtras(ctx, config).catch(() => {})
       diag.clineRequests += 1
-      diag.lastDecision = `request key=${requestKey ? keyLabel(requestKey) : '(none)'} model=${readModelOf(init?.body)}`
-      quotaStore.setDiagnostics({ ...diag, pool: pool.snapshot().map((e) => ({ label: e.label, cooling: e.cooling })) })
+
+      // 记录请求形状（只记头名与长度，绝不记 key 原文），便于线上定位「为什么没换 key」
+      const trace = {
+        at: new Date().toISOString(),
+        url: url.slice(0, 120),
+        method: (input instanceof Request ? input.method : init?.method) || 'GET',
+        authHeader: hasAuthorization ? authTarget.header : hasApiKey ? 'x-api-key' : 'none',
+        keyPresent: Boolean(requestKey),
+        bodyKind: input instanceof Request ? 'Request' : typeof init?.body,
+        bodyLen: typeof init?.body === 'string' ? init.body.length : -1,
+        model: readModelOf(init?.body),
+        poolSize: pool.size,
+        decision: 'pending',
+      }
+      diag.lastRequests = [...(diag.lastRequests ?? []).slice(-2), trace]
+      const decide = (reason) => {
+        trace.decision = reason
+        diag.lastDecision = reason
+        quotaStore.setDiagnostics({ ...diag, pool: pool.snapshot().map((e) => ({ label: e.label, cooling: e.cooling })) })
+      }
+      decide('inspecting')
 
       // Request 形态下 body 只能消费一次：若存在多个 key（可能轮换），先缓冲一份可重发副本
       let bufferedBody
@@ -628,8 +649,7 @@ export function apply(ctx, config) {
         if (soonest && soonest.readyAt - Date.now() >= failFastMinMs) {
           const waitMin = Math.max(1, Math.round((soonest.readyAt - Date.now()) / 60000))
           diag.failFasts += 1
-          diag.lastDecision = `fail-fast model=${model} pool=${pool.size} waitMin=${waitMin}`
-          quotaStore.setDiagnostics({ ...diag, pool: pool.snapshot().map((e) => ({ label: e.label, cooling: e.cooling })) })
+          decide(`fail-fast model=${model} pool=${pool.size} waitMin=${waitMin}`)
           log(`Cline 全部 key 在 ${model} 上均冷却（最早 ${waitMin} 分钟后恢复），直接返回缓存报错`)
           const body =
             soonest.body ||
@@ -675,12 +695,16 @@ export function apply(ctx, config) {
       let response = await sendWith(headers, bufferedBody)
       if (!rotateStatuses.includes(response.status)) {
         if (currentKey) pool.markHealthy(currentKey, model)
+        decide(`pass-through status=${response.status}`)
         return response
       }
 
       // 重发要求 body 可原样重建（字符串 / 字节），流式 body 只能原样返回
       const replayable = input instanceof Request ? bufferedBody !== undefined : replayableBody(init?.body)
-      if (!replayable || !currentKey) return response
+      if (!replayable || !currentKey) {
+        decide(`cannot-rotate replayable=${replayable} keyPresent=${Boolean(currentKey)} status=${response.status}`)
+        return response
+      }
 
       let lastText = await response.clone().text()
       pool.markCooling(currentKey, model, parseRetryWindowMs(lastText) || clineCooldownMs, lastText)
@@ -703,8 +727,7 @@ export function apply(ctx, config) {
         if (!rotateStatuses.includes(retried.status)) {
           pool.markHealthy(next.key, model)
           diag.rotations += 1
-          diag.lastDecision = `rotated ${keyLabel(currentKey)}→${next.label} model=${model}`
-          quotaStore.setDiagnostics({ ...diag, pool: pool.snapshot().map((e) => ({ label: e.label, cooling: e.cooling })) })
+          decide(`rotated ${keyLabel(currentKey)}→${next.label} model=${model}`)
           log(`Cline 限流已换 key 恢复（${keyLabel(currentKey)} → ${next.label}, model=${model}）`)
           return retried
         }
