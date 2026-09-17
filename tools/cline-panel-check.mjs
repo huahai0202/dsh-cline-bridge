@@ -1156,47 +1156,45 @@ async function renderPanel(payload, { fetchError = null } = {}) {
   check('F11 另一把在 deepseek 上没跑过：0/0/0 且无冷却，最近使用显示「从未」', dsOther.includes('0/0/0') && dsOther.includes('可用') && dsOther.includes('从未'), dsOther.replace(/\n/g, ' | '))
 
   // ── 按模型用量明细卡（用户要求：显示每个 key 的每个模型的用量）──
+  // 面板恒定在某个模型的筛选下，所以这张卡每把 key 就一行：key 预览 + 哈希标签 + 数字，
+  // 模型名不重复出现（它写在筛选芯片上）。
   const usageCardOf = (node) => findNode(node, (n) => String(n.props?.className ?? '') === '_dsh_ofb_usage')
   const usageOf = (node, label) => {
     const card = usageCardOf(node)
     if (!card) return ''
-    const kids = card.children ?? []
-    // 卡片是 [表头, 每把 key 的(标题行 + 若干模型行)…] 的扁平序列：取该 key 标题行之后、下个标题行之前的行
-    const at = kids.findIndex((k) => JSON.stringify(k).includes(label))
-    if (at < 0) return ''
-    const out = []
-    for (let i = at + 1; i < kids.length; i++) {
-      if (String(kids[i].props?.className ?? '').includes('_dsh_ofb_usage_key')) break
-      out.push(textOf(kids[i]).join(' '))
-    }
-    return out.join(' | ')
+    const row = (card.children ?? []).find((k) => String(k.props?.className ?? '').includes('_dsh_ofb_usage_row') && JSON.stringify(k).includes(label))
+    return row ? textOf(row).join(' ') : ''
   }
 
   const usageDsRow = usageOf(dsView, 'db694bbf')
   // 每个数值各占一列（发送|成功|限流、输入|输出），所以 textOf 用空格连接
   check('I1 明细卡按当前模型逐行列出用量（deepseek 视图）',
-    usageDsRow.includes('cline-free/deepseek-v4.1-flash 16 15 1 12.3k 1.2k'), usageDsRow)
+    usageDsRow.includes('1 sk-l…4444 db694bbf 16 15 1 12.3k 1.2k'), usageDsRow)
   check('I2 另一把 key 在 glm 视图下有自己的一行',
-    usageOf(tree, '761f9875').includes('z-ai/glm-5.3-flash 21 21 0 21k 2.1k'), usageOf(tree, '761f9875'))
+    usageOf(tree, '761f9875').includes('2 sk-t…8888 761f9875 21 21 0 21k 2.1k'), usageOf(tree, '761f9875'))
   const usageHeadOf = (node) => findNode(usageCardOf(node), (n) => String(n.props?.className ?? '') === '_dsh_ofb_usage_head')
   const usageHeadSpans = usageHeadOf(tree)?.children ?? []
   // 表头与数据行同构：每列一个标签，含义直接可见（不靠悬停），且短标签不会折行
   const usageHeadFlat = usageHeadSpans.map((s) => textOf(s).join('')).join('|')
-  check('I3 明细卡表头逐列标注（发送/成功/限流、输入/输出），与数据列一一对应',
-    usageHeadFlat === '模型|发送成功限流|输入输出|最近使用' &&
+  check('I3 明细卡表头逐列标注（Key、发送/成功/限流、输入/输出），与数据列一一对应',
+    usageHeadFlat === 'Key|发送成功限流|输入输出|最近使用' &&
+      String(usageHeadSpans[0]?.props?.className ?? '') === '_dsh_ofb_usage_lead' &&
       String(usageHeadSpans[1]?.props?.className ?? '') === '_dsh_ofb_usage_req' &&
       String(usageHeadSpans[2]?.props?.className ?? '') === '_dsh_ofb_tokencell',
     usageHeadFlat)
+  check('I3b 明细卡不再重复模型名（它已在筛选芯片上）',
+    !usageCardOf(tree) || !JSON.stringify(usageCardOf(tree)).includes('z-ai/glm-5.3-flash'),
+    JSON.stringify(usageCardOf(tree) ?? {}).slice(0, 200))
 
   const usageGlm = usageOf(tree, 'db694bbf')
-  check('I4 glm 视图下明细不含 deepseek 的行', usageGlm.includes('z-ai/glm-5.3-flash 3 3 0') && !usageGlm.includes('deepseek'), usageGlm)
+  check('I4 glm 视图下明细不含 deepseek 的行', usageGlm.includes('3 3 0 4.5k') && !usageGlm.includes('deepseek'), usageGlm)
 
   // 该模型上没用过的 key 不再各占一块，而是折叠成一行提示（否则半张卡都是「没用过」）
   const cardText = (node) => textOf(usageCardOf(node)).join('\n')
   check('I5 该模型上未使用的 key 折叠成一行提示',
     cardText(dsView).includes('其余 1 把在该模型上没用过') && !cardText(dsView).includes('761f9875'),
     cardText(dsView).replace(/\n/g, ' | '))
-  check('I6 切到 glm 时同一把 key 显示 glm 的计数', usageGlm.includes('z-ai/glm-5.3-flash 3 3 0 4.5k 300'), usageGlm)
+  check('I6 切到 glm 时同一把 key 显示 glm 的计数', usageGlm.includes('1 sk-l…4444 db694bbf 3 3 0 4.5k 300'), usageGlm)
 
   // ── Token 用量（用户真正要的是这个）──
   const tokenRowOf = (node, label) => {

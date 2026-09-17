@@ -501,6 +501,50 @@ const since = (n) => seen.slice(n)
   rmSync(statePath, { force: true })
 }
 
+// ─ Q. DSH 侧没配 key：从池里挑一把兜底（否则裸请求必是 401，轮换救不了）──
+// 对应「把 DSH 提供方的 apiKeyEnv 整个移除」的用法：此时请求不带任何鉴权头，
+// 插件在首发送前就从池里挑一把（粘性优先、跳过已冷却者），后续撞 429 照常轮换。
+{
+  const post = async (extraHeaders = {}) =>
+    globalThis.fetch(ENDPOINT, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...extraHeaders },
+      body: JSON.stringify({ model: 'deepseek/deepseek-v4.1-flash', messages: [] }),
+    })
+
+  mount({ clineKeys: ['k2', 'k3'], clineMatch: match })
+  const n = mark()
+  const res = await post()
+  await res.text()
+  const a = since(n)
+  check('Q1 请求没带 key 时，插件从池里挑一把兜底', res.status === 200 && a.length === 1 && a[0].key === 'k2', attemptsText(a))
+
+  // pi-ai 没凭据时的另一种形态：发出「Bearer undefined」占位头，同样按没带 key 处理
+  mount({ clineKeys: ['k2', 'k3'], clineMatch: match })
+  const n2 = mark()
+  const res2 = await post({ authorization: 'Bearer undefined' })
+  await res2.text()
+  const a2 = since(n2)
+  check('Q2 「Bearer undefined」占位头按没带 key 处理（不把 undefined 当 key 发出去）',
+    res2.status === 200 && a2.length === 1 && a2[0].key === 'k2', attemptsText(a2))
+
+  // 关掉兜底：clineMatch 指向免鉴权自建中转的场景，keyless 必须原样透传
+  mount({ clineKeys: ['k2', 'k3'], clineMatch: match, fillMissingRequestKey: false })
+  const n3 = mark()
+  const res3 = await post()
+  await res3.text()
+  const a3 = since(n3)
+  check('Q3 fillMissingRequestKey:false 时原样透传，不注入', a3.length === 1 && a3[0].key === '', attemptsText(a3))
+
+  // 池子为空：没有可挑的，保持原来的裸请求行为
+  mount({ clineKeys: [], clineMatch: match })
+  const n4 = mark()
+  const res4 = await post()
+  await res4.text()
+  const a4 = since(n4)
+  check('Q4 池子为空时不注入（行为与从前一致）', a4.length === 1 && a4[0].key === '', attemptsText(a4))
+}
+
 dispose()
 rmSync(TEST_STATE_DIR, { recursive: true, force: true })
 server.closeAllConnections?.()

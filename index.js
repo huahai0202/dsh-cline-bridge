@@ -48,6 +48,10 @@ export function apply(ctx, config) {
   // 设置面板的写入口（导入 Key / 重置统计两条 POST 路由）。默认开启；置 false 则写路由
   // 一律拒绝服务（只读面板照常），供不需要这条通道的部署关掉。
   const keyImportEnabled = config?.keyImport !== false
+  // DSH 侧没配 key（apiKeyEnv 被移除，或解析出来是空值）时，首发送直接从池里挑一把兜底。
+  // 不兜底的话这个请求会裸着发给上游：Cline 回 401，而轮换只认 429，池子根本没有上场机会。
+  // 关掉场景：clineMatch 指向不需要鉴权的自建中转，此时不该把池里的 key 注入进去。
+  const fillMissingRequestKey = config?.fillMissingRequestKey !== false
   // 允许导入写入的 ref 名单：与 key-pool 读盘用的是同一份（未列出的 ref 一律不碰）
   const wantedKeyRefs = Array.isArray(config?.clineKeyRefs) ? config.clineKeyRefs : DEFAULT_CLINE_KEY_REFS
   // 导入正文字节上限：面板是手工粘贴几十把 Key 的量级，64KB 绰绰有余
@@ -182,7 +186,9 @@ export function apply(ctx, config) {
       headers.set('x-client-type', 'cline-vscode')
 
       const authTarget = readAuthTarget(headers)
-      const requestKey = readKeyOf(headers, authTarget)
+      const rawRequestKey = readKeyOf(headers, authTarget)
+      // pi-ai 在没有凭据时可能发出「Bearer undefined / Bearer null」这类占位头：一律按「没带 key」处理
+      const requestKey = /^(undefined|null)$/i.test(rawRequestKey) ? '' : rawRequestKey
       const hasAuthorization = Boolean(headers.get('authorization'))
       const hasApiKey = Boolean(headers.get('x-api-key'))
       if (requestKey) pool.register(requestKey, 'request')
@@ -269,6 +275,17 @@ export function apply(ctx, config) {
           log(`Cline 主 key 在 ${model} 上仍在冷却，直接改用 ${healthy.label}`)
           currentKey = healthy.key
           writeKeyTo(headers, currentKey, authTarget)
+        }
+      }
+
+      // 请求完全没带 key（DSH 的 apiKeyEnv 被移除 / 凭据为空）：从池里挑一把兜底。
+      // 挑选规则与轮换一致（粘性优先、跳过该模型上已冷却者），后续撞 429 也照常轮换。
+      if (!currentKey && fillMissingRequestKey) {
+        const picked = pool.pick(model)
+        if (picked) {
+          currentKey = picked.key
+          writeKeyTo(headers, currentKey, authTarget)
+          log(`Cline 请求未带 key，已从池里挑 ${picked.label} 兜底（model=${model}，池=${pool.size}）`)
         }
       }
 
