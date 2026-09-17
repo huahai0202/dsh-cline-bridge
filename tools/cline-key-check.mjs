@@ -77,22 +77,17 @@ const check = (label, ok, detail = '') => results.push(`${ok ? 'PASS' : 'FAIL'} 
 
 let dispose = () => {}
 let lastCtx
-function mount(config = {}, credentialsStub, injectService) {
+function mount(config = {}) {
   dispose()
   const ctx = {
     on: (event, fn) => {
       if (event === 'dispose') dispose = fn
     },
     logger: { warn: () => {} },
-    // credentialsStub 可为对象，或「返回对象/undefined 或抛错」的函数（模拟服务晚就绪或 isolate 不匹配）
-    get: (name) =>
-      name === 'credentials' ? (typeof credentialsStub === 'function' ? credentialsStub() : credentialsStub) : undefined,
-    // 模拟 Cordis 的「等依赖就绪」子插件：deps 命中且提供了服务时才回调
-    inject: (deps, callback) => {
-      if (Array.isArray(deps) && deps.includes('credentials') && injectService) {
-        callback({ credentials: injectService, get: (name) => (name === 'credentials' ? injectService : undefined) })
-      }
-    },
+    // 插件不声明依赖，也不需要任何 host 服务：get 一律 undefined、inject 永不回调。
+    // （settings / webServer 缺席正是插件要能正常工作的场景，面板会自行退化。）
+    get: () => undefined,
+    inject: () => undefined,
   }
   const merged = { ...config }
   if (merged.quotaStatePath === undefined) merged.quotaStatePath = join(TEST_STATE_DIR, `state-${++stateSeq}.json`)
@@ -117,10 +112,6 @@ const keyTag = (key) => {
   return h.toString(16).padStart(8, '0')
 }
 const attemptsText = (attempts) => attempts.map((a) => keyTag(a.key)).join('→')
-/** 复刻 Cordis 的真实行为：插件未声明依赖时，ctx.get(name) 会抛错而非返回 undefined。 */
-const isolateMismatch = () => {
-  throw new Error('cannot get property "credentials" without provide (isolate)')
-}
 const ctxSnapshot = () => lastCtx?.__opencodeFreeBridge?.clineKeys?.() ?? []
 const ctxStatus = (options) => lastCtx?.__opencodeFreeBridge?.status?.(options) ?? null
 const ctxFlush = () => lastCtx?.__opencodeFreeBridge?.flushQuotaState?.()

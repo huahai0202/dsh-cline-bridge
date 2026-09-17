@@ -641,7 +641,6 @@ async function renderPanel(payload, { fetchError = null } = {}) {
   const bundle = loadClientBundle()
   const registered = []
   const dictionaries = []
-  const registeredSchemas = []
 
   // 每次渲染前替换 sandbox 的 fetch
   bundle.sandbox.fetch = async () => {
@@ -650,7 +649,7 @@ async function renderPanel(payload, { fetchError = null } = {}) {
   }
 
   const slots = {
-    inject: (name, cb) => { registeredSchemas.push(name); return cb() },
+    inject: (name, cb) => cb(),
     register: (options, Component) => { registered.push({ options, Component }); return () => {} },
   }
   const ctx = {
@@ -677,16 +676,8 @@ async function renderPanel(payload, { fetchError = null } = {}) {
     plugin: MODULE_ID,
     version: PLUGIN_VERSION,
     updatedAt: Date.now(),
-    settings: {
-      clineMatch: 'cline.bot', clineCooldownMs: 900000, failFastMinMs: 300000,
-      skipCoolingRequestKey: true, allCoolingFailFast: true, rotateStatuses: [429],
-      maskKeyPreview: true, readCredentialsFile: true,
-      credentialsFile: 'C:/Users/x/.dsh/.credentials.yaml', clineKeyRefs: ['CLINE_API_KEY_2'],
-    },
-    quotaStatePath: 'C:/Users/x/.dsh/.opencode-free-bridge-cline-quota.json',
     totals: { poolSize: 2, readyKeys: 1, coolingKeys: 1, clineRequests: 61, rotations: 3, failFasts: 1 },
     extras: { credentialsFileRead: true, extrasResolved: true, lastExtrasAt: '2026-09-17T07:45:16.602Z' },
-    lastDecision: 'rotated 983d80c1→953d7c08 model=cline-free/deepseek-v4.1-flash',
     keys: [
       { index: 1, label: 'db694bbf', preview: MASK_A, source: 'request',
         cooling: [{ model: 'cline-free/deepseek-v4.1-flash', readyAt: Date.now() + 21 * 3600 * 1000, readyInMin: 1300 }],
@@ -810,8 +801,6 @@ async function renderPanel(payload, { fetchError = null } = {}) {
     plugin: MODULE_ID,
     version: PLUGIN_VERSION,
     updatedAt: Date.now(),
-    settings: { maskKeyPreview: true },
-    quotaStatePath: 'C:/Users/x/.dsh/quota.json',
     models: [{ id: GLM, lastUsedAt: Date.now() }, { id: DEEPSEEK, lastUsedAt: Date.now() - 3600_000 }],
     currentModel: GLM,
     totals: { poolSize: 2, readyKeys: 1, coolingKeys: 1, clineRequests: 40, rotations: 2, failFasts: 0 },
@@ -994,7 +983,7 @@ async function renderPanel(payload, { fetchError = null } = {}) {
   // 空池：应给出空态而不是空白
   const empty = await renderPanel({
     plugin: MODULE_ID, version: PLUGIN_VERSION, updatedAt: Date.now(),
-    settings: { maskKeyPreview: true }, totals: { poolSize: 0, readyKeys: 0, coolingKeys: 0 }, extras: {}, keys: [], recent: [],
+    totals: { poolSize: 0, readyKeys: 0, coolingKeys: 0 }, extras: {}, keys: [], recent: [],
   })
   const emptyText = textOf(empty.tree).join('\n')
   check('C22 空池时显示空态引导', emptyText.includes('还没有捕获到 Cline Key'), emptyText.slice(0, 40))

@@ -337,17 +337,11 @@ export function apply(ctx, config) {
           config,
           pool,
           diag,
-          quotaStore,
           // getter：settings 可能比插件晚就绪，取的时候再读，别在构建期固化
           get settings() {
             return settingsService
           },
           clineMatch,
-          clineCooldownMs,
-          failFastMinMs,
-          skipCoolingRequestKey,
-          allCoolingFailFast,
-          rotateStatuses,
         },
         options,
       ),
