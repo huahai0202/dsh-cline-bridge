@@ -26,7 +26,7 @@ const server = createServer((req, res) => {
     try {
       model = JSON.parse(body).model ?? '?'
     } catch {}
-    seen.push({ key, model, headers: req.headers })
+    seen.push({ key, model, headers: req.headers, body })
 
     if (TRANSIENT_PREFIXES.some((p) => key === p || key.startsWith(p))) {
       res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '3' })
@@ -195,6 +195,40 @@ const since = (n) => seen.slice(n)
   const r2 = await call('k1')
   const a2 = since(n2)
   check('J2 开启后冷却中的 key 不再被先撞（一次成功）', r2.status === 200 && a2.length === 1 && a2[0].key === 'k2', a2.map((a) => a.key).join('→'))
+}
+
+// ── K. 轮换重发是否影响会话内容：请求体必须逐字节相同 ────────────────
+{
+  mount({ clineKeys: ['k1', 'k2'], clineMatch: match })
+  const payload = JSON.stringify({
+    model: 'deepseek/deepseek-v4.1-flash',
+    max_tokens: 256,
+    messages: [
+      { role: 'system', content: 'You are a helpful coding agent.' },
+      { role: 'user', content: '第一轮问题：读一下 index.js' },
+      { role: 'assistant', content: '第一轮回答：已读取' },
+      { role: 'user', content: '第二轮追问：继续改' },
+    ],
+    tools: [
+      { type: 'function', function: { name: 'read_file', parameters: { type: 'object', properties: { path: { type: 'string' } } } } },
+    ],
+  })
+  const n = mark()
+  const res = await globalThis.fetch(ENDPOINT, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer k1' },
+    body: payload,
+  })
+  await res.text()
+  const attempts = since(n)
+
+  check('K1 轮换后成功（同一次调用内完成）', res.status === 200 && attempts.length === 2, attempts.map((a) => a.key).join('→'))
+  check(
+    'K2 重发的请求体与原请求逐字节相同（对话历史不被改动）',
+    attempts.length === 2 && attempts[0].body === payload && attempts[1].body === payload,
+    `len=${attempts[1]?.body?.length ?? 0}/${payload.length}`,
+  )
+  check('K3 两次仅鉴权头不同，其余 Cline 指纹头一致', attempts[0].key === 'k1' && attempts[1].key === 'k2' && attempts[0].headers['x-client-type'] === attempts[1].headers['x-client-type'])
 }
 
 dispose()
