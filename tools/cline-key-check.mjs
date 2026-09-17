@@ -432,6 +432,35 @@ const since = (n) => seen.slice(n)
   const r2 = await call('k1')
   const a2 = since(n2)
   check('N2b 文件稍后出现后额外 key 自动补入池（无永久上锁）', r2.status === 200 && a2.some((x) => x.key === 'z9'), attemptsText(a2))
+
+  // N3：**已经成功读到过 key 之后**再往凭据文件里补一把新 ref —— 这是用户最常见的动作
+  //（「新增这个 key」）。曾经这里被 `!extrasResolved` 门控挡住：首次读到就再也不读文件，
+  // 新 key 必须重启 DSH 才生效，而 README 承诺的是「每 5 分钟复扫」。
+  // 设计：文件里先只有 _2（值 k5x，mock 里 k5 前缀必限流），主 key k1 也限流，
+  // 于是首次请求必然撞满 429；随后追加 _5（值 z5，健康），验证新 key 能顶上。
+  const growPath = join(TEST_STATE_DIR, `credentials-grow-${++stateSeq}.yaml`)
+  writeFileSync(growPath, ['version: 1', 'refs:', '  CLINE_API_KEY_2: "k5x"'].join('\n'))
+  const growCtx = mount({ clineKeys: ['k1'], clineMatch: match, credentialsFile: growPath })
+  const g1 = mark()
+  const rg1 = await call('k1')
+  const ag1 = since(g1)
+  check('N3a 首次读到额外 key 后进入已解析状态，且当时池内只有两把',
+    rg1.status === 429 && ctxStatus().extras.extrasResolved === true && ctxStatus().keys.length === 2,
+    `${attemptsText(ag1)} 池=${ctxStatus().keys.length}`)
+
+  // 往同一个文件里追加一把新 ref（模拟用户新加了一把 key）
+  writeFileSync(growPath, ['version: 1', 'refs:', '  CLINE_API_KEY_2: "k5x"', '  CLINE_API_KEY_5: "z5"'].join('\n'))
+  // 用 force 越过 5 分钟节流，走的是与自动复扫完全相同的那条读盘路径
+  await growCtx.__opencodeFreeBridge.ensureExtras({ force: true })
+  const poolLabels = ctxStatus().keys.map((k) => k.label)
+  check('N3b 已解析状态下新增的 ref 会被复扫发现（池从 2 把变 3 把）',
+    ctxStatus().keys.length === 3, `池内 ${poolLabels.length} 把`)
+
+  // 关键：新加的那把真的能被用起来 —— k1 与 k5x 都限流后必须轮到 z5
+  const g2 = mark()
+  const rg2 = await call('k1')
+  const ag2 = since(g2)
+  check('N3c 新增的 key 无需重启即可承接轮换', rg2.status === 200 && ag2.some((x) => x.key === 'z5'), attemptsText(ag2))
 }
 
 dispose()

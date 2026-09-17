@@ -1,6 +1,6 @@
 export const name = 'opencode-free-bridge'
 
-const PLUGIN_VERSION = '1.8.0'
+const PLUGIN_VERSION = '1.8.1'
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -427,14 +427,18 @@ function createKeyPool(quotaStore, diag, log) {
 
       const refs = config?.clineKeyRefs ?? DEFAULT_CLINE_KEY_REFS
 
-      // 主来源：直读 .credentials.yaml 的 refs 段（只取需要的 ref）
-      if (!extrasResolved && config?.readCredentialsFile !== false) {
+      // 主来源：直读 .credentials.yaml 的 refs 段（只取需要的 ref）。
+      // 注意这里**不能**加 `!extrasResolved` 门控：那样一旦首次读到 key 就再也不读文件，
+      // 运行期新加的 ref（用户刚往凭据文件里补一把 key）必须重启 DSH 才生效，
+      // 而 README 承诺的是「成功读到后每 5 分钟复扫」。省流是由上面的 throttle 保证的：
+      // 已解析时 ensureExtras 本身每 5 分钟才走到这里一次，所以读盘频率仍是每 5 分钟一次。
+      if (config?.readCredentialsFile !== false) {
         const path = resolveCredentialsFilePath(config)
         try {
           const fromFile = readCredentialRefsFromFile(path, refs)
           for (const [ref, value] of fromFile) register(value, `.credentials.yaml: ${ref}`)
           diag.credentialsFileRead = true
-          // 兜底成功也算已解析：改为 5 分钟复扫，避免每个请求都读盘
+          // 读到过 key 就按「已解析」走 5 分钟节流；没读到则保持 2 秒重试（文件可能稍后才出现）
           if (fromFile.size > 0) extrasResolved = true
         } catch {
           diag.credentialsFileRead = false
@@ -1046,6 +1050,8 @@ export function apply(ctx, config) {
     clineKeys: () => pool.snapshot(),
     status: (options) => statusRoute.build(options),
     routePath: statusRoute.path,
+    // 强制立刻重扫一次额外 key 来源（自检用；运行期新增 ref 的正式路径是 5 分钟自动复扫）
+    ensureExtras: (options) => pool.ensureExtras(ctx, config, options),
     parseRetryWindowMs,
     quotaStatePath: quotaStore.path,
     flushQuotaState: () => quotaStore.flush(),
