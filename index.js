@@ -2,10 +2,12 @@ export const name = 'opencode-free-bridge'
 
 // 本文件只做两件事：把各模块装配起来，以及实现 fetch 层拦截。
 // 具体实现按职责拆在 lib/host/ 下：defaults(常量与路径) / ids(ID 与标签) /
-// quota-state(额度落盘) / request-shape(请求形状) / credentials(凭据文件) /
-// usage(token 采集) / key-pool(key 池) / status(面板载荷) / http(路由小工具)。
+// quota-state(额度落盘) / request-shape(请求形状) / credentials(凭据文件读+兜底写) /
+// key-import(面板导入) / usage(token 采集) / key-pool(key 池) / status(面板载荷) /
+// http(路由小工具)。
 import {
   CLINE_ROTATE_STATUSES,
+  DEFAULT_CLINE_KEY_REFS,
   DEFAULT_CLINE_MATCH,
   DEFAULT_CLINE_COOLDOWN_MS,
   DEFAULT_FAIL_FAST_MIN_MS,
@@ -13,6 +15,7 @@ import {
   PLUGIN_VERSION,
   TERMINAL_CAP_RE,
   TERMINAL_WINDOW_MS,
+  resolveCredentialsFilePath,
   resolveQuotaStatePath,
 } from './lib/host/defaults.js'
 import { OPENCODE_UA, canonicalSession, keyLabel, opencodeId } from './lib/host/ids.js'
@@ -21,7 +24,9 @@ import { readAuthTarget, readKeyOf, readModelOf, replayableBody, writeKeyTo } fr
 import { normalizeUsage, tapUsage } from './lib/host/usage.js'
 import { createKeyPool } from './lib/host/key-pool.js'
 import { buildStatus } from './lib/host/status.js'
-import { isTrustedRequest, sendJson } from './lib/host/http.js'
+import { isTrustedRequest, readJsonBody, sendJson } from './lib/host/http.js'
+import { readCredentialRefsFromFile, writeCredentialRefToFile } from './lib/host/credentials.js'
+import { importClineKeys, MAX_IMPORT_KEYS } from './lib/host/key-import.js'
 
 export function apply(ctx, config) {
   const originalFetch = globalThis.fetch
@@ -40,6 +45,13 @@ export function apply(ctx, config) {
   // 不再发一次注定失败的请求（报文里的恢复时刻就是依据）。默认开启，可配置关闭。
   const allCoolingFailFast = config?.allCoolingFailFast !== false
   const failFastMinMs = Number.isFinite(config?.failFastMinMs) ? Math.max(0, config.failFastMinMs) : DEFAULT_FAIL_FAST_MIN_MS
+  // 设置面板里「导入 Key」的写入口（POST 路由）。默认开启；置 false 则整条写路由拒绝服务
+  // （只读面板照常），供不需要这条通道的部署关掉。
+  const keyImportEnabled = config?.keyImport !== false
+  // 允许导入写入的 ref 名单：与 key-pool 读盘用的是同一份（未列出的 ref 一律不碰）
+  const wantedKeyRefs = Array.isArray(config?.clineKeyRefs) ? config.clineKeyRefs : DEFAULT_CLINE_KEY_REFS
+  // 导入正文字节上限：面板是手工粘贴几十把 Key 的量级，64KB 绰绰有余
+  const MAX_IMPORT_BODY = 64 * 1024
   const quotaStore = createQuotaStore(resolveQuotaStatePath(config))
   // 诊断信息随状态文件落盘：池规模、额外 key 来源、各类决策计数（便于线上排查“为什么没换 key”）
   const diag = {
@@ -73,6 +85,21 @@ export function apply(ctx, config) {
     } catch {
       // 日志失败绝不影响请求
     }
+  }
+
+  // 凭据服务（可选）：导入 Key 的**写**优先走它——带文件锁的原子写 + 变更通知，
+  // 与 DSH 设置页写凭据是同一条路径。仍然用非门控的 ctx.inject：服务缺席时插件照常工作，
+  // 导入退化为直写凭据文件（读侧本来就有这条兜底）。
+  let credentialsService
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['credentials'], (credentialsCtx) => {
+      credentialsService = credentialsCtx.get('credentials') ?? credentialsCtx.credentials
+      // 凭据一变（面板导入、DSH 设置里改 ref、乃至手工编辑文件被服务观察到）立刻重扫 key 池，
+      // 不必等 EXTRAS_TTL_MS 那 5 分钟节流——「刚加进去的 key 为什么不在池子里」就是这么来的。
+      credentialsCtx.on?.('credentials/reference-updated', () => {
+        void pool.ensureExtras(ctx, config, { force: true }).catch(() => {})
+      })
+    })
   }
 
   globalThis.fetch = async function (input, init) {
@@ -319,6 +346,106 @@ export function apply(ctx, config) {
     quotaStore.flush()
   })
 
+  // ───────────────────── 设置面板：导入 Key（写路由） ─────────────────────
+  // 面板上「插件版本」右边的按钮就是这条通道：把粘贴进来的 Key 写进凭据仓库
+  // （优先凭据服务），写完立刻重扫进池，当轮即可参与轮换。
+  //
+  // 这是一条**写**路由，因此比只读状态路由多三道闸：
+  //   · 只接受 POST + application/json（挡住表单/文本这类无需预检的跨站简单请求）；
+  //   · 同源校验与只读路由完全一致（Referer 必须与 Host 同源）；
+  //   · 正文带上限（MAX_IMPORT_BODY），超限立刻断开。
+  // 除此之外它只写 refs 段里名单内的 ref，且回包只带 ref / 哈希标签 / 掩码——没有 Key 原文。
+  const importPath = '/opencode-free-bridge/cline-keys/import'
+
+  /** ref → 当前值：凭据服务优先（反映 DSH 眼里的真实值），服务缺席或未就绪时直读文件。 */
+  const readClineKeyRefs = async () => {
+    const values = new Map(wantedKeyRefs.map((ref) => [ref, undefined]))
+    const service = credentialsService
+    if (service && typeof service.resolve === 'function') {
+      await Promise.all(
+        wantedKeyRefs.map(async (ref) => {
+          try {
+            const found = await service.resolve(ref)
+            if (found && typeof found.value === 'string' && found.value) values.set(ref, found.value)
+          } catch {
+            // 单个 ref 解析失败只影响它自己：按「未占用」处理，导入时再用写路径的报错说话
+          }
+        }),
+      )
+      return { values, source: 'credentials' }
+    }
+    try {
+      for (const [ref, value] of readCredentialRefsFromFile(resolveCredentialsFilePath(config), wantedKeyRefs)) {
+        values.set(ref, value)
+      }
+    } catch {
+      // 文件不存在/不可读：当作全都空着，写的时候再报错
+    }
+    return { values, source: 'file' }
+  }
+
+  /** 凭据服务缺席时的兜底写：直写凭据文件的 refs 段。 */
+  const writeCredentialKeyToFile = (ref, value) => writeCredentialRefToFile(resolveCredentialsFilePath(config), ref, value)
+
+  /** 写一个 ref：凭据服务优先（带文件锁的原子写 + 变更通知），缺席时直写凭据文件。 */
+  const writeClineKeyRef = async (ref, value) => {
+    const service = credentialsService
+    if (service && typeof service.set === 'function') return service.set(ref, value)
+    writeCredentialKeyToFile(ref, value)
+  }
+
+  const handleKeyImport = async (req, res) => {
+    if (!keyImportEnabled) return sendJson(res, 403, { error: 'key import is disabled (config.keyImport = false)' })
+    if (req.method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' })
+    if (!isTrustedRequest(req)) return sendJson(res, 403, { error: 'untrusted request' })
+    const contentType = String(req.headers?.['content-type'] ?? '')
+    if (!/^application\/json\b/i.test(contentType)) {
+      return sendJson(res, 415, { error: 'content-type must be application/json' })
+    }
+
+    let payload
+    try {
+      payload = await readJsonBody(req, MAX_IMPORT_BODY)
+    } catch (error) {
+      const tooLarge = error?.code === 'PAYLOAD_TOO_LARGE'
+      return sendJson(res, tooLarge ? 413 : 400, { error: String(error?.message ?? error) })
+    }
+    const text =
+      typeof payload?.keys === 'string' ? payload.keys : Array.isArray(payload?.keys) ? payload.keys.join('\n') : ''
+    if (!text.trim()) return sendJson(res, 400, { error: 'no keys in request body' })
+
+    const current = await readClineKeyRefs()
+    const report = await importClineKeys({
+      text,
+      refs: wantedKeyRefs,
+      existing: current.values,
+      writeRef: writeClineKeyRef,
+      // 池内已知标签：粘一把已经在用的 Key 会被判为重复，而不是又写一份
+      poolLabels: new Set(pool.snapshot().map((entry) => entry.label)),
+    })
+
+    // 只有真写进去了才重扫：把新 ref 立刻收进池子（顺带刷新来源标签与池大小）
+    if (report.imported.length > 0) {
+      await pool.ensureExtras(ctx, config, { force: true }).catch(() => {})
+    }
+    // 日志只有计数，没有 Key 材料
+    log(
+      '导入 Key：新增 ' + report.imported.length + '，重复 ' + report.duplicates.length +
+        '，拒绝 ' + report.rejected.length + '，失败 ' + report.failed.length + '（来源：' + current.source + '）',
+    )
+    return sendJson(res, 200, {
+      ok: true,
+      writeMode: current.source,
+      imported: report.imported,
+      duplicates: report.duplicates,
+      rejected: report.rejected,
+      failed: report.failed,
+      refsFree: report.refsFree,
+      poolSize: pool.size,
+      maxKeys: MAX_IMPORT_KEYS,
+    })
+  }
+
   // ───────────────────── 设置面板：只读状态路由 ─────────────────────
   // 面板本体是浏览器半边（lib/client.js，经 package.json 的 dsh.client 声明由
   // dsh-client-modules 打包投放）；它需要主机端把 key 池状态交出来，这里用一条
@@ -374,6 +501,20 @@ export function apply(ctx, config) {
             },
           }),
         'opencode-free-bridge: cline keys route',
+      )
+      // 导入路由与只读路由同一个 webServer 门（headless/acp 下两条一起缺席，主链路不受影响）
+      webCtx.effect(
+        () =>
+          webCtx.webServer.register({
+            kind: 'exact',
+            path: importPath,
+            handler: (req, res) => {
+              handleKeyImport(req, res).catch((error) => {
+                if (!res.headersSent) sendJson(res, 500, { error: String(error?.message ?? error) })
+              })
+            },
+          }),
+        'opencode-free-bridge: cline key import route',
       )
     })
   }

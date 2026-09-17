@@ -21,6 +21,7 @@
     - 主 Key 完全由用户在 DSH 设置中配置，原生透传直通，不设代码层内置 Key 兜底；
     - **可选**多 Key 池：额外提供 Key 后，撞到「每日免费额度」类限流会自动换 Key 重发（未提供额外 Key 时行为与之前完全一致，零影响）；
     - **设置页面板**：在 DSH 设置里新增「Cline Key」分区，逐把列出每个 Key 的来源、掩码预览、健康/冷却状态、各模型的恢复倒计时与本次运行的用量（发送 / 成功 / 限流）。
+    - **面板直接导入 Key**：面板右上角（插件版本卡右边）一个「导入 Key」按钮，粘贴一把或多把即可写进凭据仓库的空闲槽位（`CLINE_API_KEY_2`~`_10`），写完立刻进池、当轮即可参与轮换；重复的自动跳过，可用 `keyImport: false` 关掉整条写入口。
 - **100% 流量精准隔离**：
   - 仅在网络请求目标为 `opencode.ai/zen` 或 `api.cline.bot` 时介入；
   - 对 DeepSeek 官方模型、OpenAI、Claude、Gemini 等其他所有渠道 100% 原样直通，零副作用。
@@ -75,17 +76,18 @@ Cline 的免费额度是**按 Key + 按模型**的每日上限，撞限流时服
 
 > DSH 原生不支持多 Key：`apiKeyEnv` 是单个凭据引用，路由在请求进入 pi-ai 前只解析出一个 Key，pi-ai 的重试也始终复用同一个 Key。所以这个能力只能由插件在 fetch 层提供。
 
-### 提供额外 Key 的三种方式（可组合）
+### 提供额外 Key 的四种方式（可组合）
 
 | 方式 | 用法 |
 | --- | --- |
+| **设置面板导入（最省事）** | DSH 设置 → **Cline Key** → 右上角「**导入 Key**」：粘贴（一行一把，也认空格/逗号分隔）→ 导入。插件会把它们写进凭据仓库的空闲槽位 `CLINE_API_KEY_2`~`_10`，池内已有的自动跳过，导入完立刻参与轮换 |
 | **`.credentials.yaml`（默认）** | 在 `<DSH_HOME>/.credentials.yaml` 的 `refs` 下存 `CLINE_API_KEY_2`、`CLINE_API_KEY_3`…（插件默认探测 `_2`~`_10`）。可用 `clineKeyRefs` 改成别的 ref 名，**未列出的 ref 一律忽略** |
 | **启动环境变量** | 启动 DSH 前设置 `CLINE_API_KEYS=k2,k3`（逗号/空格/分号分隔），或直接 `CLINE_API_KEY_2`、`CLINE_API_KEY_3`… |
 | **插件 config** | 在 profile 的 `cordis.patch.yml` 里给条目加配置（支持 `!!js` 表达式） |
 
-> 额外 Key 的解析**不会一次性上锁**：首次未读到（例如文件稍后才出现）会每 2 秒重试，成功读到后每 5 分钟复扫一次——运行期新增的 ref 也会被发现。
+> 额外 Key 的解析**不会一次性上锁**：首次未读到（例如文件稍后才出现）会每 2 秒重试，成功读到后每 5 分钟复扫一次——运行期新增的 ref 也会被发现。另外，插件的**写**路径（面板导入）优先走 DSH 的凭据服务，服务写完之后会发 `credentials/reference-updated`；插件订阅了该事件并立刻强制重扫一次，所以「导入 / 在 DSH 设置页改 ref / 手工编辑凭据文件」都会在下一秒进入池子，不必等那 5 分钟。
 >
-> **为什么不用 DSH 凭据服务**（已实测确认，勿再尝试）：Cordis 只在插件声明依赖时才把服务名映射进它的 isolate，未声明时 `ctx.get('credentials')` 会**静默返回 undefined**；而插件 ctx 上并不存在 `ctx.inject(deps, cb)`（`ctx.root` 上也没有）。唯一替代是 `export const inject = ['credentials']`，但那会让**整个插件**被该服务门控——服务一旦缺席，连 Zen 头注入一起失效。收益远小于风险，故改为直读凭据文件。
+> **为什么读盘仍然直读文件**：凭据服务可能在插件挂载之后才就绪，而读侧不能在服务缺席时失效，所以保留 `.credentials.yaml` 直读作兜底；`ctx.inject(['credentials'], cb)` 只是**可选加速**与写入通道，服务缺席时插件照常工作（导入退化为直写文件）。注意这里用的是子 fiber 的 `ctx.inject`，**不是**模块级 `export const inject = ['credentials']`——后者会把整个插件（含 Zen 头注入）门控在该服务上。
 >
 > 排查入口：状态文件里带 `diagnostics` 字段（插件版本、`credentialsFileRead`、`poolSize`、`clineRequests`/`rotations`/`failFasts` 计数、`lastDecision`、各 Key 的冷却模型），一眼能看出「为什么没换 Key」。日志里 Key 只以 8 位哈希标签出现。
 
@@ -111,6 +113,8 @@ Cline 的免费额度是**按 Key + 按模型**的每日上限，撞限流时服
     # failFastMinMs: 300000
     # 可选：设置面板里是否显示 Key 的首尾各 4 位掩码（默认 true；设 false 则连片段也不下发）
     # maskKeyPreview: false
+    # 可选：设置面板里的「导入 Key」写入口（默认 true；设 false 则整条写路由一律 403，只读面板照常）
+    # keyImport: false
 ```
 
 ### 用报错里的「恢复时刻」做的三件事
@@ -139,7 +143,7 @@ refs:
 - 撞限流后按 **`key + 模型`** 维度记录冷却：同一个 Key 在模型 A 上耗尽，不影响它在模型 B 上继续用；重试窗口优先从报文的 `Try again in 22h 47m` 解析，解析不出则用 `clineCooldownMs`。
 - 挑选备用 Key 时**粘性优先**：一直用同一把（最近在用的那把），**直到它也撞上限才换下一把**，并始终跳过该模型上已冷却者。原因是 Cline 的免费额度按 `key + 模型` 每日重置：摊开轮换会让池内所有 Key 几乎同时逼近上限、一起失去后备；压着一把烧完再换，池子里才始终留着没动过的额度。面板上会看到某一把的「发送」持续增长、其余保持 0，这是预期形态。
 - 备用 Key 全部失败时区分收尾：**额度耗尽类**（`INFERENCE_CAP_ERROR` / 报文含 `Daily free limit` / 窗口 ≥ 10 分钟）会附加 `x-should-retry: false`，让 pi-ai 立即放弃而不是空等退避；**瞬时限流**则原样返回，交给 pi-ai 按 `retry-after` 自行重试。
-- Key 原文永不写日志，只记录 8 位哈希标签；额度状态落盘时同样只写标签，**文件里不含任何 key**。设置页面板是唯一的例外通道：它经同源只读路由展示每个 Key 的**首尾各 4 位掩码**（例如 `sk-a…9f2c`），方便你认出是哪一把；可用 `maskKeyPreview: false` 彻底关闭。
+- Key 原文永不写日志，只记录 8 位哈希标签；额度状态落盘时同样只写标签，**文件里不含任何 key**。设置页面板是唯一的例外通道：它经同源只读路由展示每个 Key 的**首尾各 4 位掩码**（例如 `sk-a…9f2c`），方便你认出是哪一把；可用 `maskKeyPreview: false` 彻底关闭。面板上的「导入 Key」是唯一的**写**通道，且只往 `clineKeyRefs` 名单内的备用 ref 写你亲手粘贴的 Key——它不读取、不回显、也不改动别人的 Key。
 - 冷却状态跨 DSH 重启保留（见下「用报错里的恢复时刻做的三件事」）；缓存成功后自动清除对应记录。
 
 ### 设置页面板（Cline Key）
@@ -162,6 +166,22 @@ refs:
 > 表格里的 `16/15/1` 与 `12.3k/1.2k` 是**紧凑写法**（列宽只有百来像素）；每个数字的确切含义在下方的「按模型用量」卡里逐列标注。
 
 面板顶部还有池大小、可用/冷却把数、`Cline 请求` / `换 Key 恢复` / `快速失败` 三个累计计数与插件版本；表格下方依次是**「按模型用量」**与「最近决策」（最近几条请求的模型与决策文本）。面板每 5 秒自动刷新一次（页面不可见时暂停），也可手动刷新。
+
+**导入 Key（插件版本卡右边的按钮）。** 点开是一个粘贴框（取消按钮 / 点遮罩 / `Esc` 都能关）：**一行一把**（也认空格 / 逗号 / 分号分隔，会顺手剥掉包裹引号与 `Bearer ` 前缀）。提交后插件把每一把落到凭据仓库里**最小的空闲槽位**（`CLINE_API_KEY_2` → `_10`），写完立刻重扫 Key 池，因此导入完当轮就能参与轮换，**不需要重启**。结果按四类收口：
+
+| 结果 | 含义 |
+| --- | --- |
+| **已导入 n 把** | 写入成功的槽位会逐一列出（如 `CLINE_API_KEY_6`、`CLINE_API_KEY_7`） |
+| **跳过 n 把（池内已存在）** | 按 8 位哈希标签判重：已经在池子里的 Key 不会再写一份，也不会多占槽位 |
+| **忽略 n 条（格式不符）** | 太短 / 太长 / 含控制字符 / 超出单次上限（20 把）/ 没有空闲槽位，逐条给出掩码与原因 |
+| **写入失败 n 把** | 底层写盘报错（例如该 ref 被启动环境变量遮蔽，凭据服务会拒绝写入），原文错误一并回显 |
+
+细节与边界：
+
+- **写入走哪条路**：优先 DSH 凭据服务的 `set()`（带文件锁的原子写 + 变更通知，与 DSH 设置页写凭据同一条路径）；服务缺席或尚未就绪时退化为**直写 `.credentials.yaml`**——同样走「同目录临时文件 + 改名」，并且**不碰文件的其余内容**（`records` 段、注释、行尾风格一律保留）。
+- **只写名单内的 ref**：`clineKeyRefs`（默认 `_2`~`_10`）之外的 ref 一律不碰；槽位用尽时明确回 `no-free-ref`，并提示先删掉不用的 `CLINE_API_KEY_n`。
+- **不算主 Key**：它不会去改 DSH 里配置的 `CLINE_API_KEY`（那是 `apiKeyEnv` 指向的主 Key）；面板只往备用槽位里加。
+- **关掉它**：`keyImport: false` 后写路由一律 403（返回一句说明），只读面板照常工作。
 
 **按模型用量（含 token）。** 每把 Key 逐行列出它在**每个模型**上的实际用量——`发送/成功/限流`、**`输入/输出 Token`**（配一根占比条）与最近使用时间；标题行给出当前范围的**合计**：
 
@@ -191,7 +211,14 @@ refs:
 
 > 每把 Key 的**来源**（`DSH 请求头` / `config: clineKeys[n]` / `env: CLINE_API_KEY_n` / `.credentials.yaml: REF`）仍由主机端记录并保留在状态载荷里（自检会断言它），只是不再显示在面板上。原先随「运行参数」卡一起下发的配置摘要（匹配目标、冷却时长、快速失败阈值、掩码开关、凭据文件路径）已从载荷中移除——面板从不需要它，而真正的排查入口是额度状态文件里的 `diagnostics` 字段。
 
-> **数据通道与隐私边界**：主机半边只在 `ctx.inject(['webServer'], …)` 里注册一条**只读** `GET /opencode-free-bridge/cline-keys`，把状态交给浏览器半边渲染。该路由强制同源校验（`Referer` 必须与 `Host` 同源）、只允许 `GET`/`HEAD`、回包带 `no-store`。它下发的只有哈希标签、掩码预览、来源标签、冷却时刻与计数——**没有任何 key 原文，也不回显 `config.clineKeys`**；掩码只在内存里现算，磁盘状态文件里依旧连掩码都没有。全程用 `node tools/cline-panel-check.mjs` 断言这一点。
+> **数据通道与隐私边界**：主机半边只在 `ctx.inject(['webServer'], …)` 里注册两条同源路由，都带 `no-store`，都不出现任何 Key 原文：
+>
+> | 路由 | 用途 | 闸门 |
+> | --- | --- | --- |
+> | `GET /opencode-free-bridge/cline-keys` | **只读**：把池状态交给浏览器半边渲染 | 同源 `Referer` 校验；只允许 `GET`/`HEAD`。只下发哈希标签、掩码预览、来源标签、冷却时刻与计数——**不回显 `config.clineKeys`**，也不含任何 Key 原文；掩码只在内存里现算，磁盘状态文件里连掩码都没有 |
+> | `POST /opencode-free-bridge/cline-keys/import` | **写**：把面板里粘贴的 Key 写进备用槽位 | 同源 `Referer` 校验；只允许 `POST`；必须 `application/json`（挡住表单/文本这类无需预检的跨站简单请求）；正文上限 64KB；可用 `keyImport: false` 整条关掉。回包只有 ref、哈希标签与掩码 |
+>
+> 两条路由都只在 `ctx.inject(['webServer'], …)` 的子 fiber 里注册，headless / acp / desktop 这些没有 `webServer` 的 profile 里它们一起缺席，主链路（fetch 补丁）不受影响。全程用 `node tools/cline-panel-check.mjs` 断言：回包不含 Key 原文、写路由的每道闸门、以及磁盘状态文件里连掩码都没有。
 >
 > **不门控主链路**：路由等待 `webServer` 用的是 `ctx.inject([...])` 子 fiber，而不是模块级 `export const inject = ['webServer']`。后者会把整个插件（包括 fetch 补丁）门控在 webServer 上，让 headless / acp / desktop 等没有 webServer 的 profile 连渠道桥接一起失效。
 
@@ -203,17 +230,18 @@ refs:
 
 | 文件 | 行数 | 职责 |
 | --- | --- | --- |
-| `index.js` | ~400 | 插件入口：装配各模块 + 实现 fetch 层拦截（Zen 头注入 / Cline 换 Key 轮换） |
+| `index.js` | ~533 | 插件入口：装配各模块 + 实现 fetch 层拦截（Zen 头注入 / Cline 换 Key 轮换）+ 面板只读/导入两条路由 |
 | `lib/host/defaults.js` | ~48 | 插件版本、各通道可调常量、DSH 路径解析 |
 | `lib/host/ids.js` | ~116 | opencode 会话/请求 ID 生成；key 的 8 位哈希标签与掩码预览 |
 | `lib/host/quota-state.js` | ~132 | 额度状态落盘（跨重启保留）+ 重试窗口解析 |
 | `lib/host/request-shape.js` | ~58 | 读请求形状：body 可否重发、模型名、鉴权头读写 |
-| `lib/host/credentials.js` | ~32 | 兜底读取 `.credentials.yaml` 的 refs 段 |
+| `lib/host/credentials.js` | ~87 | 兜底读取 `.credentials.yaml` 的 refs 段；凭据服务缺席时的兜底写入（保留其余内容 + 临时文件改名） |
+| `lib/host/key-import.js` | ~106 | 面板导入：粘贴文本解析、空闲 ref 分配、写入编排（不含 Key 原文的返回值） |
 | `lib/host/usage.js` | ~95 | Token 用量采集（tee 出只读分支扫 usage） |
 | `lib/host/key-pool.js` | ~264 | key 池：来源、按 `key+模型` 冷却、粘性选 Key、按模型用量 |
-| `lib/host/status.js` | ~155 | 设置面板的状态载荷（唯一的对外数据出口，字段白名单） |
-| `lib/host/http.js` | ~28 | 只读路由的 JSON 响应与同源校验 |
-| `lib/client.js` | ~818 | 浏览器半边：设置页分区（**必须单文件**，见下） |
+| `lib/host/status.js` | ~137 | 设置面板的状态载荷（唯一的对外数据出口，字段白名单） |
+| `lib/host/http.js` | ~80 | 路由的 JSON 响应、同源校验、带上限的 JSON 正文读取 |
+| `lib/client.js` | ~984 | 浏览器半边：设置页分区（含导入按钮与弹窗）（**必须单文件**，见下） |
 
 > **为什么 `lib/client.js` 不能拆分**：DSH 的客户端模块系统是「**一个包 = 一个 bundle**」——`package.json` 的 `exports['./client']` 只能指向单个文件，浏览器侧模块图是 flat 的（每个 bundle 只与平台基线表相连）。bundle 之间互相 `require` 只能通过 `dsh.client.external` 声明，而那要求**另发一个包**。所以除非引入构建步骤（tsdown/esbuild 把多个源文件打成单个 `lib/client.js`，如 `dsh-better-sidebar` 那样），客户端半边只能保持一个手写文件。主机半边没有这个限制，因为 Node ESM 的相对 import 天然支持包内多文件。
 
@@ -258,14 +286,18 @@ node tools/self-check.mjs cline-key  # 只跑名字匹配的分项
 node tools/zen-check.mjs          # 离线断言：头部形状、会话稳定性、渠道隔离、dispose 还原
 node tools/zen-check.mjs --live   # 追加真实网络调用，确认免费通道确实放行
 node tools/cline-key-check.mjs    # Cline 多 Key 轮换：本地 mock 服务器复刻 429，无需真实 Key
-node tools/cline-panel-check.mjs  # 设置页面板：只读路由契约 + 浏览器半边真实渲染
+node tools/cline-panel-check.mjs  # 设置页面板：只读/导入路由契约 + 浏览器半边真实渲染
 ```
 
 可用 `ZEN_FREE_MODEL=xxx node tools/zen-check.mjs --live` 指定探测用的免费模型。
 
 `cline-key-check.mjs` 覆盖：换 Key 恢复、按模型冷却、**粘性选 Key（先烧完一把再换下一把）**、三种 Key 来源（config / 环境变量 / 凭据仓库）、单 Key 与瞬时限流下的收尾差异、**额度状态跨重启持久化**、**全池冷却快速失败**。
 
-`cline-panel-check.mjs` 覆盖：路由只在 `ctx.inject(['webServer'])` 里注册（不门控主链路）、同源校验与 `GET`/`HEAD` 限制、载荷**不含任何 Key 原文**且只带首尾掩码、`maskKeyPreview: false` 时连片段也不下发、**磁盘状态文件里连掩码都没有**、用量计数与来源标签正确；浏览器半边则在 `node:vm` 沙箱里用迷你 React 真正渲染一遍（有数据 / 空池 / 请求失败三条路径），断言渲染树里不出现 Key 原文。
+`cline-panel-check.mjs` 覆盖：
+
+- **主机半边**：路由只在 `ctx.inject(['webServer'])` 里注册（不门控主链路）、同源校验与 `GET`/`HEAD` 限制、载荷**不含任何 Key 原文**且只带首尾掩码、`maskKeyPreview: false` 时连片段也不下发、**磁盘状态文件里连掩码都没有**、用量计数与来源标签正确。
+- **导入写路由（L 组）**：非 `POST` → 405、非同源 → 403、非 JSON → 415、坏 JSON → 400、空正文 → 400、超 64KB → 413；正常导入落最小空闲槽位、**凭据文件里真的写对了**、池子**立刻**可见（不等 TTL）、回包只有 ref/标签/掩码、重复导入不占新槽位、脏输入按太短/太长/重复分类、槽位用尽回 `no-free-ref`、**凭据服务缺席时直写文件且保留 records 段**、凭据变更事件触发立刻重扫。
+- **浏览器半边**：在 `node:vm` 沙箱里用迷你 React 真正渲染（有数据 / 空池 / 请求失败三条路径），断言渲染树里不出现 Key 原文；**导入入口**（N 组）则把整条链路走一遍——按钮长在版本卡右边、点开是粘贴框、提交发出一次带 `application/json` 的 POST、结果以摘要收口并列出落到的 ref、成功后自动重拉一次面板数据、`Esc` 能关掉弹窗。
 
 > 自检默认把额度状态写到临时目录，不会碰你真实的 `.opencode-free-bridge-cline-quota.json`。
 

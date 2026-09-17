@@ -13,11 +13,13 @@
  */
 
 import { createServer } from 'node:http'
-import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createContext, runInContext } from 'node:vm'
 import { apply } from '../index.js'
+import { readCredentialRefsFromFile, writeCredentialRefToFile } from '../lib/host/credentials.js'
+import { parseKeyInput } from '../lib/host/key-import.js'
 
 const TEST_STATE_DIR = join(tmpdir(), `ofb-panel-state-${process.pid}`)
 mkdirSync(TEST_STATE_DIR, { recursive: true })
@@ -35,6 +37,11 @@ const SECRET_A = 'sk-live-AAAA1111BBBB2222CCCC3333DDDD4444'
 const SECRET_B = 'sk-test-EEEE5555FFFF6666GGGG7777HHHH8888'
 const MASK_A = `${SECRET_A.slice(0, 4)}…${SECRET_A.slice(-4)}`
 const MASK_B = `${SECRET_B.slice(0, 4)}…${SECRET_B.slice(-4)}`
+// 导入用：两把全新的 Key（也用于断言回包里没有原文、只有 ref/标签/掩码）
+const SECRET_C = 'sk-import-CCCC1111DDDD2222EEEE3333FFFF4444'
+const SECRET_D = 'sk-import-DDDD5555EEEE6666FFFF7777AAAA8888'
+const MASK_C = `${SECRET_C.slice(0, 4)}…${SECRET_C.slice(-4)}`
+const MASK_D = `${SECRET_D.slice(0, 4)}…${SECRET_D.slice(-4)}`
 
 /** SECRET_A 只在这个模型上撞每日上限；换到别的模型它仍然可用。 */
 const CAP_ONLY_MODEL = 'cline-free/deepseek-v4.1-flash'
@@ -96,6 +103,23 @@ const ENDPOINT = `http://${match}/api/v1/chat/completions`
 let dispose = () => {}
 let lastCtx
 const routes = []
+// 插件通过 ctx.inject(['credentials']) 订阅的监听器（凭据变更 → 立刻重扫 Key 池）
+const credentialListeners = []
+let credsSeq = 0
+
+/** 凭据服务的替身：读写都落到一个真实临时文件上（用插件自己的读写函数），
+ *  这样「导入 → 池子里真的多了一把」是端到端可见的，而不是只在内存里自说自话。 */
+function makeCredentialsService(file) {
+  return {
+    async resolve(ref) {
+      const value = readCredentialRefsFromFile(file, [ref]).get(ref)
+      return value ? { value, source: 'file' } : undefined
+    },
+    async set(ref, value) {
+      writeCredentialRefToFile(file, ref, value)
+    },
+  }
+}
 
 /** DSH 设置服务里 llm-pi-ai 的值：一个 Cline 提供方 + 一个非 Cline 提供方。
  *  用来验证面板能从配置里列出 Cline 名下的模型（而不是只从发生过的流量里学）。 */
@@ -126,7 +150,11 @@ const AGENT_DEFAULT = { provider: 'cline', model: 'z-ai/glm-5.3-flash' }
 function mount(config = {}) {
   dispose()
   routes.length = 0
+  credentialListeners.length = 0
   const settingsValues = { 'llm-pi-ai': SETTINGS_TABLE, 'agent-default-model': AGENT_DEFAULT, ...(config.__settingsValues ?? {}) }
+  // 每次挂载一个全新的凭据文件：导入测试之间不互相污染（config 里显式给了就用它的）
+  const credentialsFile = config.credentialsFile ?? join(TEST_STATE_DIR, `creds-${++credsSeq}.yaml`)
+  const credentials = makeCredentialsService(credentialsFile)
   const ctx = {
     on: (event, fn) => { if (event === 'dispose') dispose = fn },
     logger: { warn: () => {} },
@@ -140,6 +168,15 @@ function mount(config = {}) {
           effect: (factory) => factory(),
           get: (name) => (name === 'settings' ? { get: (ns) => settingsValues[ns] } : undefined),
           settings: { get: (ns) => settingsValues[ns] },
+        })
+      }
+      if (deps.includes('credentials')) {
+        if (config.__noCredentials) return undefined // 模拟凭据服务缺席（导入应退化为直写文件）
+        return callback({
+          effect: (factory) => factory(),
+          get: (name) => (name === 'credentials' ? credentials : undefined),
+          credentials,
+          on: (event, fn) => { if (event === 'credentials/reference-updated') credentialListeners.push(fn) },
         })
       }
       if (!deps.includes('webServer')) return undefined
@@ -158,7 +195,7 @@ function mount(config = {}) {
   const merged = {
     clineMatch: match,
     clineKeys: [SECRET_A],
-    credentialsFile: join(TEST_STATE_DIR, 'no-such-credentials.yaml'),
+    credentialsFile,
     quotaStatePath: join(TEST_STATE_DIR, `state-${++stateSeq}.json`),
     ...config,
   }
@@ -167,10 +204,37 @@ function mount(config = {}) {
   return ctx
 }
 
-const fakeReq = ({ method = 'GET', referer = 'http://127.0.0.1:3080/settings', host = '127.0.0.1:3080' } = {}) => ({
-  method,
-  headers: { host, referer },
-})
+const READ_PATH = '/opencode-free-bridge/cline-keys'
+const IMPORT_PATH = '/opencode-free-bridge/cline-keys/import'
+
+/** 假请求：带正文的那几条会按真实流式形状分两片投递 data、再 end，
+ *  这样「带上限的正文读取」真的走到累加与上限分支。 */
+const fakeReq = ({ method = 'GET', referer = 'http://127.0.0.1:3080/settings', host = '127.0.0.1:3080', contentType, body } = {}) => {
+  const handlers = new Map()
+  const req = {
+    method,
+    headers: { host, referer, ...(contentType === undefined ? {} : { 'content-type': contentType }) },
+    on(event, fn) {
+      const list = handlers.get(event) ?? []
+      list.push(fn)
+      handlers.set(event, list)
+      return req
+    },
+    destroy() {},
+  }
+  setTimeout(() => {
+    const list = (event) => handlers.get(event) ?? []
+    if (body !== undefined) {
+      const buffer = Buffer.from(String(body), 'utf8')
+      const half = Math.ceil(buffer.length / 2)
+      for (const chunk of [buffer.subarray(0, half), buffer.subarray(half)]) {
+        if (chunk.length) for (const fn of list('data')) fn(chunk)
+      }
+    }
+    for (const fn of list('end')) fn()
+  }, 0)
+  return req
+}
 
 /** 与插件同一套 FNV-1a 标签：测试里按标签定位某把 key 的统计行。 */
 const label8 = (value) => {
@@ -182,24 +246,40 @@ const label8 = (value) => {
   return h.toString(16).padStart(8, '0')
 }
 const fakeRes = () => {
+  let settle
+  const done = new Promise((resolve) => { settle = resolve })
   const res = {
     statusCode: 0,
     headers: {},
     body: '',
+    headersSent: false,
+    done,
     writeHead(status, headers) { res.statusCode = status; res.headers = headers || {} },
-    end(body) { if (body !== undefined) res.body += String(body) },
+    end(body) {
+      if (body !== undefined) res.body += String(body)
+      res.headersSent = true
+      settle()
+    },
   }
   return res
 }
+
+/** 调一条路由（默认只读状态路由）：等 handler 返回，也等响应真的收尾。
+ *  带 2 秒兜底，避免将来某条 handler 忘了 end 时整个自检挂死。 */
 const callRoute = async (options) => {
-  const route = routes[0]
-  if (!route) throw new Error('route not registered')
+  const route = routes.find((row) => row.path === (options?.path ?? READ_PATH))
+  if (!route) throw new Error('route not registered: ' + (options?.path ?? READ_PATH))
   const res = fakeRes()
   await route.handler(fakeReq(options), res)
+  await Promise.race([res.done, new Promise((resolve) => setTimeout(resolve, 2000))])
   let json
   try { json = JSON.parse(res.body) } catch { json = undefined }
   return { route, status: res.statusCode, headers: res.headers, body: res.body, json }
 }
+
+/** 走导入路由的一发 POST（默认带合法的同源 Referer 与 JSON Content-Type）。 */
+const importPost = (options = {}) =>
+  callRoute({ path: IMPORT_PATH, method: 'POST', contentType: 'application/json', ...options })
 
 /** 最近一次 mount 出来的插件实例的观察入口（不含 key 原文）。 */
 const ctxStatusOf = (options) => lastCtx?.__opencodeFreeBridge?.status?.(options)
@@ -207,8 +287,12 @@ const ctxStatusOf = (options) => lastCtx?.__opencodeFreeBridge?.status?.(options
 // ───────────────────────── 1. 路由注册与契约 ─────────────────────────
 {
   mount({ skipCoolingRequestKey: true })
-  check('H1 只在 ctx.inject([\'webServer\']) 里注册路由（不门控整个插件）', routes.length === 1, `routes=${routes.length}`)
-  check('H2 路由是 exact 匹配且路径固定', routes[0]?.kind === 'exact' && routes[0]?.path === '/opencode-free-bridge/cline-keys', `${routes[0]?.kind} ${routes[0]?.path}`)
+  check('H1 只在 ctx.inject([\'webServer\']) 里注册路由（不门控整个插件）', routes.length === 2, `routes=${routes.length}`)
+  const readRoute = routes.find((row) => row.path === READ_PATH)
+  const importRoute = routes.find((row) => row.path === IMPORT_PATH)
+  check('H2 只读 / 导入两条路由都是 exact 匹配且路径固定',
+    Boolean(readRoute && importRoute) && [readRoute, importRoute].every((row) => row.kind === 'exact'),
+    routes.map((row) => `${row.kind} ${row.path}`).join(' + '))
 
   const ok = await callRoute()
   check('H3 同源 GET 返回 200 JSON', ok.status === 200 && ok.json?.plugin === 'opencode-free-bridge', `status=${ok.status}`)
@@ -471,6 +555,104 @@ const ctxStatusOf = (options) => lastCtx?.__opencodeFreeBridge?.status?.(options
     JSON.stringify(onlyRequest.map((k) => k.source)))
 }
 
+// ──────────────────────── 4f. 面板导入 Key（写路由） ─────────────────────────
+// 这是插件唯一的写入口，闸门与写入结果都要逐条钉住：同源、POST + JSON、体积上限，
+// 以及「真的写进凭据文件、池子立刻可见、回包不含 Key 原文」。
+{
+  const credsFile = join(TEST_STATE_DIR, `import-creds-${++credsSeq}.yaml`)
+  mount({ clineKeys: [SECRET_A], credentialsFile: credsFile, skipCoolingRequestKey: true })
+
+  const getOnImport = await callRoute({ path: IMPORT_PATH })
+  check('L1 导入路由拒绝非 POST（405）', getOnImport.status === 405, `status=${getOnImport.status}`)
+  const untrusted = await importPost({ referer: 'http://evil.example/x', body: JSON.stringify({ keys: SECRET_C }) })
+  check('L2 导入路由同样要求同源 Referer（403）', untrusted.status === 403, `status=${untrusted.status}`)
+  const wrongType = await importPost({ contentType: 'text/plain', body: JSON.stringify({ keys: SECRET_C }) })
+  check('L3 非 application/json 被拒（415，挡住跨站简单请求）', wrongType.status === 415, `status=${wrongType.status}`)
+  const badJson = await importPost({ body: '{oops' })
+  check('L4 非法 JSON 被拒（400）', badJson.status === 400, `status=${badJson.status}`)
+  const emptyBody = await importPost({ body: JSON.stringify({ keys: '   \n  ' }) })
+  check('L5 空正文被拒（400）', emptyBody.status === 400, `status=${emptyBody.status}`)
+  const tooBig = await importPost({ body: JSON.stringify({ keys: 'x'.repeat(70 * 1024) }) })
+  check('L6 超过体积上限被拒（413）', tooBig.status === 413, `status=${tooBig.status}`)
+
+  const ok = await importPost({ body: JSON.stringify({ keys: SECRET_C + '\n' + SECRET_D }) })
+  check('L7 导入两把返回 200 与分组结果', ok.status === 200 && ok.json?.ok === true && ok.json?.imported?.length === 2, `status=${ok.status} imported=${ok.json?.imported?.length}`)
+  check('L8 回包不含任何 Key 原文', !ok.body.includes(SECRET_C) && !ok.body.includes(SECRET_D))
+  check('L9 回包只有 ref / 哈希标签 / 掩码',
+    (ok.json?.imported ?? []).every((row) => /^CLINE_API_KEY_\d+$/.test(row.ref) && /^[0-9a-f]{8}$/.test(row.label) && /^.{4}….{4}$/.test(row.preview)),
+    JSON.stringify(ok.json?.imported))
+  check('L10 落到最小的空闲槽位 _2 / _3', (ok.json?.imported ?? []).map((row) => row.ref).join(',') === 'CLINE_API_KEY_2,CLINE_API_KEY_3', (ok.json?.imported ?? []).map((row) => row.ref).join(','))
+  check('L11 有凭据服务时走服务这条写入路径', ok.json?.writeMode === 'credentials', String(ok.json?.writeMode))
+
+  const onDisk = readCredentialRefsFromFile(credsFile, ['CLINE_API_KEY_2', 'CLINE_API_KEY_3'])
+  check('L12 凭据文件里真的写进了这两个 ref 且值正确', onDisk.get('CLINE_API_KEY_2') === SECRET_C && onDisk.get('CLINE_API_KEY_3') === SECRET_D, `${onDisk.size} refs`)
+
+  const afterImport = await callRoute()
+  const afterKeys = afterImport.json?.keys ?? []
+  check('L13 导入后池子立刻包含新 Key（不等 5 分钟复扫）',
+    afterKeys.some((k) => k.label === label8(SECRET_C)) && afterKeys.some((k) => k.label === label8(SECRET_D)),
+    afterKeys.map((k) => k.label).join(','))
+  check('L14 新 Key 的来源标成它落到的凭证 ref',
+    afterKeys.find((k) => k.label === label8(SECRET_C))?.source === '.credentials.yaml: CLINE_API_KEY_2',
+    String(afterKeys.find((k) => k.label === label8(SECRET_C))?.source))
+  check('L15 只读载荷里依然没有 Key 原文', !afterImport.body.includes(SECRET_C) && !afterImport.body.includes(SECRET_D))
+
+  const again = await importPost({ body: JSON.stringify({ keys: SECRET_C }) })
+  check('L16 重复导入被判为 duplicate，不再写一遍', again.json?.duplicates?.length === 1 && again.json?.imported?.length === 0, JSON.stringify(again.json?.duplicates))
+  check('L17 重复导入没有多占槽位', readCredentialRefsFromFile(credsFile, ['CLINE_API_KEY_2', 'CLINE_API_KEY_3', 'CLINE_API_KEY_4']).size === 2)
+
+  const dirty = await importPost({ body: JSON.stringify({ keys: 'short\n' + 'x'.repeat(300) + '\n' + SECRET_C + '\n' + SECRET_C + '\nok-enough-key-value' }) })
+  check('L18 太短 / 太长被拒，同批重复与被池内重复都只算一次',
+    dirty.json?.rejected?.length === 2 && dirty.json?.duplicates?.length === 1 && dirty.json?.imported?.length === 1,
+    `rej=${dirty.json?.rejected?.length} dup=${dirty.json?.duplicates?.length} imp=${dirty.json?.imported?.length}`)
+  check('L19 被拒条目只给掩码与原因码（不回显原文）',
+    (dirty.json?.rejected ?? []).every((row) => ['too-short', 'too-long'].includes(row.reason) && row.preview.length < 20 && !dirty.body.includes('x'.repeat(50))),
+    JSON.stringify(dirty.json?.rejected))
+}
+
+// 槽位用尽：明确拒绝并说明原因，而不是静默丢掉
+{
+  const credsFile = join(TEST_STATE_DIR, `import-full-${++credsSeq}.yaml`)
+  for (let i = 2; i <= 10; i++) writeCredentialRefToFile(credsFile, `CLINE_API_KEY_${i}`, `sk-filler-${i}-`.padEnd(40, 'z'))
+  mount({ clineKeys: [], credentialsFile: credsFile })
+  const full = await importPost({ body: JSON.stringify({ keys: SECRET_C }) })
+  check('L20 空闲槽位用尽时明确拒绝（no-free-ref）',
+    full.json?.imported?.length === 0 && full.json?.rejected?.[0]?.reason === 'no-free-ref' && full.json?.refsFree === 0,
+    JSON.stringify(full.json?.rejected))
+}
+
+// 凭据服务缺席：导入退化为直写文件，且不碰文件的其余内容
+{
+  const credsFile = join(TEST_STATE_DIR, `import-keep-${++credsSeq}.yaml`)
+  writeFileSync(credsFile, 'version: 1\nrefs:\n  CLINE_API_KEY_2: "sk-old-value-000000"\nrecords:\n  client-connection/browser-session:\n    kind: grant\n    payload:\n      secret: keep-me\n', 'utf8')
+  mount({ clineKeys: [], credentialsFile: credsFile, __noCredentials: true })
+  const fallback = await importPost({ body: JSON.stringify({ keys: SECRET_D }) })
+  const text = readFileSync(credsFile, 'utf8')
+  check('L21 凭据服务缺席时直写文件仍然成功', fallback.status === 200 && fallback.json?.imported?.length === 1 && fallback.json?.writeMode === 'file', JSON.stringify(fallback.json ?? {}).slice(0, 120))
+  check('L22 兜底写入保留文件其余内容（records 段原样）', text.includes('client-connection/browser-session') && text.includes('keep-me'), text.slice(0, 40))
+  check('L23 兜底写入接着已有条目放进 refs 段', readCredentialRefsFromFile(credsFile, ['CLINE_API_KEY_2', 'CLINE_API_KEY_3']).get('CLINE_API_KEY_3') === SECRET_D)
+}
+
+// 凭据变更事件 → 立刻重扫（DSH 设置页改 ref、手工编辑文件都走这条）
+{
+  const credsFile = join(TEST_STATE_DIR, `import-event-${++credsSeq}.yaml`)
+  mount({ clineKeys: [], credentialsFile: credsFile })
+  check('L24 插件订阅了凭据变更事件', credentialListeners.length === 1, `listeners=${credentialListeners.length}`)
+  writeCredentialRefToFile(credsFile, 'CLINE_API_KEY_2', SECRET_C)
+  for (const fn of credentialListeners) fn('CLINE_API_KEY_2')
+  await new Promise((r) => setTimeout(r, 30))
+  const keys = ctxStatusOf().keys
+  check('L25 凭据变更后立刻重扫池子（不必等 TTL 节流）', keys.some((k) => k.label === label8(SECRET_C)), keys.map((k) => k.label).join(','))
+}
+
+// 解析器的边角：引号包裹、Bearer 前缀、逗号/分号分隔
+{
+  const parsed = parseKeyInput('"sk-quoted1111"\nBearer sk-bearer2222\nsk-aaaa1111,sk-bbbb2222;sk-cccc3333')
+  check('L26 解析容忍引号 / Bearer 前缀 / 逗号分号分隔',
+    parsed.values.length === 5 && parsed.values[0] === 'sk-quoted1111' && parsed.values[1] === 'sk-bearer2222' && parsed.rejected.length === 0,
+    parsed.values.join('|'))
+}
+
 // 主机半边测完再关 mock 服务器（G 组还要发请求，不能提前关）
 dispose()
 server.closeAllConnections?.()
@@ -502,7 +684,10 @@ function createMiniReact() {
 
   const React = {
     createElement(type, props, ...children) {
-      return { type, props: props || {}, children: children.flat(Infinity).filter((c) => c !== null && c !== undefined && c !== false) }
+      const list = children.flat(Infinity).filter((c) => c !== null && c !== undefined && c !== false)
+      // 真实 React 会把子节点放进 props.children；这里必须一致，否则函数组件（例如
+      // Button 桩）收到的 children 是 undefined，按钮上的文案在断言里就消失了。
+      return { type, props: { ...(props || {}), children: list }, children: list }
     },
     useState(initial) {
       const slots = slotsOf()
@@ -599,12 +784,15 @@ function table_headers(tree) {
 const CLIENT_SOURCE = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
 const MODULE_ID = 'opencode-free-bridge'
 const ROUTE = '/opencode-free-bridge/cline-keys'
+const CLIENT_IMPORT_ROUTE = '/opencode-free-bridge/cline-keys/import'
 
 /** 把客户端半边装进 vm 沙箱，返回它的模块导出。 */
 function loadClientBundle() {
   let captured
   const styleTags = []
   const mini = createMiniReact()
+  // 键盘监听（导入弹窗的 Esc）：桩里也要收得到，这样「按 Esc 关窗」才测得了
+  const keyListeners = new Map()
   const sandbox = {
     console,
     window: { __ModuleLoader__: { load: (definition) => { captured = definition } } },
@@ -615,6 +803,16 @@ function loadClientBundle() {
       getElementById: (id) => styleTags.find((el) => el.id === id) ?? null,
       hidden: false,
       createElement: () => ({ dataset: {}, textContent: '', id: '' }),
+      addEventListener(type, fn) {
+        const list = keyListeners.get(type) ?? []
+        list.push(fn)
+        keyListeners.set(type, list)
+      },
+      removeEventListener(type, fn) {
+        const list = keyListeners.get(type) ?? []
+        const at = list.indexOf(fn)
+        if (at >= 0) list.splice(at, 1)
+      },
     },
     navigator: { language: 'zh-CN' },
     setInterval: () => 1,
@@ -633,7 +831,7 @@ function loadClientBundle() {
     }
     throw new Error(`unexpected require: ${request}`)
   })
-  return { exports: exportsObj, sandbox, mini, styleTags, id: captured.id, load: captured }
+  return { exports: exportsObj, sandbox, mini, styleTags, id: captured.id, load: captured, keyListeners }
 }
 
 /** 用给定的路由载荷渲染一次面板，返回渲染树与插槽注册信息。 */
@@ -981,6 +1179,83 @@ async function renderPanel(payload, { fetchError = null } = {}) {
 }
 
 // ───────────────────────── 6. 面板的退化路径 ─────────────────────────
+// ────────────────────── 5c. 导入入口：按钮 → 弹窗 → POST ──────────────────────
+// 浏览器半边这条链路的每一步都要走一遍：按钮长在版本卡右边、点开是粘贴框、
+// 提交发出一次 JSON POST、结果以摘要收口（只出现 ref / 标签 / 掩码，没有 Key 原文）。
+{
+  const bundle = loadClientBundle()
+  const calls = []
+  const payload = {
+    plugin: MODULE_ID,
+    version: PLUGIN_VERSION,
+    updatedAt: Date.now(),
+    models: [{ id: 'cline-free/deepseek-v4.1-flash', lastUsedAt: 0 }],
+    currentModel: 'cline-free/deepseek-v4.1-flash',
+    totals: { poolSize: 1, clineRequests: 0, rotations: 0, failFasts: 0 },
+    keys: [{ index: 1, label: 'db694bbf', preview: 'sk_c…ead1', source: 'request', cooling: [], stats: { sent: 0, ok: 0, limited: 0, lastUsedAt: 0, tokens: {} }, models: {} }],
+    recent: [],
+  }
+  const importReply = {
+    ok: true, writeMode: 'credentials',
+    imported: [{ ref: 'CLINE_API_KEY_2', label: '1c4dd756', preview: 'sk-i…4444' }],
+    duplicates: [], rejected: [], failed: [], refsFree: 7, poolSize: 2, maxKeys: 20,
+  }
+  bundle.sandbox.fetch = async (url, init) => {
+    const method = (init && init.method) || 'GET'
+    calls.push({ url, method, headers: (init && init.headers) || {}, body: init && init.body })
+    if (method === 'POST') return { ok: true, status: 200, json: async () => importReply }
+    return { ok: true, status: 200, json: async () => payload }
+  }
+
+  const registered = []
+  const slots = {
+    inject: (name, cb) => cb(),
+    register: (options, Component) => { registered.push({ options, Component }); return () => {} },
+  }
+  bundle.exports.apply({ get: (name) => (name === 'slots' ? slots : undefined), inject: () => undefined })
+  const Component = registered[0].Component
+
+  let tree = await bundle.mini.render(Component, {})
+  const importButton = findNode(tree, (n) => n.type === 'button' && textOf(n).join('') === '导入 Key')
+  check('N1 版本卡右边有「导入 Key」按钮', Boolean(importButton))
+  const statsRow = findNode(tree, (n) => n.props && n.props.className === '_dsh_ofb_stats')
+  const statsText = statsRow ? textOf(statsRow) : []
+  check('N2 按钮排在版本卡右侧（统计行末尾）', statsText[statsText.length - 1] === '导入 Key' && statsText.includes(PLUGIN_VERSION), statsText.join(' | '))
+  check('N3 没点开时不渲染弹窗', !findNode(tree, (n) => n.props && n.props.className === '_dsh_ofb_dialog'))
+
+  importButton.props.onClick()
+  tree = await bundle.mini.render(Component, {})
+  const dialog = findNode(tree, (n) => n.props && n.props.className === '_dsh_ofb_dialog')
+  check('N4 点开后是导入弹窗（标题 + 粘贴框 + 取消/导入）',
+    Boolean(dialog) && textOf(dialog).join(' | ').includes('导入 Cline Key') && Boolean(findNode(dialog, (n) => n.type === 'textarea')) && textOf(dialog).includes('取消'),
+    dialog ? textOf(dialog).join(' | ').slice(0, 90) : 'no dialog')
+
+  const textarea = findNode(dialog, (n) => n.type === 'textarea')
+  textarea.props.onChange({ target: { value: SECRET_C } })
+  tree = await bundle.mini.render(Component, {})
+  const confirm = findNode(tree, (n) => n.type === 'button' && textOf(n).join('') === '导入')
+  const pending = confirm.props.onClick()
+  await new Promise((r) => setTimeout(r, 20))
+  if (pending && typeof pending.then === 'function') await pending
+  tree = await bundle.mini.render(Component, {})
+
+  const post = calls.find((c) => c.method === 'POST')
+  check('N5 提交后向导入路由发一次 JSON POST',
+    post?.url === CLIENT_IMPORT_ROUTE && post?.headers['content-type'] === 'application/json' && JSON.parse(post.body).keys === SECRET_C,
+    post ? `${post.url} ${post.headers['content-type']}` : 'no POST')
+  const summary = findNode(tree, (n) => n.props && n.props.className === '_dsh_ofb_import_summary')
+  check('N6 结果以摘要收口并列出落到的 ref', Boolean(summary) && textOf(summary).join(' | ').includes('CLINE_API_KEY_2'), summary ? textOf(summary).join(' | ') : 'no summary')
+  check('N7 导入成功后自动重拉一次面板数据', calls.filter((c) => c.method === 'GET').length >= 2, `GET=${calls.filter((c) => c.method === 'GET').length}`)
+  check('N8 渲染树里不出现 Key 原文', !JSON.stringify(tree).includes(SECRET_C))
+
+  const escListeners = bundle.keyListeners.get('keydown') ?? []
+  check('N9 弹窗打开时注册了 Esc 监听', escListeners.length >= 1, `listeners=${escListeners.length}`)
+  for (const fn of escListeners) fn({ key: 'Escape' })
+  tree = await bundle.mini.render(Component, {})
+  check('N10 Esc 能关掉弹窗', !findNode(tree, (n) => n.props && n.props.className === '_dsh_ofb_dialog'))
+  bundle.mini.dispose()
+}
+
 {
   // 空池：应给出空态而不是空白
   const empty = await renderPanel({
