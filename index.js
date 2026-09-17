@@ -1,6 +1,6 @@
 export const name = 'opencode-free-bridge'
 
-const PLUGIN_VERSION = '1.12.0'
+const PLUGIN_VERSION = '1.12.1'
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -440,7 +440,7 @@ function tapUsage(response, onUsage) {
  *  冷却状态会经由 quotaStore 落到磁盘，DSH 重启后仍知道「哪个 key 在哪个模型上被限到几点」。
  *  每把 key 另带来源标签与本次运行的用量计数，供设置面板展示（这些只留在内存里）。 */
 function createKeyPool(quotaStore, diag, log) {
-  const entries = new Map() // label → { key, label, source, isRequestKey, cooling: Map<model, readyAt>, lastBody: Map<model, text>, lastUsedAt, stats }
+  const entries = new Map() // label → { key, label, source, cooling: Map<model, readyAt>, lastBody: Map<model, text>, lastUsedAt, stats }
   // 额外 key 未就绪时必须可重试：凭据服务可能在插件挂载之后才注册
   let extrasResolved = false
   let lastExtrasAttempt = 0
@@ -478,7 +478,6 @@ function createKeyPool(quotaStore, diag, log) {
         key: value,
         label,
         source: typeof source === 'string' && source ? source : 'unknown',
-        isRequestKey: false,
         cooling: new Map(),
         lastBody: new Map(),
         lastUsedAt: 0,
@@ -491,7 +490,6 @@ function createKeyPool(quotaStore, diag, log) {
         if (record.body) entry.lastBody.set(model, record.body)
       }
     }
-    if (source === 'request') entry.isRequestKey = true
     return entry
   }
 
@@ -661,8 +659,9 @@ function createKeyPool(quotaStore, diag, log) {
           index: index + 1,
           label: entry.label,
           preview: withPreview ? maskKey(entry.key) : '',
+          // 只保留「来源」这一项出处信息；不再单独标「哪把是 DSH 主 key」——
+          // 开启 skipCoolingRequestKey 后池内 key 一律同级（该冷却就跳过，不搞特殊）。
           source: entry.source,
-          isRequestKey: entry.isRequestKey,
           cooling: [...entry.cooling.entries()]
             .filter(([, until]) => until > now)
             .map(([model, until]) => ({

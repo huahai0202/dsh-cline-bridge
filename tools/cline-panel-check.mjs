@@ -94,6 +94,7 @@ const ENDPOINT = `http://${match}/api/v1/chat/completions`
 
 // ───────────────────────── 主机半边脚手架 ─────────────────────────
 let dispose = () => {}
+let lastCtx
 const routes = []
 
 /** DSH 设置服务里 llm-pi-ai 的值：一个 Cline 提供方 + 一个非 Cline 提供方。
@@ -162,6 +163,7 @@ function mount(config = {}) {
     ...config,
   }
   apply(ctx, merged)
+  lastCtx = ctx
   return ctx
 }
 
@@ -198,6 +200,9 @@ const callRoute = async (options) => {
   try { json = JSON.parse(res.body) } catch { json = undefined }
   return { route, status: res.statusCode, headers: res.headers, body: res.body, json }
 }
+
+/** 最近一次 mount 出来的插件实例的观察入口（不含 key 原文）。 */
+const ctxStatusOf = (options) => lastCtx?.__opencodeFreeBridge?.status?.(options)
 
 // ───────────────────────── 1. 路由注册与契约 ─────────────────────────
 {
@@ -265,7 +270,9 @@ const callRoute = async (options) => {
   const healthyKey = keys.find((k) => k.cooling.length === 0)
   check('H21 成功那把 key 记了 ok', healthyKey?.stats.ok === 1 && healthyKey?.stats.sent === 1, JSON.stringify(healthyKey?.stats))
   check('H22 来源标签区分 DSH 主 key 与 config', Boolean(byPreview[MASK_A] || byPreview[MASK_B]) && keys.some((k) => k.source.startsWith('config:')), JSON.stringify(keys.map((k) => k.source)))
-  check('H23 首个请求用的 key 被标为 DSH 主 key', keys.some((k) => k.isRequestKey === true))
+  check('H23 每把 key 都带来源标签，且载荷已无 isRequestKey 字段（池内 key 同级）',
+    keys.every((k) => typeof k.source === 'string' && k.source.length > 0) && keys.every((k) => !('isRequestKey' in k)),
+    JSON.stringify(keys.map((k) => k.source)))
   check('H24 全局计数里有一次换 key 恢复', r.json.totals.rotations === 1 && r.json.totals.clineRequests === 1, JSON.stringify(r.json.totals))
 }
 
@@ -446,6 +453,22 @@ const callRoute = async (options) => {
   check('J8 撞限流的响应不给被限的那把 key 记 token（轮换成功的那把照常记）',
     limited?.models?.[model]?.tokens?.total === 0 && limited?.models?.[model]?.limited === 1 && healthy?.models?.[model]?.tokens?.input === 8000,
     `A=${JSON.stringify(limited?.models?.[model]?.tokens)} (limited=${limited?.models?.[model]?.limited}) B=${JSON.stringify(healthy?.models?.[model]?.tokens)}`)
+}
+
+// ── 4e. 只从请求头出现的那把 key，来源应记为 request ──
+// （与 isRequestKey 不同：来源记的是「首次见到它的地方」，所以配置里也列了的 key
+//  会显示 config，只有纯粹从请求头来的才显示 request。）
+{
+  mount({ clineKeys: [], skipCoolingRequestKey: true })
+  await (await globalThis.fetch(ENDPOINT, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${SECRET_B}` },
+    body: JSON.stringify({ model: CAP_ONLY_MODEL, messages: [] }),
+  })).text()
+  const onlyRequest = ctxStatusOf().keys
+  check('K1 仅从请求头出现的 key，来源记为 request',
+    onlyRequest.length === 1 && onlyRequest[0].source === 'request',
+    JSON.stringify(onlyRequest.map((k) => k.source)))
 }
 
 // 主机半边测完再关 mock 服务器（G 组还要发请求，不能提前关）
@@ -663,10 +686,10 @@ async function renderPanel(payload, { fetchError = null } = {}) {
     extras: { credentialsFileRead: true, extrasResolved: true, lastExtrasAt: '2026-09-17T07:45:16.602Z' },
     lastDecision: 'rotated 983d80c1→953d7c08 model=cline-free/deepseek-v4.1-flash',
     keys: [
-      { index: 1, label: 'db694bbf', preview: MASK_A, source: 'request', isRequestKey: true,
+      { index: 1, label: 'db694bbf', preview: MASK_A, source: 'request',
         cooling: [{ model: 'cline-free/deepseek-v4.1-flash', readyAt: Date.now() + 21 * 3600 * 1000, readyInMin: 1300 }],
         stats: { sent: 12, ok: 11, limited: 1, lastModel: 'cline-free/deepseek-v4.1-flash', lastUsedAt: Date.now() - 5000 } },
-      { index: 2, label: '761f9875', preview: MASK_B, source: '.credentials.yaml: CLINE_API_KEY_2', isRequestKey: false,
+      { index: 2, label: '761f9875', preview: MASK_B, source: '.credentials.yaml: CLINE_API_KEY_2',
         cooling: [], stats: { sent: 4, ok: 4, limited: 0, lastModel: 'cline-free/deepseek-v4.1-flash', lastUsedAt: Date.now() - 61000 } },
     ],
     recent: [{ at: new Date().toISOString(), model: 'cline-free/deepseek-v4.1-flash', decision: 'rotated a→b', bodyLen: 413503, poolSize: 2 }],
@@ -740,7 +763,7 @@ async function renderPanel(payload, { fetchError = null } = {}) {
   check('C29 冷却单元格是「模型一行 + 倒计时一行」的两段结构', Boolean(coolingItems) && (coolingItems.children?.length ?? 0) === 2,
     JSON.stringify((coolingItems?.children ?? []).map((c) => c.props?.className)))
 
-  // Key 单元格：预览与「标签 + 主 Key 标记」各占一行，且都带裁剪类（不换行）
+  // Key 单元格：预览与哈希标签各占一行，且都带裁剪类（不换行）
   const keyCellItems = rowCells[1]?.children?.[0]?.children ?? []
   const clipped = (node) => String(node?.props?.className ?? '').includes('_dsh_ofb_clip')
   check('C30 Key 单元格两行都带裁剪类（预览/标签都不会换行）', clipped(keyCellItems[0]) && String(keyCellItems[1]?.props?.className ?? '').includes('_dsh_ofb_key_meta'),
@@ -752,12 +775,16 @@ async function renderPanel(payload, { fetchError = null } = {}) {
       if (Array.isArray(node)) return node.forEach(walk)
       const cls = String(node.props?.className ?? '')
       if (node.type === 'td' && node.children.some((c) => typeof c === 'string' && c.length > 12)) offenders.push(String(node.children[0]).slice(0, 20))
-      if (cls.includes('_dsh_ofb_mono') && !cls.includes('_dsh_ofb_clip') && !cls.includes('_dsh_ofb_badge')) offenders.push(cls)
+      if (cls.includes('_dsh_ofb_mono') && !cls.includes('_dsh_ofb_clip')) offenders.push(cls)
       ;(node.children ?? []).forEach(walk)
     }
     walk(table)
     return offenders.length === 0
   })(), 'mono 文本必须带 _dsh_ofb_clip 才会省略号收口')
+
+  check('C32 面板里不再出现「主 Key」标记（池内 key 一律同级）',
+    !text.includes('主 Key') && !serialized.includes('isRequestKey') && !serialized.includes('_dsh_ofb_badge'),
+    textOf(tree).filter((s) => s.includes('主 Key')).join(' / ') || '（无）')
 
   bundle.mini.dispose()
 }
@@ -781,7 +808,7 @@ async function renderPanel(payload, { fetchError = null } = {}) {
     extras: {},
     keys: [
       {
-        index: 1, label: 'db694bbf', preview: MASK_A, source: 'request', isRequestKey: true,
+        index: 1, label: 'db694bbf', preview: MASK_A, source: 'request',
         cooling: [{ model: DEEPSEEK, readyAt: Date.now() + 21 * 3600 * 1000, readyInMin: 1260 }],
         stats: { sent: 19, ok: 18, limited: 1, lastModel: GLM, lastUsedAt: Date.now() - 4000, tokens: { input: 16800, output: 1500, total: 18300, cached: 900 } },
         models: {
@@ -790,7 +817,7 @@ async function renderPanel(payload, { fetchError = null } = {}) {
         },
       },
       {
-        index: 2, label: '761f9875', preview: MASK_B, source: '.credentials.yaml: CLINE_API_KEY_2', isRequestKey: false,
+        index: 2, label: '761f9875', preview: MASK_B, source: '.credentials.yaml: CLINE_API_KEY_2',
         cooling: [],
         stats: { sent: 21, ok: 21, limited: 0, lastModel: GLM, lastUsedAt: Date.now() - 9000, tokens: { input: 21000, output: 2100, total: 23100, cached: 0 } },
         models: { [GLM]: { sent: 21, ok: 21, limited: 0, lastUsedAt: Date.now() - 9000, tokens: { input: 21000, output: 2100, total: 23100, cached: 0 } } },
