@@ -1,6 +1,6 @@
 export const name = 'opencode-free-bridge'
 
-const PLUGIN_VERSION = '1.9.0'
+const PLUGIN_VERSION = '1.11.0'
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -348,6 +348,94 @@ function readCredentialRefsFromFile(path, wantedRefs) {
   return out
 }
 
+// ───────────────────── Token 用量采集 ─────────────────────
+// 插件位于 openai SDK 之下，是唯一能碰到原始响应体的层次，所以 token 用量只能在这里捞：
+//   · 流式（Cline 走的就是这条）：pi-ai 已经带上 `stream_options.include_usage`，
+//     最后一个 data chunk 里带 usage，取**最后一次**（有的网关每个 chunk 都发累计值）。
+//   · 非流式：JSON 体里的 usage。
+// 实现方式是把响应体 tee 成两路：一路原样交给上层 SDK，另一路自己读一遍、只挑 usage，
+// 读完即丢。任何失败都静默跳过——统计绝不能影响请求本身。
+
+/** 把 OpenAI 形状的 usage 归一成四个数（兼容 input_tokens/output_tokens 命名）。 */
+function normalizeUsage(usage) {
+  const num = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0)
+  const input = num(usage?.prompt_tokens ?? usage?.input_tokens)
+  const output = num(usage?.completion_tokens ?? usage?.output_tokens)
+  const total = num(usage?.total_tokens) || input + output
+  const cached = num(usage?.prompt_tokens_details?.cached_tokens ?? usage?.cache_read_input_tokens)
+  return { input, output, total, cached }
+}
+
+/** 扫 SSE 流，取最后一次 usage。只做「读一遍、丢弃」，占用与响应体同阶、不累积。 */
+async function scanSseUsage(stream, onUsage) {
+  const reader = stream.getReader()
+  const decoder = new TextDecoder()
+  let pending = ''
+  let last
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      pending += decoder.decode(value, { stream: true })
+      let at
+      while ((at = pending.indexOf('\n')) >= 0) {
+        const line = pending.slice(0, at).trim()
+        pending = pending.slice(at + 1)
+        if (!line.startsWith('data:')) continue
+        const payload = line.slice(5).trim()
+        // 只对可能带 usage 的行做 JSON 解析，避免给每个 chunk 都付解析成本
+        if (!payload || payload === '[DONE]' || payload.indexOf('"usage"') === -1) continue
+        try {
+          const parsed = JSON.parse(payload)
+          if (parsed?.usage) last = parsed.usage
+        } catch {
+          // 半截 JSON / 非 JSON 数据行：忽略
+        }
+      }
+    }
+  } catch {
+    // 流被取消或中断：已经拿到的 usage 仍然算数
+  }
+  if (last) onUsage(last)
+}
+
+/** 非流式 JSON 响应里的 usage。 */
+async function scanJsonUsage(stream, onUsage) {
+  try {
+    const text = await new Response(stream).text()
+    const parsed = JSON.parse(text)
+    if (parsed?.usage) onUsage(parsed.usage)
+  } catch {
+    // 解析失败就当这次没有 usage
+  }
+}
+
+/** 给响应挂一个用量观察分支，返回给 SDK 的仍是等价响应（状态、头、体都不变）。
+ *
+ *  只在成功响应上挂：只有 2xx 才可能带 usage；错误响应完全不碰，免得和 SDK /
+ *  pi-ai 的取消与重试路径（`CancelReadableStream(response.body)` 之类）产生任何交互。
+ *  另外确认过 SDK 只在 debug 日志里用 `response.url`，重建 Response 丢掉它是安全的。 */
+function tapUsage(response, onUsage) {
+  if (!response.ok || !response.body) return response
+  const type = response.headers.get('content-type') ?? ''
+  const isSse = /text\/event-stream/i.test(type)
+  const isJson = /application\/json/i.test(type)
+  if (!isSse && !isJson) return response
+  try {
+    const [mine, theirs] = response.body.tee()
+    if (isSse) void scanSseUsage(mine, onUsage)
+    else void scanJsonUsage(mine, onUsage)
+    return new Response(theirs, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: new Headers(response.headers),
+    })
+  } catch {
+    // tee 不可用（body 已被消费等）：原样返回，绝不因为统计而影响请求
+    return response
+  }
+}
+
 /** key 池：按模型维度记录冷却时间，选 key 时**粘性优先**——先把一把用到限流再换下一把。
  *  冷却状态会经由 quotaStore 落到磁盘，DSH 重启后仍知道「哪个 key 在哪个模型上被限到几点」。
  *  每把 key 另带来源标签与本次运行的用量计数，供设置面板展示（这些只留在内存里）。 */
@@ -357,17 +445,24 @@ function createKeyPool(quotaStore, diag, log) {
   let extrasResolved = false
   let lastExtrasAttempt = 0
 
-  /** 累加某把 key 在某个模型上的计数。
-   *  用量必须按模型分开记：冷却本来就是「key + 模型」维度，把两个模型的数字混在
-   *  一行里会让人误判（例如 deepseek 上被限、glm 上其实还在正常跑）。
+  /** 取（必要时创建）某把 key 在某模型上的计数行。
    *  byModel 用 null 原型，避免模型名撞上 __proto__ 之类的键。 */
-  const bumpModelStat = (entry, model, field) => {
-    if (!model) return
+  const modelRowOf = (entry, model) => {
+    if (!model) return undefined
     let row = entry.stats.byModel[model]
     if (!row) {
-      row = { sent: 0, ok: 0, limited: 0, lastUsedAt: 0 }
+      row = { sent: 0, ok: 0, limited: 0, lastUsedAt: 0, tokens: { input: 0, output: 0, total: 0, cached: 0 } }
       entry.stats.byModel[model] = row
     }
+    return row
+  }
+
+  /** 累加某把 key 在某个模型上的请求计数。
+   *  用量必须按模型分开记：冷却本来就是「key + 模型」维度，把两个模型的数字混在
+   *  一行里会让人误判（例如 deepseek 上被限、glm 上其实还在正常跑）。 */
+  const bumpModelStat = (entry, model, field) => {
+    const row = modelRowOf(entry, model)
+    if (!row) return
     row[field] += 1
     row.lastUsedAt = Date.now()
   }
@@ -387,7 +482,7 @@ function createKeyPool(quotaStore, diag, log) {
         cooling: new Map(),
         lastBody: new Map(),
         lastUsedAt: 0,
-        stats: { sent: 0, ok: 0, limited: 0, lastModel: '', byModel: Object.create(null) },
+        stats: { sent: 0, ok: 0, limited: 0, lastModel: '', byModel: Object.create(null), tokens: { input: 0, output: 0, total: 0, cached: 0 } },
       }
       entries.set(label, entry)
       // 恢复该 key 上次进程留下的额度状态（按 label 匹配，磁盘上没有 key 原文）
@@ -530,6 +625,20 @@ function createKeyPool(quotaStore, diag, log) {
       bumpModelStat(entry, model, 'ok')
       quotaStore?.clear?.(entry.label, model)
     },
+    /** 记一次响应里的 token 用量（key + 模型两个维度同时累加）。不碰 lastUsedAt：
+     *  用量是发送之后才回来的，时间戳该由发送那一刻决定。 */
+    markTokens(key, model, usage) {
+      const entry = entries.get(keyLabel(key))
+      if (!entry || !usage) return
+      const row = modelRowOf(entry, model)
+      if (!row) return
+      for (const field of ['input', 'output', 'total', 'cached']) {
+        const value = Number(usage[field]) || 0
+        if (!value) continue
+        row.tokens[field] += value
+        entry.stats.tokens[field] += value
+      }
+    },
     /** 供自检工具观察状态，不暴露 key 原文。 */
     snapshot() {
       const now = Date.now()
@@ -568,12 +677,13 @@ function createKeyPool(quotaStore, diag, log) {
             limited: entry.stats.limited,
             lastModel: entry.stats.lastModel,
             lastUsedAt: entry.lastUsedAt,
+            tokens: { ...entry.stats.tokens },
           },
           // 按模型的用量明细（面板切到某个模型时看的就是这份）
           models: Object.fromEntries(
             Object.entries(entry.stats.byModel).map(([model, row]) => [
               model,
-              { sent: row.sent, ok: row.ok, limited: row.limited, lastUsedAt: row.lastUsedAt },
+              { sent: row.sent, ok: row.ok, limited: row.limited, lastUsedAt: row.lastUsedAt, tokens: { ...row.tokens } },
             ]),
           ),
         }))
@@ -971,7 +1081,8 @@ export function apply(ctx, config) {
       if (!rotateStatuses.includes(response.status)) {
         if (currentKey) pool.markHealthy(currentKey, model)
         decide(`pass-through status=${response.status}`)
-        return response
+        // 顺手把这轮响应的 token 用量记到「key + 模型」上（失败静默，不影响请求）
+        return currentKey ? tapUsage(response, (usage) => pool.markTokens(currentKey, model, normalizeUsage(usage))) : response
       }
 
       // 重发要求 body 可原样重建（字符串 / 字节），流式 body 只能原样返回
@@ -1005,7 +1116,7 @@ export function apply(ctx, config) {
           diag.rotations += 1
           decide(`rotated ${keyLabel(currentKey)}→${next.label} model=${model}`)
           log(`Cline 限流已换 key 恢复（${keyLabel(currentKey)} → ${next.label}, model=${model}）`)
-          return retried
+          return tapUsage(retried, (usage) => pool.markTokens(next.key, model, normalizeUsage(usage)))
         }
 
         lastText = await retried.clone().text()

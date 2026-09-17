@@ -41,26 +41,46 @@ const CAP_ONLY_MODEL = 'cline-free/deepseek-v4.1-flash'
 
 // ───────────────────────── mock Cline 上游 ─────────────────────────
 const seen = []
+
+/** 每个 (key, model) 组合回一组固定的 token 用量，方便断言累加结果。 */
+const usageFor = (key, model) => ({
+  prompt_tokens: key === SECRET_B ? 2000 : 100,
+  completion_tokens: key === SECRET_B ? 300 : 20,
+  total_tokens: (key === SECRET_B ? 2000 : 100) + (key === SECRET_B ? 300 : 20),
+  prompt_tokens_details: { cached_tokens: key === SECRET_B ? 500 : 0 },
+  model,
+})
+
 const server = createServer((req, res) => {
   let body = ''
   req.on('data', (c) => (body += c))
   req.on('end', () => {
     const key = (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim()
-    let model = '?'
-    try { model = JSON.parse(body).model ?? '?' } catch {}
+    let parsed = {}
+    try { parsed = JSON.parse(body) } catch {}
+    const model = parsed.model ?? '?'
     seen.push({ key, model })
-    if (key === SECRET_B) {
+
+    /** 成功响应：流式回 SSE（带 usage 的最后一个 chunk），非流式回 JSON。 */
+    const succeed = () => {
+      const usage = usageFor(key, model)
+      if (parsed.stream === true) {
+        res.writeHead(200, { 'content-type': 'text/event-stream' })
+        res.write(`data: ${JSON.stringify({ id: 'x', choices: [{ delta: { content: 'hi' } }] })}\n\n`)
+        // 中间再插一个「不带 usage」的 chunk，确认扫描只认带 usage 的那些
+        res.write(`data: ${JSON.stringify({ id: 'x', choices: [{ delta: { content: '!' } }] })}\n\n`)
+        res.write(`data: ${JSON.stringify({ id: 'x', choices: [], usage })}\n\n`)
+        res.end('data: [DONE]\n\n')
+        return
+      }
       res.writeHead(200, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ ok: true }))
-      return
+      res.end(JSON.stringify({ ok: true, usage }))
     }
+
+    if (key === SECRET_B) return succeed()
     // SECRET_A 只在 deepseek 上撞每日上限，在别的模型上照常成功——这正是真实场景
     // （每日额度是「key + 模型」维度），也是「按模型分别查看」要防住的那种误判。
-    if (key === SECRET_A && model !== CAP_ONLY_MODEL) {
-      res.writeHead(200, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ ok: true }))
-      return
-    }
+    if (key === SECRET_A && model !== CAP_ONLY_MODEL) return succeed()
     res.writeHead(429, { 'content-type': 'application/json' })
     res.end(JSON.stringify({
       code: 'INFERENCE_CAP_ERROR',
@@ -149,6 +169,16 @@ const fakeReq = ({ method = 'GET', referer = 'http://127.0.0.1:3080/settings', h
   method,
   headers: { host, referer },
 })
+
+/** 与插件同一套 FNV-1a 标签：测试里按标签定位某把 key 的统计行。 */
+const label8 = (value) => {
+  let h = 0x811c9dc5
+  for (let i = 0; i < value.length; i++) {
+    h ^= value.charCodeAt(i)
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+  return h.toString(16).padStart(8, '0')
+}
 const fakeRes = () => {
   const res = {
     statusCode: 0,
@@ -364,6 +394,58 @@ const callRoute = async (options) => {
   })()
   check('G8 配置里没有 Cline 提供方时不列任何配置模型，也不崩',
     noCline.status === 200 && (noCline.json.models ?? []).length === 0, JSON.stringify((noCline.json.models ?? []).map((m) => m.id)))
+}
+
+// ───────────────────────── 4d. Token 用量采集 ─────────────────────────
+// 用户要的是 token 用量，不是请求次数。插件在 SDK 之下，只能从原始响应体里捞：
+// 流式取 SSE 里最后一个带 usage 的 chunk，非流式取 JSON 的 usage；
+// 记录维度是「key + 模型」，并同时累加到 key 级总计。
+{
+  const model = CAP_ONLY_MODEL
+  const ctx = mount({ clineKeys: [SECRET_B], skipCoolingRequestKey: true })
+  const post = async (stream) =>
+    (await globalThis.fetch(ENDPOINT, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${SECRET_B}` },
+      body: JSON.stringify({ model, messages: [], ...(stream ? { stream: true } : {}) }),
+    })).text()
+
+  // 非流式一次：input 2000 / output 300 / cached 500
+  const plainText = await post(false)
+  check('J1 非流式响应的 body 仍然原样交给上层（含 usage）', plainText.includes('"usage"') && plainText.includes('2000'), plainText.slice(0, 60))
+
+  // 流式两次：应逐次累加
+  const sse1 = await post(true)
+  const sse2 = await post(true)
+  check('J2 流式响应仍完整交给上层（SSE 未被吞掉）', sse1.includes('[DONE]') && sse1.includes('"content"') && sse2.includes('[DONE]'), sse1.slice(0, 40))
+  check('J3 流式带 usage 的 chunk 仍在（没被改写）', sse1.includes('"prompt_tokens":2000'), sse1.slice(-80).replace(/\n/g, ' '))
+
+  // 采集是异步的（顺带读一遍流），给它一拍
+  await new Promise((r) => setTimeout(r, 50))
+  const keys = ctx.__opencodeFreeBridge.status().keys
+  const row = keys.find((k) => k.label === label8(SECRET_B))
+  check('J4 token 用量按 key+模型 累加（非流式 + 两次流式）',
+    row?.models?.[model]?.tokens?.input === 6000 && row?.models?.[model]?.tokens?.output === 900,
+    JSON.stringify(row?.models?.[model]?.tokens))
+  check('J5 同时累加到 key 级总计', row?.stats?.tokens?.input === 6000 && row?.stats?.tokens?.total === 6900, JSON.stringify(row?.stats?.tokens))
+  check('J6 缓存命中 token 也记下来了', row?.models?.[model]?.tokens?.cached === 1500, String(row?.models?.[model]?.tokens?.cached))
+  check('J7 token 采集不改变请求计数', row?.models?.[model]?.sent === 3 && row?.stats?.sent === 3, `${row?.models?.[model]?.sent}/${row?.stats?.sent}`)
+
+  // 429 响应没有 usage，不应给「被限流的那把 key」记 token。
+  // 注意：这次请求会轮换到 SECRET_B 并成功，所以 B 的 token 增长是正常的——
+  // 要断言的是撞限流的 A 没有任何 token 记录。
+  await (await globalThis.fetch(ENDPOINT, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${SECRET_A}` },
+    body: JSON.stringify({ model, messages: [] }),
+  })).text()
+  await new Promise((r) => setTimeout(r, 30))
+  const afterKeys = ctx.__opencodeFreeBridge.status().keys
+  const limited = afterKeys.find((k) => k.label === label8(SECRET_A))
+  const healthy = afterKeys.find((k) => k.label === label8(SECRET_B))
+  check('J8 撞限流的响应不给被限的那把 key 记 token（轮换成功的那把照常记）',
+    limited?.models?.[model]?.tokens?.total === 0 && limited?.models?.[model]?.limited === 1 && healthy?.models?.[model]?.tokens?.input === 8000,
+    `A=${JSON.stringify(limited?.models?.[model]?.tokens)} (limited=${limited?.models?.[model]?.limited}) B=${JSON.stringify(healthy?.models?.[model]?.tokens)}`)
 }
 
 // 主机半边测完再关 mock 服务器（G 组还要发请求，不能提前关）
@@ -619,7 +701,7 @@ async function renderPanel(payload, { fetchError = null } = {}) {
   check('C17 渲染出最近决策', text.includes('最近决策') && text.includes('rotated a→b'))
   check('C18 面板里没有「运行参数」卡片', !text.includes('运行参数') && !text.includes('凭据文件') && !text.includes('15分钟') && !text.includes('Runtime parameters'))
   check('C19 面板里没有掩码说明文字', !text.includes('首尾各 4 位') && !text.includes('掩码预览'))
-  check('C20 详情卡里出现 key 池表格表头（且只有 6 列）', text.includes('冷却 / 恢复') && text.includes('发送/成功/限流') && table_headers(tree).length === 6, table_headers(tree).join(' | '))
+  check('C20 表格表头恰好是这 6 列', table_headers(tree).join('|') === '#|Key|状态|冷却 / 恢复|请求 / Token|最近使用', table_headers(tree).join(' | '))
 
   // 关键 DOM 结构：表格确实有 2 行数据
   const table = findNode(tree, (n) => n.type === 'table')
@@ -701,17 +783,17 @@ async function renderPanel(payload, { fetchError = null } = {}) {
       {
         index: 1, label: 'db694bbf', preview: MASK_A, source: 'request', isRequestKey: true,
         cooling: [{ model: DEEPSEEK, readyAt: Date.now() + 21 * 3600 * 1000, readyInMin: 1260 }],
-        stats: { sent: 19, ok: 18, limited: 1, lastModel: GLM, lastUsedAt: Date.now() - 4000 },
+        stats: { sent: 19, ok: 18, limited: 1, lastModel: GLM, lastUsedAt: Date.now() - 4000, tokens: { input: 16800, output: 1500, total: 18300, cached: 900 } },
         models: {
-          [DEEPSEEK]: { sent: 16, ok: 15, limited: 1, lastUsedAt: Date.now() - 3600_000 },
-          [GLM]: { sent: 3, ok: 3, limited: 0, lastUsedAt: Date.now() - 4000 },
+          [DEEPSEEK]: { sent: 16, ok: 15, limited: 1, lastUsedAt: Date.now() - 3600_000, tokens: { input: 12300, output: 1200, total: 13500, cached: 800 } },
+          [GLM]: { sent: 3, ok: 3, limited: 0, lastUsedAt: Date.now() - 4000, tokens: { input: 4500, output: 300, total: 4800, cached: 100 } },
         },
       },
       {
         index: 2, label: '761f9875', preview: MASK_B, source: '.credentials.yaml: CLINE_API_KEY_2', isRequestKey: false,
         cooling: [],
-        stats: { sent: 21, ok: 21, limited: 0, lastModel: GLM, lastUsedAt: Date.now() - 9000 },
-        models: { [GLM]: { sent: 21, ok: 21, limited: 0, lastUsedAt: Date.now() - 9000 } },
+        stats: { sent: 21, ok: 21, limited: 0, lastModel: GLM, lastUsedAt: Date.now() - 9000, tokens: { input: 21000, output: 2100, total: 23100, cached: 0 } },
+        models: { [GLM]: { sent: 21, ok: 21, limited: 0, lastUsedAt: Date.now() - 9000, tokens: { input: 21000, output: 2100, total: 23100, cached: 0 } } },
       },
     ],
     recent: [{ at: new Date().toISOString(), model: GLM, decision: 'pass-through status=200', bodyLen: 1000, poolSize: 2 }],
@@ -768,6 +850,55 @@ async function renderPanel(payload, { fetchError = null } = {}) {
   check('F10 切到 deepseek 后该 key 显示冷却中，用量是 deepseek 的计数', dsRow.includes('冷却中') && dsRow.includes('16/15/1'), dsRow.replace(/\n/g, ' | '))
   const dsOther = rowText(dsView, '761f9875')
   check('F11 另一把在 deepseek 上没跑过：0/0/0 且无冷却，最近使用显示「从未」', dsOther.includes('0/0/0') && dsOther.includes('可用') && dsOther.includes('从未'), dsOther.replace(/\n/g, ' | '))
+
+  // ── 按模型用量明细卡（用户要求：显示每个 key 的每个模型的用量）──
+  const usageCardOf = (node) => findNode(node, (n) => String(n.props?.className ?? '') === '_dsh_ofb_usage')
+  const usageOf = (node, label) => {
+    const card = usageCardOf(node)
+    if (!card) return ''
+    const kids = card.children ?? []
+    // 卡片是 [表头, 每把 key 的(标题行 + 若干模型行)…] 的扁平序列：取该 key 标题行之后、下个标题行之前的行
+    const at = kids.findIndex((k) => JSON.stringify(k).includes(label))
+    if (at < 0) return ''
+    const out = []
+    for (let i = at + 1; i < kids.length; i++) {
+      if (String(kids[i].props?.className ?? '').includes('_dsh_ofb_usage_key')) break
+      out.push(textOf(kids[i]).join(' '))
+    }
+    return out.join(' | ')
+  }
+
+  const usageAll = usageOf(allView, 'db694bbf')
+  check('I1 「全部模型」下每把 key 逐行列出各模型用量',
+    usageAll.includes('cline-free/deepseek-v4.1-flash 16/15/1') && usageAll.includes('z-ai/glm-5.3-flash 3/3/0'),
+    usageAll)
+  check('I2 明细里两把 key 都有自己的行', usageOf(allView, '761f9875').includes('z-ai/glm-5.3-flash 21/21/0'), usageOf(allView, '761f9875'))
+  check('I3 明细卡带「发送/成功/限流」表头说明', textOf(usageCardOf(allView)).join(' ').includes('发送/成功/限流'), textOf(usageCardOf(allView)).join(' ').slice(0, 80))
+
+  const usageGlm = usageOf(tree, 'db694bbf')
+  check('I4 筛到 glm 时明细只剩 glm 那一行', usageGlm.includes('z-ai/glm-5.3-flash 3/3/0') && !usageGlm.includes('deepseek'), usageGlm)
+
+  const usageDs = usageOf(dsView, '761f9875')
+  check('I5 筛到 deepseek 时该模型上没跑过的 key 显示「该模型上没用过」', usageDs.includes('该模型上没用过'), usageDs)
+  const usageDsMine = usageOf(dsView, 'db694bbf')
+  check('I6 筛到 deepseek 时明细显示 deepseek 的计数', usageDsMine.includes('cline-free/deepseek-v4.1-flash 16/15/1'), usageDsMine)
+
+  // ── Token 用量（用户真正要的是这个）──
+  check('I7 明细卡逐行显示每个模型的输入/输出 token',
+    usageAll.includes('12.3k/1.2k') && usageAll.includes('4.5k/300') && usageOf(allView, '761f9875').includes('21k/2.1k'),
+    usageAll)
+  const tokenRowOf = (node, label) => {
+    const body = findNode(node, (n) => n.type === 'tbody')
+    const row = (body?.children ?? []).find((tr) => JSON.stringify(tr).includes(label))
+    const cell = (row?.children ?? [])[4]
+    return textOf(cell).join(' | ')
+  }
+  check('I8 表格用量列第二行显示 token（「全部模型」下是总计）',
+    tokenRowOf(allView, 'db694bbf').includes('16.8k/1.5k'), tokenRowOf(allView, 'db694bbf'))
+  check('I9 表格用量列跟随筛选显示该模型的 token',
+    tokenRowOf(dsView, 'db694bbf').includes('12.3k/1.2k'), tokenRowOf(dsView, 'db694bbf'))
+  check('I10 该模型上没用过的 key：token 显示 0/0，不能退回全局总计',
+    tokenRowOf(dsView, '761f9875') === '0/0/0 | 0/0', tokenRowOf(dsView, '761f9875'))
 
   bundle.mini.dispose()
 }
