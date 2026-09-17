@@ -83,17 +83,26 @@ Cline 的免费额度是**按 Key + 按模型**的每日上限，撞限流时服
 | **插件 config** | 在 profile 的 `cordis.patch.yml` 里给条目加配置（支持 `!!js` 表达式） |
 
 ```yaml
-- insert:
-    - id: opencode-free-bridge
-      name: 'opencode-free-bridge'
-      config:
-        clineKeys:
-          - !!js process.env.CLINE_API_KEY
-          - !!js process.env.CLINE_API_KEY_2
-        # 可选：自建中转 / 测试用的目标匹配串（默认 api.cline.bot）
-        # clineMatch: 'my-cline-proxy.example'
-        # 可选：报文里解析不出重试窗口时的默认冷却（毫秒，默认 15 分钟）
-        # clineCooldownMs: 900000
+# 加在 profile 的 cordis.patch.yml（即 ~/.dsh/profiles/web/cordis.patch.yml）。
+# 注意用 id 定向覆盖，不要用 insert —— 后者会挂载第二个插件实例、把 fetch 包两层。
+- id: opencode-free-bridge
+  config:
+    clineKeys:
+      - !!js process.env.CLINE_API_KEY
+      - !!js process.env.CLINE_API_KEY_2
+    # 可选：自建中转 / 测试用的目标匹配串（默认 api.cline.bot）
+    # clineMatch: 'my-cline-proxy.example'
+    # 可选：报文里解析不出重试窗口时的默认冷却（毫秒，默认 15 分钟）
+    # clineCooldownMs: 900000
+```
+
+凭据仓库方式则是直接在 `~/.dsh/.credentials.yaml` 的 `refs` 下追加（或用 DSH Web 设置里的凭据页）：
+
+```yaml
+version: 1
+refs:
+  CLINE_API_KEY: "…"      # 主 key，DSH 已配置
+  CLINE_API_KEY_2: "…"    # 插件会自动探测 _2 ~ _10
 ```
 
 ### 行为约定
