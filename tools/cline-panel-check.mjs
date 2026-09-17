@@ -906,21 +906,23 @@ async function renderPanel(payload, { fetchError = null } = {}) {
   }
 
   const usageAll = usageOf(allView, 'db694bbf')
+  // 每个数值各占一列（发送|成功|限流、输入|输出），所以 textOf 用空格连接
   check('I1 「全部模型」下每把 key 逐行列出各模型用量',
-    usageAll.includes('cline-free/deepseek-v4.1-flash 16/15/1') && usageAll.includes('z-ai/glm-5.3-flash 3/3/0'),
+    usageAll.includes('cline-free/deepseek-v4.1-flash 16 15 1 12.3k 1.2k') && usageAll.includes('z-ai/glm-5.3-flash 3 3 0 4.5k 300'),
     usageAll)
-  check('I2 明细里两把 key 都有自己的行', usageOf(allView, '761f9875').includes('z-ai/glm-5.3-flash 21/21/0'), usageOf(allView, '761f9875'))
+  check('I2 明细里两把 key 都有自己的行', usageOf(allView, '761f9875').includes('z-ai/glm-5.3-flash 21 21 0 21k 2.1k'), usageOf(allView, '761f9875'))
   const usageHeadOf = (node) => findNode(usageCardOf(node), (n) => String(n.props?.className ?? '') === '_dsh_ofb_usage_head')
   const usageHeadSpans = usageHeadOf(allView)?.children ?? []
-  check('I3 明细卡表头用极短标签 + title 承载完整含义（表头不换行、与条左端对齐）',
-    usageHeadSpans.map((s) => textOf(s).join('')).join(' | ') === '模型 | 请求 | Token | 最近使用' &&
-      usageHeadSpans[1]?.props?.title === '发送 / 成功 / 撞限流' &&
-      usageHeadSpans[2]?.props?.title === '输入 / 输出 token' &&
+  // 表头与数据行同构：每列一个标签，含义直接可见（不靠悬停），且短标签不会折行
+  const usageHeadFlat = usageHeadSpans.map((s) => textOf(s).join('')).join('|')
+  check('I3 明细卡表头逐列标注（发送/成功/限流、输入/输出），与数据列一一对应',
+    usageHeadFlat === '模型|发送成功限流|输入输出|最近使用' &&
+      String(usageHeadSpans[1]?.props?.className ?? '') === '_dsh_ofb_usage_req' &&
       String(usageHeadSpans[2]?.props?.className ?? '') === '_dsh_ofb_tokencell',
-    usageHeadSpans.map((s) => textOf(s).join('')).join(' | '))
+    usageHeadFlat)
 
   const usageGlm = usageOf(tree, 'db694bbf')
-  check('I4 筛到 glm 时明细只剩 glm 那一行', usageGlm.includes('z-ai/glm-5.3-flash 3/3/0') && !usageGlm.includes('deepseek'), usageGlm)
+  check('I4 筛到 glm 时明细只剩 glm 那一行', usageGlm.includes('z-ai/glm-5.3-flash 3 3 0') && !usageGlm.includes('deepseek'), usageGlm)
 
   // 该模型上没用过的 key 不再各占一块，而是折叠成一行提示（否则半张卡都是「没用过」）
   const cardText = (node) => textOf(usageCardOf(node)).join('\n')
@@ -928,11 +930,11 @@ async function renderPanel(payload, { fetchError = null } = {}) {
     cardText(dsView).includes('其余 1 把在该模型上没用过') && !cardText(dsView).includes('761f9875'),
     cardText(dsView).replace(/\n/g, ' | '))
   const usageDsMine = usageOf(dsView, 'db694bbf')
-  check('I6 筛到 deepseek 时明细显示 deepseek 的计数', usageDsMine.includes('cline-free/deepseek-v4.1-flash 16/15/1'), usageDsMine)
+  check('I6 筛到 deepseek 时明细显示 deepseek 的计数', usageDsMine.includes('cline-free/deepseek-v4.1-flash 16 15 1'), usageDsMine)
 
   // ── Token 用量（用户真正要的是这个）──
   check('I7 明细卡逐行显示每个模型的输入/输出 token',
-    usageAll.includes('12.3k/1.2k') && usageAll.includes('4.5k/300') && usageOf(allView, '761f9875').includes('21k/2.1k'),
+    usageAll.includes('12.3k 1.2k') && usageAll.includes('4.5k 300') && usageOf(allView, '761f9875').includes('21k 2.1k'),
     usageAll)
   const tokenRowOf = (node, label) => {
     const body = findNode(node, (n) => n.type === 'tbody')
