@@ -76,17 +76,52 @@ const ENDPOINT = `http://${match}/api/v1/chat/completions`
 let dispose = () => {}
 const routes = []
 
+/** DSH 设置服务里 llm-pi-ai 的值：一个 Cline 提供方 + 一个非 Cline 提供方。
+ *  用来验证面板能从配置里列出 Cline 名下的模型（而不是只从发生过的流量里学）。 */
+const SETTINGS_TABLE = {
+  providers: {
+    cline: {
+      displayName: 'Cline',
+      apiKeyEnv: 'CLINE_API_KEY',
+      baseURL: 'https://api.cline.bot/api/v1',
+      models: [{ id: 'cline-free/deepseek-v4.1-flash' }, { id: 'z-ai/glm-5.3-flash' }],
+    },
+    hyper: {
+      displayName: 'Charm Hyper',
+      apiKeyEnv: 'HYPER_API_KEY',
+      baseURL: 'https://hyper.charm.land/v1',
+      models: [{ id: 'glm-5.3' }, { id: 'kimi-k3' }],
+    },
+    opencode: {
+      apiKeyEnv: 'OPENCODE_API_KEY',
+      baseURL: 'https://opencode.ai/zen/v1',
+      models: [{ id: 'mimo-v2.5-free' }],
+    },
+  },
+}
+const AGENT_DEFAULT = { provider: 'cline', model: 'z-ai/glm-5.3-flash' }
+
 /** 挂载插件，并把 ctx.inject(['webServer'], ...) 里的路由捕获下来。 */
 function mount(config = {}) {
   dispose()
   routes.length = 0
+  const settingsValues = { 'llm-pi-ai': SETTINGS_TABLE, 'agent-default-model': AGENT_DEFAULT, ...(config.__settingsValues ?? {}) }
   const ctx = {
     on: (event, fn) => { if (event === 'dispose') dispose = fn },
     logger: { warn: () => {} },
     get: () => undefined,
     // DSH 真实 ctx 上的子 fiber 等待模式
     inject: (deps, callback) => {
-      if (!Array.isArray(deps) || !deps.includes('webServer')) return undefined
+      if (!Array.isArray(deps)) return undefined
+      if (deps.includes('settings')) {
+        if (config.__noSettings) return undefined // 模拟 settings 服务缺席
+        return callback({
+          effect: (factory) => factory(),
+          get: (name) => (name === 'settings' ? { get: (ns) => settingsValues[ns] } : undefined),
+          settings: { get: (ns) => settingsValues[ns] },
+        })
+      }
+      if (!deps.includes('webServer')) return undefined
       const webCtx = {
         effect: (factory) => factory(),
         webServer: {
@@ -272,6 +307,66 @@ const callRoute = async (options) => {
   check('H34 模型清单按最近活跃排序（当前模型在最前）', r.json.models[0]?.id === modelB, r.json.models.map((m) => m.id).join(' > '))
 }
 
+// ───────────────────────── 4c. 模型清单来自配置，而不是只靠流量 ─────────────────────────
+// 用户的现象：deepseek 撞上限、切到 glm 之后面板里只有 deepseek 一个模型芯片。
+// 原因是模型清单只从「已发生的流量 + 落盘的冷却记录」里学——重启后若还没发过 glm
+// 请求，glm 就完全不存在。正确做法是直接读 DSH 设置里 Cline 提供方的模型表。
+{
+  // 全新挂载、一次 Cline 请求都不发。注意设置表里的 Cline baseURL 必须命中本用例的
+  // clineMatch（与真实判据同构：提供方 baseURL 命中 clineMatch 才算 Cline 通道），
+  // 所以这里用 mock 服务器地址当 baseURL。
+  const table = {
+    providers: {
+      cline: {
+        displayName: 'Cline',
+        apiKeyEnv: 'CLINE_API_KEY',
+        baseURL: `http://${match}/api/v1`,
+        models: [{ id: 'cline-free/deepseek-v4.1-flash' }, { id: 'z-ai/glm-5.3-flash' }],
+      },
+      hyper: { displayName: 'Charm Hyper', baseURL: 'https://hyper.charm.land/v1', models: [{ id: 'glm-5.3' }, { id: 'kimi-k3' }] },
+      opencode: { baseURL: 'https://opencode.ai/zen/v1', models: [{ id: 'mimo-v2.5-free' }] },
+    },
+  }
+  mount({ __settingsValues: { 'llm-pi-ai': table } })
+  const r = await callRoute()
+  const ids = (r.json.models ?? []).map((m) => m.id)
+  check('G1 零流量时也能列出 Cline 名下配置的全部模型（含 glm）',
+    ids.includes('z-ai/glm-5.3-flash') && ids.includes('cline-free/deepseek-v4.1-flash'), ids.join(' | '))
+  check('G2 默认筛选项取 DSH 的默认模型（cline/z-ai/glm-5.3-flash）',
+    r.json.currentModel === 'z-ai/glm-5.3-flash', String(r.json.currentModel))
+  check('G3 非 Cline 提供方的模型不会混进来（hyper / opencode 隔离）',
+    !ids.includes('glm-5.3') && !ids.includes('kimi-k3') && !ids.includes('mimo-v2.5-free'), ids.join(' | '))
+  check('G4 配置里的 Cline 模型按配置顺序紧随当前模型排列',
+    ids[0] === 'z-ai/glm-5.3-flash' && ids[1] === 'cline-free/deepseek-v4.1-flash', ids.join(' | '))
+
+  // 发一个「配置里没有」的模型：它也必须进清单（配置 ∪ 观察到的流量）
+  await (await globalThis.fetch(ENDPOINT, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${SECRET_B}` },
+    body: JSON.stringify({ model: 'cline-free/observed-only', messages: [] }),
+  })).text()
+  const after = (await callRoute()).json
+  const idsAfter = (after.models ?? []).map((m) => m.id)
+  check('G5 配置 ∪ 观察：跑过的非配置模型也会进清单',
+    idsAfter.includes('cline-free/observed-only') && idsAfter.includes('z-ai/glm-5.3-flash'), idsAfter.join(' | '))
+  check('G6 有真实流量后默认筛选项改跟流量走（不再是配置默认）',
+    after.currentModel === 'cline-free/observed-only', String(after.currentModel))
+
+  // 设置客户端缺席时必须退化，而不是崩
+  const noSettings = await (async () => { mount({ __noSettings: true }); return callRoute() })()
+  check('G7 settings 服务缺席时退化为「只列观察到的模型」且不报错',
+    noSettings.status === 200 && Array.isArray(noSettings.json.models), `status=${noSettings.status} models=${(noSettings.json.models ?? []).length}`)
+
+  // 配置里没有 Cline 提供方时同样不崩，且不把别的提供方的模型算进来
+  const noCline = await (async () => {
+    mount({ __settingsValues: { 'llm-pi-ai': { providers: { hyper: table.providers.hyper } } } })
+    return callRoute()
+  })()
+  check('G8 配置里没有 Cline 提供方时不列任何配置模型，也不崩',
+    noCline.status === 200 && (noCline.json.models ?? []).length === 0, JSON.stringify((noCline.json.models ?? []).map((m) => m.id)))
+}
+
+// 主机半边测完再关 mock 服务器（G 组还要发请求，不能提前关）
 dispose()
 server.closeAllConnections?.()
 await new Promise((r) => server.close(r))
