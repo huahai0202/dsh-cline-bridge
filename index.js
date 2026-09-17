@@ -1,6 +1,6 @@
 export const name = 'opencode-free-bridge'
 
-const PLUGIN_VERSION = '1.8.1'
+const PLUGIN_VERSION = '1.8.2'
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'

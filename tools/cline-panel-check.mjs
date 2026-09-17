@@ -524,27 +524,38 @@ async function renderPanel(payload, { fetchError = null } = {}) {
   check('C17 渲染出最近决策', text.includes('最近决策') && text.includes('rotated a→b'))
   check('C18 面板里没有「运行参数」卡片', !text.includes('运行参数') && !text.includes('凭据文件') && !text.includes('15分钟') && !text.includes('Runtime parameters'))
   check('C19 面板里没有掩码说明文字', !text.includes('首尾各 4 位') && !text.includes('掩码预览'))
-  check('C20 详情卡里出现 key 池表格表头（且只有 6 列）', text.includes('冷却模型 / 恢复') && text.includes('发送 / 成功 / 限流') && table_headers(tree).length === 6, table_headers(tree).join(' | '))
+  check('C20 详情卡里出现 key 池表格表头（且只有 6 列）', text.includes('冷却 / 恢复') && text.includes('发送/成功/限流') && table_headers(tree).length === 6, table_headers(tree).join(' | '))
 
   // 关键 DOM 结构：表格确实有 2 行数据
   const table = findNode(tree, (n) => n.type === 'table')
   const bodyRows = table ? findNode(table, (n) => n.type === 'tbody')?.children?.length : 0
   check('C21 表格渲染出 2 行 key', bodyRows === 2, `rows=${bodyRows}`)
 
-  // ── 布局断言：这几条钉的是用户实际看到的问题（长内容把行撑高、表格横向溢出）──
+  // ── 布局断言：这几条钉的是用户实际看到的问题（列被挤到一起、长内容把行撑高）──
   const colgroup = findNode(table, (n) => n.type === 'colgroup')
   const cols = colgroup?.children ?? []
-  check('C26 表格用 colgroup 固定列宽（列宽不再由内容撑开）', cols.length === 6 && cols.every((c) => c.props?.style?.width), cols.map((c) => c.props?.style?.width).join(' | '))
-  check('C27 冷却列吃掉剩余宽度（其余列定宽）', cols[3]?.props?.style?.width === 'auto' && cols.filter((c) => c.props?.style?.width === 'auto').length === 1)
+  const widths = cols.map((c) => String(c.props?.style?.width ?? ''))
+  check('C26 表格用 colgroup 按百分比分配列宽（跟着容器走，不由内容撑开）',
+    cols.length === 6 && widths.every((w) => /^\d+(\.\d+)?%$/.test(w)), widths.join(' | '))
+  check('C27 列宽百分比之和正好 100%（不会几列互相挤压）',
+    Math.abs(widths.reduce((sum, w) => sum + Number.parseFloat(w), 0) - 100) < 0.001, String(widths.reduce((s, w) => s + Number.parseFloat(w), 0)))
+
+  // 表头必须自带裁剪：只看 nowrap 的话，列一窄标题就会压到隔壁列头上（用户截图里的现象）
+  const css = bundle.styleTags[0]?.textContent ?? ''
+  const thRule = /_dsh_ofb_table th \{([^}]*)\}/.exec(css)?.[1] ?? ''
+  check('C27b 表头规则带 overflow:hidden + text-overflow:ellipsis',
+    thRule.includes('overflow: hidden') && thRule.includes('text-overflow: ellipsis') && thRule.includes('white-space: nowrap'),
+    thRule.slice(0, 80))
+  const tdRule = /_dsh_ofb_table td \{([^}]*)\}/.exec(css)?.[1] ?? ''
+  check('C27c 单元格规则带 overflow:hidden', tdRule.includes('overflow: hidden'), tdRule.slice(0, 60))
 
   const firstRow = findNode(table, (n) => n.type === 'tbody')?.children?.[0]
   const rowCells = firstRow?.children ?? []
   const lastUsedCell = rowCells[5]
-  const lastUsedSpans = lastUsedCell?.children ?? []
-  const shortModelSpan = lastUsedSpans.find((s) => s.props?.title)
-  check('C28 「最近使用」只显示模型短名，完整名放 title（不再换行撑高行）',
-    Boolean(shortModelSpan) && shortModelSpan.children[0] === 'deepseek-v4.1-flash' && shortModelSpan.props.title === 'cline-free/deepseek-v4.1-flash',
-    `${shortModelSpan?.children?.[0]} / title=${shortModelSpan?.props?.title}`)
+  const lastUsedText = textOf(lastUsedCell).join('')
+  check('C28 「最近使用」只显示相对时间，完整模型名放 title（不再被 30 字符模型名撑宽）',
+    lastUsedText === '5 秒前' && lastUsedCell?.children?.[0]?.props?.title === 'cline-free/deepseek-v4.1-flash',
+    `${lastUsedText} / title=${lastUsedCell?.children?.[0]?.props?.title}`)
 
   // 冷却单元格：模型与「倒计时 + 绝对时刻」分成两行，不再挤在一行互相顶
   const coolingCell = rowCells[3]
