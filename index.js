@@ -1,6 +1,6 @@
 export const name = 'opencode-free-bridge'
 
-const PLUGIN_VERSION = '1.5.2'
+const PLUGIN_VERSION = '1.6.0'
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -112,6 +112,28 @@ const TERMINAL_WINDOW_MS = 10 * 60 * 1000
 /** 只用于日志的短标签，绝不记录 key 原文。 */
 function keyLabel(key) {
   return seedOf(key).toString(16).padStart(8, '0')
+}
+
+// ── 掩码预览 ─────────────────────────────────────────────────────────
+// 设置面板里为了让人认出「这是哪把 key」，会显示首尾各几位（形如 abcd…wxyz）。
+// 这条通道有严格的边界，改动时务必保持：
+//   · 只在内存里现算，只在同一个 HTTP 响应里回给本机设置面板；
+//   · 绝不进日志，绝不进 <DSH_HOME>/.opencode-free-bridge-cline-quota.json
+//     （落盘仍然只写 8 位哈希标签，见 quotaStore）；
+//   · 可用 maskKeyPreview: false 整体关闭，关闭后连首尾几位也不下发。
+// 注意：首尾各 4 位仍属于部分密钥材料，因此它只经由同源校验的只读路由暴露。
+const MASK_HEAD = 4
+const MASK_TAIL = 4
+
+/** 形如 `sk-a…9f2c`；太短的 key 不猜结构，直接少露。 */
+function maskKey(key) {
+  const value = typeof key === 'string' ? key.trim() : ''
+  if (!value) return ''
+  if (value.length <= MASK_HEAD + MASK_TAIL) {
+    // 短到首尾会重叠时只露尾巴，避免拼出完整 key
+    return value.length <= 4 ? '…' : `…${value.slice(-4)}`
+  }
+  return `${value.slice(0, MASK_HEAD)}…${value.slice(-MASK_TAIL)}`
 }
 
 // ── 额度状态持久化 ───────────────────────────────────────────────────
@@ -327,20 +349,31 @@ function readCredentialRefsFromFile(path, wantedRefs) {
 }
 
 /** key 池：按模型维度记录冷却时间，选 key 时用 LRU 避开刚用过的那个。
- *  冷却状态会经由 quotaStore 落到磁盘，DSH 重启后仍知道「哪个 key 在哪个模型上被限到几点」。 */
+ *  冷却状态会经由 quotaStore 落到磁盘，DSH 重启后仍知道「哪个 key 在哪个模型上被限到几点」。
+ *  每把 key 另带来源标签与本次运行的用量计数，供设置面板展示（这些只留在内存里）。 */
 function createKeyPool(quotaStore, diag, log) {
-  const entries = new Map() // label → { key, label, cooling: Map<model, readyAt>, lastBody: Map<model, text>, lastUsedAt }
+  const entries = new Map() // label → { key, label, source, isRequestKey, cooling: Map<model, readyAt>, lastBody: Map<model, text>, lastUsedAt, stats }
   // 额外 key 未就绪时必须可重试：凭据服务可能在插件挂载之后才注册
   let extrasResolved = false
   let lastExtrasAttempt = 0
 
-  const register = (key) => {
+  /** 来源标签只在首次登记时确定，之后的重复登记不覆盖（保证「它是从哪来的」稳定）。 */
+  const register = (key, source) => {
     const value = typeof key === 'string' ? key.trim() : ''
     if (!value || /^(Bearer|undefined|null)$/i.test(value)) return undefined
     const label = keyLabel(value)
     let entry = entries.get(label)
     if (!entry) {
-      entry = { key: value, label, cooling: new Map(), lastBody: new Map(), lastUsedAt: 0 }
+      entry = {
+        key: value,
+        label,
+        source: typeof source === 'string' && source ? source : 'unknown',
+        isRequestKey: false,
+        cooling: new Map(),
+        lastBody: new Map(),
+        lastUsedAt: 0,
+        stats: { sent: 0, ok: 0, limited: 0, lastModel: '' },
+      }
       entries.set(label, entry)
       // 恢复该 key 上次进程留下的额度状态（按 label 匹配，磁盘上没有 key 原文）
       for (const [model, record] of quotaStore?.forLabel?.(label) ?? []) {
@@ -348,6 +381,7 @@ function createKeyPool(quotaStore, diag, log) {
         if (record.body) entry.lastBody.set(model, record.body)
       }
     }
+    if (source === 'request') entry.isRequestKey = true
     return entry
   }
 
@@ -365,14 +399,16 @@ function createKeyPool(quotaStore, diag, log) {
       if (now - lastExtrasAttempt < throttle) return
       lastExtrasAttempt = now
 
-      for (const key of config?.clineKeys ?? []) register(key)
+      // 列表里带上标号：多把 key 同在一处时，面板上靠它能对上你配置里的第几项
+      const configKeys = config?.clineKeys ?? []
+      for (let i = 0; i < configKeys.length; i++) register(configKeys[i], `config: clineKeys[${i + 1}]`)
 
       const env = globalThis.process?.env ?? {}
-      for (const chunk of [env.CLINE_API_KEYS, env.CLINE_FREE_API_KEYS]) {
+      for (const [name, chunk] of [['CLINE_API_KEYS', env.CLINE_API_KEYS], ['CLINE_FREE_API_KEYS', env.CLINE_FREE_API_KEYS]]) {
         if (!chunk) continue
-        for (const key of String(chunk).split(/[\s,;]+/)) register(key)
+        for (const key of String(chunk).split(/[\s,;]+/)) register(key, `env: ${name}`)
       }
-      for (const ref of DEFAULT_CLINE_KEY_REFS) register(env[ref])
+      for (const ref of DEFAULT_CLINE_KEY_REFS) register(env[ref], `env: ${ref}`)
 
       const refs = config?.clineKeyRefs ?? DEFAULT_CLINE_KEY_REFS
 
@@ -381,7 +417,7 @@ function createKeyPool(quotaStore, diag, log) {
         const path = resolveCredentialsFilePath(config)
         try {
           const fromFile = readCredentialRefsFromFile(path, refs)
-          for (const value of fromFile.values()) register(value)
+          for (const [ref, value] of fromFile) register(value, `.credentials.yaml: ${ref}`)
           diag.credentialsFileRead = true
           // 兜底成功也算已解析：改为 5 分钟复扫，避免每个请求都读盘
           if (fromFile.size > 0) extrasResolved = true
@@ -434,6 +470,14 @@ function createKeyPool(quotaStore, diag, log) {
       }
       return best
     },
+    /** 记一次「真的发给了上游」（设置面板的用量计数用，只留在内存）。 */
+    markSent(key, model) {
+      const entry = entries.get(keyLabel(key))
+      if (!entry) return
+      entry.stats.sent += 1
+      entry.stats.lastModel = model
+      entry.lastUsedAt = Date.now()
+    },
     markCooling(key, model, ms, body) {
       const entry = entries.get(keyLabel(key))
       if (!entry) return
@@ -441,6 +485,8 @@ function createKeyPool(quotaStore, diag, log) {
       entry.cooling.set(model, readyAt)
       if (body) entry.lastBody.set(model, body)
       entry.lastUsedAt = Date.now()
+      entry.stats.limited += 1
+      entry.stats.lastModel = model
       quotaStore?.set?.(entry.label, model, readyAt, body)
     },
     markHealthy(key, model) {
@@ -449,6 +495,8 @@ function createKeyPool(quotaStore, diag, log) {
       entry.cooling.delete(model)
       entry.lastBody.delete(model)
       entry.lastUsedAt = Date.now()
+      entry.stats.ok += 1
+      entry.stats.lastModel = model
       quotaStore?.clear?.(entry.label, model)
     },
     /** 供自检工具观察状态，不暴露 key 原文。 */
@@ -463,6 +511,121 @@ function createKeyPool(quotaStore, diag, log) {
         lastUsedAt: entry.lastUsedAt,
       }))
     },
+    /** 设置面板用的完整视图：带来源、掩码预览与本次运行用量。每个 key 原文都只经 maskKey 处理。 */
+    describe(options) {
+      const now = Date.now()
+      const withPreview = options?.revealPreview !== false
+      return [...entries.values()]
+        .sort((a, b) => b.lastUsedAt - a.lastUsedAt || a.label.localeCompare(b.label))
+        .map((entry, index) => ({
+          index: index + 1,
+          label: entry.label,
+          preview: withPreview ? maskKey(entry.key) : '',
+          source: entry.source,
+          isRequestKey: entry.isRequestKey,
+          cooling: [...entry.cooling.entries()]
+            .filter(([, until]) => until > now)
+            .map(([model, until]) => ({
+              model,
+              readyAt: until,
+              readyInMin: Math.max(1, Math.round((until - now) / 60000)),
+            }))
+            .sort((a, b) => a.readyAt - b.readyAt),
+          stats: {
+            sent: entry.stats.sent,
+            ok: entry.stats.ok,
+            limited: entry.stats.limited,
+            lastModel: entry.stats.lastModel,
+            lastUsedAt: entry.lastUsedAt,
+          },
+        }))
+    },
+  }
+}
+
+// ───────────────────── 设置面板的状态载荷 ─────────────────────
+// 主机端 → 浏览器半边的唯一数据出口。它只读、只回这些字段：
+//   · 每把 key 的 8 位标签、**掩码预览**（可关）、来源、冷却模型与恢复倒计时、
+//     本次运行的用量计数；
+//   · 全局计数、配置摘要（只挑标量字段）、最近几条决策轨迹。
+// 绝不出现的内容：key 原文、config.clineKeys（那是 key 原文数组！）、请求体、
+// 任何 Authorization 头。改动这里时请把这条约束当成硬性要求。
+
+/** 只挑可安全外发的配置项：绝不整体展开 config（它在 clineKeys 里含 key 原文）。 */
+function safeConfigSummary(config, extra) {
+  return {
+    clineMatch: extra.clineMatch,
+    clineCooldownMs: extra.clineCooldownMs,
+    failFastMinMs: extra.failFastMinMs,
+    skipCoolingRequestKey: extra.skipCoolingRequestKey,
+    allCoolingFailFast: extra.allCoolingFailFast,
+    rotateStatuses: [...extra.rotateStatuses],
+    maskKeyPreview: config?.maskKeyPreview !== false,
+    readCredentialsFile: config?.readCredentialsFile !== false,
+    credentialsFile: resolveCredentialsFilePath(config),
+    clineKeyRefs: [...(config?.clineKeyRefs ?? DEFAULT_CLINE_KEY_REFS)],
+  }
+}
+
+/** 设置面板一次刷新所需的全部内容。 */
+function buildStatus(deps, options) {
+  const { config, pool, diag, quotaStore } = deps
+  const revealPreview = options?.revealPreview ?? config?.maskKeyPreview !== false
+  const keys = pool.describe({ revealPreview })
+  const coolingKeys = keys.filter((key) => key.cooling.length > 0).length
+  return {
+    plugin: 'opencode-free-bridge',
+    version: PLUGIN_VERSION,
+    updatedAt: Date.now(),
+    settings: safeConfigSummary(config, deps),
+    quotaStatePath: quotaStore.path,
+    totals: {
+      poolSize: keys.length,
+      readyKeys: keys.length - coolingKeys,
+      coolingKeys,
+      clineRequests: diag.clineRequests ?? 0,
+      rotations: diag.rotations ?? 0,
+      failFasts: diag.failFasts ?? 0,
+    },
+    extras: {
+      credentialsFileRead: Boolean(diag.credentialsFileRead),
+      extrasResolved: Boolean(diag.extrasResolved),
+      lastExtrasAt: diag.lastExtrasAt ?? '',
+    },
+    lastDecision: diag.lastDecision ?? '',
+    keys,
+    // 最近几次请求的决策轨迹（只有模型名与决策文本，无 key 材料）
+    recent: (diag.lastRequests ?? []).map((row) => ({
+      at: row.at,
+      model: row.model,
+      decision: row.decision,
+      bodyLen: row.bodyLen,
+      poolSize: row.poolSize,
+    })),
+  }
+}
+
+/** 只回 JSON 的小工具：面板路由只走这一条响应路径。 */
+function sendJson(res, status, payload) {
+  let body
+  try {
+    body = JSON.stringify(payload)
+  } catch {
+    body = '{"error":"serialization failed"}'
+    status = 500
+  }
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+  res.end(body)
+}
+
+/** 最低限度的本机浏览器信任校验：请求的 Referer 必须与 Host 同源。 */
+function isTrustedRequest(req) {
+  const host = req.headers?.host ?? ''
+  const referer = req.headers?.referer ?? ''
+  try {
+    return referer !== '' && new URL(referer).host === host
+  } catch {
+    return false
   }
 }
 
@@ -580,7 +743,7 @@ export function apply(ctx, config) {
       const requestKey = readKeyOf(headers, authTarget)
       const hasAuthorization = Boolean(headers.get('authorization'))
       const hasApiKey = Boolean(headers.get('x-api-key'))
-      if (requestKey) pool.register(requestKey)
+      if (requestKey) pool.register(requestKey, 'request')
       // 额外 key 必须在首次判定前就位，否则「全池冷却」与「挑备用 key」都会失真
       await pool.ensureExtras(ctx, config).catch(() => {})
       diag.clineRequests += 1
@@ -673,6 +836,7 @@ export function apply(ctx, config) {
       }
 
       let response = await sendWith(headers, bufferedBody)
+      if (currentKey) pool.markSent(currentKey, model)
       if (!rotateStatuses.includes(response.status)) {
         if (currentKey) pool.markHealthy(currentKey, model)
         decide(`pass-through status=${response.status}`)
@@ -699,6 +863,7 @@ export function apply(ctx, config) {
         let retried
         try {
           retried = await sendWith(nextHeaders, bufferedBody)
+          pool.markSent(next.key, model)
         } catch (error) {
           log(`Cline 换 key 重发失败（key=${next.label}）：${error?.message ?? error}`)
           break
@@ -749,9 +914,72 @@ export function apply(ctx, config) {
     quotaStore.flush()
   })
 
+  // ───────────────────── 设置面板：只读状态路由 ─────────────────────
+  // 面板本体是浏览器半边（lib/client.js，经 package.json 的 dsh.client 声明由
+  // dsh-client-modules 打包投放）；它需要主机端把 key 池状态交出来，这里用一条
+  // 同源只读路由提供。
+  //
+  // 关键：这条路由**不能**用模块级 `export const inject = ['webServer']` 来等依赖——
+  // 那会把整个插件（包括 fetch 补丁）门控在 webServer 上，headless/acp/desktop
+  // 这些没有 webServer 的 profile 里连 Zen/Cline 桥接都会一起失效。
+  // 正确做法是 ctx.inject 开一个子 fiber（DSH 自身大量使用这个模式，例如
+  // dsh-client-modules 就是这么挂 /plugins 路由的），只为路由等 webServer。
+  const statusRoute = {
+    path: '/opencode-free-bridge/cline-keys',
+    build: (options) =>
+      buildStatus(
+        {
+          config,
+          pool,
+          diag,
+          quotaStore,
+          clineMatch,
+          clineCooldownMs,
+          failFastMinMs,
+          skipCoolingRequestKey,
+          allCoolingFailFast,
+          rotateStatuses,
+        },
+        options,
+      ),
+  }
+
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['webServer'], (webCtx) => {
+      webCtx.effect(
+        () =>
+          webCtx.webServer.register({
+            kind: 'exact',
+            path: statusRoute.path,
+            handler: (req, res) => {
+              if (req.method !== 'GET' && req.method !== 'HEAD') {
+                return sendJson(res, 405, { error: 'method not allowed' })
+              }
+              // 同源校验：拒绝一切非本机 GUI 发起的读取
+              if (!isTrustedRequest(req)) return sendJson(res, 403, { error: 'untrusted request' })
+              let payload
+              try {
+                payload = statusRoute.build()
+              } catch (error) {
+                return sendJson(res, 500, { error: String(error?.message ?? error) })
+              }
+              if (req.method === 'HEAD') {
+                res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+                return res.end()
+              }
+              return sendJson(res, 200, payload)
+            },
+          }),
+        'opencode-free-bridge: cline keys route',
+      )
+    })
+  }
+
   // 自检工具用的观察入口（不含 key 原文）
   ctx.__opencodeFreeBridge = {
     clineKeys: () => pool.snapshot(),
+    status: (options) => statusRoute.build(options),
+    routePath: statusRoute.path,
     parseRetryWindowMs,
     quotaStatePath: quotaStore.path,
     flushQuotaState: () => quotaStore.flush(),

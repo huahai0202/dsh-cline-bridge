@@ -19,7 +19,8 @@
   - **Cline 渠道 (`api.cline.bot`)**：
     - 自动注入完整的 Cline 官方客户端特征头（`user-agent: Cline/4.1.16`、`x-client-type: cline-vscode`、`x-platform: vscode`、`http-referer` 等）；
     - 主 Key 完全由用户在 DSH 设置中配置，原生透传直通，不设代码层内置 Key 兜底；
-    - **可选**多 Key 池：额外提供 Key 后，撞到「每日免费额度」类限流会自动换 Key 重发（未提供额外 Key 时行为与之前完全一致，零影响）。
+    - **可选**多 Key 池：额外提供 Key 后，撞到「每日免费额度」类限流会自动换 Key 重发（未提供额外 Key 时行为与之前完全一致，零影响）；
+    - **设置页面板**：在 DSH 设置里新增「Cline Key」分区，逐把列出每个 Key 的来源、掩码预览、健康/冷却状态、各模型的恢复倒计时与本次运行的用量（发送 / 成功 / 限流）。
 - **100% 流量精准隔离**：
   - 仅在网络请求目标为 `opencode.ai/zen` 或 `api.cline.bot` 时介入；
   - 对 DeepSeek 官方模型、OpenAI、Claude、Gemini 等其他所有渠道 100% 原样直通，零副作用。
@@ -108,6 +109,8 @@ Cline 的免费额度是**按 Key + 按模型**的每日上限，撞限流时服
     # allCoolingFailFast: false
     # 可选：最早恢复时刻至少还有这么久，才快速失败（毫秒，默认 5 分钟；设 0 表示只要全池冷却就快速失败）
     # failFastMinMs: 300000
+    # 可选：设置面板里是否显示 Key 的首尾各 4 位掩码（默认 true；设 false 则连片段也不下发）
+    # maskKeyPreview: false
 ```
 
 ### 用报错里的「恢复时刻」做的三件事
@@ -136,8 +139,28 @@ refs:
 - 撞限流后按 **`key + 模型`** 维度记录冷却：同一个 Key 在模型 A 上耗尽，不影响它在模型 B 上继续用；重试窗口优先从报文的 `Try again in 22h 47m` 解析，解析不出则用 `clineCooldownMs`。
 - 挑选备用 Key 时用 **LRU + 跳过该模型已冷却者**，避免把压力集中到某一个 Key。
 - 备用 Key 全部失败时区分收尾：**额度耗尽类**（`INFERENCE_CAP_ERROR` / 报文含 `Daily free limit` / 窗口 ≥ 10 分钟）会附加 `x-should-retry: false`，让 pi-ai 立即放弃而不是空等退避；**瞬时限流**则原样返回，交给 pi-ai 按 `retry-after` 自行重试。
-- Key 原文永不写日志，只记录 8 位哈希标签；额度状态落盘时同样只写标签，**文件里不含任何 key**。
+- Key 原文永不写日志，只记录 8 位哈希标签；额度状态落盘时同样只写标签，**文件里不含任何 key**。设置页面板是唯一的例外通道：它经同源只读路由展示每个 Key 的**首尾各 4 位掩码**（例如 `sk-a…9f2c`），方便你认出是哪一把；可用 `maskKeyPreview: false` 彻底关闭。
 - 冷却状态跨 DSH 重启保留（见下「用报错里的恢复时刻做的三件事」）；缓存成功后自动清除对应记录。
+
+### 设置页面板（Cline Key）
+
+在 **DSH 设置 → Cline Key** 里可以一眼看到池内每把 Key 的情况（分区由 DSH 自己的 `settings.section` 座位承载，配色与主题全部继承宿主）：
+
+| 列 | 含义 |
+| --- | --- |
+| **#** | 池内序号，按最近使用倒序 |
+| **Key** | 首尾各 4 位的掩码预览 + 8 位哈希标签；首个发起请求的那把会带「DSH 主 Key」标记 |
+| **来源** | 这把 Key 是从哪来的：`DSH 请求头`（DSH 里配的那把）、`config: clineKeys`、`env: CLINE_API_KEY_2`、`.credentials.yaml: CLINE_API_KEY_2` |
+| **状态** | 可用 / 冷却中 |
+| **冷却模型 / 恢复** | 该 Key 在哪些模型上撞了每日上限，以及距恢复的倒计时与绝对时刻（按 `key + 模型` 维度） |
+| **发送 / 成功 / 限流** | 本次运行（进程内）真的发给上游的次数 / 成功次数 / 撞限流次数 |
+| **最近使用** | 相对时间与该次请求的模型 |
+
+面板顶部还有池大小、可用/冷却把数、`Cline 请求` / `换 Key 恢复` / `快速失败` 三个累计计数与插件版本；底部是「最近决策」（最近几条请求的模型与决策文本）与「运行参数」（当前生效的匹配目标、冷却时长、快速失败阈值、掩码开关、凭据文件路径等）。面板每 5 秒自动刷新一次（页面不可见时暂停），也可手动刷新。
+
+> **数据通道与隐私边界**：主机半边只在 `ctx.inject(['webServer'], …)` 里注册一条**只读** `GET /opencode-free-bridge/cline-keys`，把状态交给浏览器半边渲染。该路由强制同源校验（`Referer` 必须与 `Host` 同源）、只允许 `GET`/`HEAD`、回包带 `no-store`。它下发的只有哈希标签、掩码预览、来源标签、冷却时刻与计数——**没有任何 key 原文，也不回显 `config.clineKeys`**；掩码只在内存里现算，磁盘状态文件里依旧连掩码都没有。全程用 `node tools/cline-panel-check.mjs` 断言这一点。
+>
+> **不门控主链路**：路由等待 `webServer` 用的是 `ctx.inject([...])` 子 fiber，而不是模块级 `export const inject = ['webServer']`。后者会把整个插件（包括 fetch 补丁）门控在 webServer 上，让 headless / acp / desktop 等没有 webServer 的 profile 连渠道桥接一起失效。
 
 ---
 
@@ -173,11 +196,14 @@ Zen 的放行规则由服务端随时可能调整，更新插件后建议跑一�
 node tools/zen-check.mjs          # 离线断言：头部形状、会话稳定性、渠道隔离、dispose 还原
 node tools/zen-check.mjs --live   # 追加真实网络调用，确认免费通道确实放行
 node tools/cline-key-check.mjs    # Cline 多 Key 轮换：本地 mock 服务器复刻 429，无需真实 Key
+node tools/cline-panel-check.mjs  # 设置页面板：只读路由契约 + 浏览器半边真实渲染
 ```
 
 可用 `ZEN_FREE_MODEL=xxx node tools/zen-check.mjs --live` 指定探测用的免费模型。
 
 `cline-key-check.mjs` 覆盖：换 Key 恢复、按模型冷却、LRU 选 Key、三种 Key 来源（config / 环境变量 / 凭据仓库）、单 Key 与瞬时限流下的收尾差异、**额度状态跨重启持久化**、**全池冷却快速失败**。
+
+`cline-panel-check.mjs` 覆盖：路由只在 `ctx.inject(['webServer'])` 里注册（不门控主链路）、同源校验与 `GET`/`HEAD` 限制、载荷**不含任何 Key 原文**且只带首尾掩码、`maskKeyPreview: false` 时连片段也不下发、**磁盘状态文件里连掩码都没有**、用量计数与来源标签正确；浏览器半边则在 `node:vm` 沙箱里用迷你 React 真正渲染一遍（有数据 / 空池 / 请求失败三条路径），断言渲染树里不出现 Key 原文。
 
 > 自检默认把额度状态写到临时目录，不会碰你真实的 `.opencode-free-bridge-cline-quota.json`。
 

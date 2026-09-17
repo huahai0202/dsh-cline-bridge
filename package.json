@@ -1,11 +1,12 @@
 {
   "name": "opencode-free-bridge",
-  "version": "1.5.2",
-  "description": "OpenCode Zen & Cline Bridge for DeepSeek Harness (DSH): native channel enhancement, protocol headers injection, multi-key failover for Cline.",
+  "version": "1.6.0",
+  "description": "OpenCode Zen & Cline Bridge for DeepSeek Harness (DSH): native channel enhancement, protocol headers injection, multi-key failover for Cline, plus a settings panel for per-key usage.",
   "type": "module",
   "main": "index.js",
   "exports": {
     ".": "./index.js",
+    "./client": "./lib/client.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
@@ -21,6 +22,14 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-modules",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-locale"
+      ],
+      "platform": "web"
     }
   }
 }
