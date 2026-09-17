@@ -1,6 +1,6 @@
 {
   "name": "opencode-free-bridge",
-  "version": "1.11.0",
+  "version": "1.12.0",
   "description": "OpenCode Zen & Cline Bridge for DeepSeek Harness (DSH): native channel enhancement, protocol headers injection, multi-key failover for Cline, plus a settings panel for per-key usage.",
   "type": "module",
   "main": "index.js",

@@ -878,8 +878,11 @@ async function renderPanel(payload, { fetchError = null } = {}) {
   const usageGlm = usageOf(tree, 'db694bbf')
   check('I4 筛到 glm 时明细只剩 glm 那一行', usageGlm.includes('z-ai/glm-5.3-flash 3/3/0') && !usageGlm.includes('deepseek'), usageGlm)
 
-  const usageDs = usageOf(dsView, '761f9875')
-  check('I5 筛到 deepseek 时该模型上没跑过的 key 显示「该模型上没用过」', usageDs.includes('该模型上没用过'), usageDs)
+  // 该模型上没用过的 key 不再各占一块，而是折叠成一行提示（否则半张卡都是「没用过」）
+  const cardText = (node) => textOf(usageCardOf(node)).join('\n')
+  check('I5 筛到 deepseek 时未使用的 key 折叠成一行提示',
+    cardText(dsView).includes('其余 1 把在该模型上没用过') && !cardText(dsView).includes('761f9875'),
+    cardText(dsView).replace(/\n/g, ' | '))
   const usageDsMine = usageOf(dsView, 'db694bbf')
   check('I6 筛到 deepseek 时明细显示 deepseek 的计数', usageDsMine.includes('cline-free/deepseek-v4.1-flash 16/15/1'), usageDsMine)
 
@@ -899,6 +902,43 @@ async function renderPanel(payload, { fetchError = null } = {}) {
     tokenRowOf(dsView, 'db694bbf').includes('12.3k/1.2k'), tokenRowOf(dsView, 'db694bbf'))
   check('I10 该模型上没用过的 key：token 显示 0/0，不能退回全局总计',
     tokenRowOf(dsView, '761f9875') === '0/0/0 | 0/0', tokenRowOf(dsView, '761f9875'))
+
+  // ── 可视化：占比条与合计 ──
+  const barsOf = (node) => {
+    const found = []
+    const walk = (current) => {
+      if (!current || typeof current !== 'object') return
+      if (Array.isArray(current)) return current.forEach(walk)
+      if (String(current.props?.className ?? '') === '_dsh_ofb_bar') found.push(current)
+      ;(current.children ?? []).forEach(walk)
+    }
+    walk(usageCardOf(node))
+    return found
+  }
+  const fillOf = (bar) => findNode(bar, (n) => String(n.props?.className ?? '') === '_dsh_ofb_bar_fill')
+  const bars = barsOf(allView)
+  check('I11 每行 token 都配一根占比条', bars.length === 3, `bars=${bars.length}`)
+  const barWidths = bars.map((bar) => Number.parseFloat(fillOf(bar)?.props?.style?.width ?? '0'))
+  check('I12 用量最大的那行占满整条（条长按卡内最大用量归一）',
+    Math.max(...barWidths) === 100 && barWidths.filter((w) => w === 100).length === 1, barWidths.map((w) => w.toFixed(0) + '%').join(' / '))
+  check('I13 条内按 输入:输出 拆成两段',
+    bars.every((bar) => {
+      const segs = (fillOf(bar)?.children ?? []).map((c) => String(c.props?.className ?? ''))
+      return segs.includes('_dsh_ofb_bar_in') && segs.includes('_dsh_ofb_bar_out')
+    }), JSON.stringify(bars.map((bar) => (fillOf(bar)?.children ?? []).map((c) => String(c.props?.className ?? '').replace('_dsh_ofb_bar_', '')))))
+  const inputShare = Number.parseFloat(
+    (fillOf(bars[1])?.children ?? []).find((c) => String(c.props?.className ?? '') === '_dsh_ofb_bar_in')?.props?.style?.width ?? '0',
+  )
+  check('I14 输入段占比与数值一致（12300/13500）', Math.abs(inputShare - (12300 / 13500) * 100) < 0.2, inputShare.toFixed(1) + '%')
+  check('I15 标题行给出合计（请求 + token，取自面板整体文本，因为它在卡片外）',
+    (() => {
+      const whole = textOf(allView).join('\n')
+      return whole.includes('合计') && whole.includes('40/39/1') && whole.includes('37.8k/3.6k')
+    })(),
+    textOf(allView).filter((s) => s.includes('合计')).join(' '))
+  check('I16 条与数字都带完整数值 title（悬停看精确值）',
+    String(findNode(bars[0], (n) => typeof n.props?.title === 'string')?.props?.title ?? '').includes('输入 ') === true,
+    findNode(bars[0], (n) => typeof n.props?.title === 'string')?.props?.title)
 
   bundle.mini.dispose()
 }
