@@ -228,6 +228,12 @@ function createKeyPool() {
       }
       return best
     },
+    isCooling(key, model) {
+      const entry = entries.get(key)
+      if (!entry) return false
+      const until = entry.cooling.get(model)
+      return until !== undefined && until > Date.now()
+    },
     markCooling(key, model, ms) {
       const entry = entries.get(key)
       if (!entry) return
@@ -262,6 +268,9 @@ export function apply(ctx, config) {
     ? Math.max(0, config.clineCooldownMs)
     : DEFAULT_CLINE_COOLDOWN_MS
   const rotateStatuses = Array.isArray(config?.rotateStatuses) ? config.rotateStatuses : CLINE_ROTATE_STATUSES
+  // 默认 false：首发送始终用 DSH 配置的 key，冷却中的 key 也先试一次（更可预测）。
+  // 置 true：本地已记录该 key 在当前模型上冷却时，首发送就改用健康 key，省掉一次白撞。
+  const skipCoolingRequestKey = config?.skipCoolingRequestKey === true
   const pool = createKeyPool()
   // 额外 key 与请求无关，尽早加载；失败也不影响主链路
   void pool.ensureExtras(ctx, config).catch(() => {})
@@ -364,7 +373,16 @@ export function apply(ctx, config) {
       // 首发送始终沿用请求自带的 key（即 DSH 里配置的那个），轮换只作为撞限流后的兜底。
       // 即使该 key 已被本地记为「冷却中」也仍然先试一次：本地冷却只是推测，
       // 服务端额度可能已重置，先试一次比直接换 key 更可预测。
+      // 若确实希望省掉这次白撞（例如主 key 已被限 22 小时），把 skipCoolingRequestKey 打开。
       let currentKey = requestKey
+      if (skipCoolingRequestKey && currentKey && pool.isCooling(currentKey, model)) {
+        const healthy = pool.pick(model)
+        if (healthy && healthy.key !== currentKey) {
+          log(`Cline 主 key 在 ${model} 上仍在冷却，直接改用 ${healthy.label}`)
+          currentKey = healthy.key
+          writeKeyTo(headers, currentKey, authTarget)
+        }
+      }
 
       const sendWith = (sendHeaders, body) => {
         if (input instanceof Request) {

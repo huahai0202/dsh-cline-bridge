@@ -94,6 +94,8 @@ Cline 的免费额度是**按 Key + 按模型**的每日上限，撞限流时服
     # clineMatch: 'my-cline-proxy.example'
     # 可选：报文里解析不出重试窗口时的默认冷却（毫秒，默认 15 分钟）
     # clineCooldownMs: 900000
+    # 可选：主 key 已知在冷却时，首发送就改用健康 key（默认 false，保持「先试主 key」的可预测行为）
+    # skipCoolingRequestKey: true
 ```
 
 凭据仓库方式则是直接在 `~/.dsh/.credentials.yaml` 的 `refs` 下追加（或用 DSH Web 设置里的凭据页）：
@@ -107,7 +109,8 @@ refs:
 
 ### 行为约定
 
-- **首发送始终使用 DSH 里配置的那个 Key**，轮换只作为兜底；即使该 Key 已被本地记为「冷却中」也仍会先试一次（本地冷却只是推测，服务端额度可能已重置，先试一次更可预测）。
+- **首发送默认始终使用 DSH 里配置的那个 Key**，轮换只作为兜底；即使该 Key 已被本地记为「冷却中」也仍会先试一次（本地冷却只是推测，服务端额度可能已重置，先试一次更可预测）。
+  - 代价是：当主 Key 在某模型上被限了一整天时，每一轮都会先白撞一次 429 再换 Key。若想省掉这次白撞，把 `skipCoolingRequestKey: true` 打开，首发送就会直接改用健康 Key（实测数据见下）。
 - 撞限流后按 **`key + 模型`** 维度记录冷却：同一个 Key 在模型 A 上耗尽，不影响它在模型 B 上继续用；重试窗口优先从报文的 `Try again in 22h 47m` 解析，解析不出则用 `clineCooldownMs`。
 - 挑选备用 Key 时用 **LRU + 跳过该模型已冷却者**，避免把压力集中到某一个 Key。
 - 备用 Key 全部失败时区分收尾：**额度耗尽类**（`INFERENCE_CAP_ERROR` / 报文含 `Daily free limit` / 窗口 ≥ 10 分钟）会附加 `x-should-retry: false`，让 pi-ai 立即放弃而不是空等退避；**瞬时限流**则原样返回，交给 pi-ai 按 `retry-after` 自行重试。

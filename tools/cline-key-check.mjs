@@ -183,6 +183,20 @@ const since = (n) => seen.slice(n)
   check('I2 不追加 x-should-retry（交给 pi-ai 自行退避重试）', r.noRetry === null, String(r.noRetry))
 }
 
+// ── J. skipCoolingRequestKey：可选地跳过首发送的白撞 ────────────────
+{
+  mount({ clineKeys: ['k1', 'k2'], clineMatch: match, skipCoolingRequestKey: true })
+  const n = mark()
+  const r1 = await call('k1')
+  const a1 = since(n)
+  check('J1 开启后首次仍靠轮换成功', r1.status === 200 && a1.length === 2 && a1[1].key === 'k2', a1.map((a) => a.key).join('→'))
+
+  const n2 = mark()
+  const r2 = await call('k1')
+  const a2 = since(n2)
+  check('J2 开启后冷却中的 key 不再被先撞（一次成功）', r2.status === 200 && a2.length === 1 && a2[0].key === 'k2', a2.map((a) => a.key).join('→'))
+}
+
 dispose()
 server.closeAllConnections?.()
 await new Promise((resolve) => server.close(resolve))
