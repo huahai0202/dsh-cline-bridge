@@ -18,7 +18,8 @@
     - 未配置 Key（或误填 URL）时自动使用官方匿名通道（`Bearer public`）。
   - **Cline 渠道 (`api.cline.bot`)**：
     - 自动注入完整的 Cline 官方客户端特征头（`user-agent: Cline/4.1.16`、`x-client-type: cline-vscode`、`x-platform: vscode`、`http-referer` 等）；
-    - 鉴权完全由用户在 DSH 设置中配置的 Key 决定，原生透传直通，不设代码层内置 Key 兜底。
+    - 主 Key 完全由用户在 DSH 设置中配置，原生透传直通，不设代码层内置 Key 兜底；
+    - **可选**多 Key 池：额外提供 Key 后，撞到「每日免费额度」类限流会自动换 Key 重发（未提供额外 Key 时行为与之前完全一致，零影响）。
 - **100% 流量精准隔离**：
   - 仅在网络请求目标为 `opencode.ai/zen` 或 `api.cline.bot` 时介入；
   - 对 DeepSeek 官方模型、OpenAI、Claude、Gemini 等其他所有渠道 100% 原样直通，零副作用。
@@ -60,6 +61,51 @@ Zen 免费模型（`mimo-v2.5-free`、`nemotron-3.5-lightning-free` 等）由 Co
 
 ---
 
+## 🔁 Cline 多 Key 自动切换（可选）
+
+Cline 的免费额度是**按 Key + 按模型**的每日上限，撞限流时服务端返回：
+
+```json
+429 {"code":"INFERENCE_CAP_ERROR",
+     "message":"Error 429: Daily free limit reached on model deepseek/deepseek-v4.1-flash. Try again in 22h 47m"}
+```
+
+重试窗口以小时计，退避等待毫无意义，只能换 Key。插件位于 openai SDK 之下、pi-ai 的 `retryProviderRequest` 之上，**是唯一能「换 Key 重发」的层次**：只要换 Key 后拿到成功响应就直接返回，上层根本看不到那次 429。
+
+> DSH 原生不支持多 Key：`apiKeyEnv` 是单个凭据引用，路由在请求进入 pi-ai 前只解析出一个 Key，pi-ai 的重试也始终复用同一个 Key。所以这个能力只能由插件在 fetch 层提供。
+
+### 提供额外 Key 的三种方式（可组合）
+
+| 方式 | 用法 |
+| --- | --- |
+| **DSH 凭据仓库**（推荐） | 在凭据中存 `CLINE_API_KEY_2`、`CLINE_API_KEY_3`…（插件默认探测 `_2`~`_10`），通过 `ctx.credentials.resolve(ref)` 读取，Key 不进代码与配置文件 |
+| **启动环境变量** | 启动 DSH 前设置 `CLINE_API_KEYS=k2,k3`（逗号/空格/分号分隔），或直接 `CLINE_API_KEY_2`、`CLINE_API_KEY_3`… |
+| **插件 config** | 在 profile 的 `cordis.patch.yml` 里给条目加配置（支持 `!!js` 表达式） |
+
+```yaml
+- insert:
+    - id: opencode-free-bridge
+      name: 'opencode-free-bridge'
+      config:
+        clineKeys:
+          - !!js process.env.CLINE_API_KEY
+          - !!js process.env.CLINE_API_KEY_2
+        # 可选：自建中转 / 测试用的目标匹配串（默认 api.cline.bot）
+        # clineMatch: 'my-cline-proxy.example'
+        # 可选：报文里解析不出重试窗口时的默认冷却（毫秒，默认 15 分钟）
+        # clineCooldownMs: 900000
+```
+
+### 行为约定
+
+- **首发送始终使用 DSH 里配置的那个 Key**，轮换只作为兜底；即使该 Key 已被本地记为「冷却中」也仍会先试一次（本地冷却只是推测，服务端额度可能已重置，先试一次更可预测）。
+- 撞限流后按 **`key + 模型`** 维度记录冷却：同一个 Key 在模型 A 上耗尽，不影响它在模型 B 上继续用；重试窗口优先从报文的 `Try again in 22h 47m` 解析，解析不出则用 `clineCooldownMs`。
+- 挑选备用 Key 时用 **LRU + 跳过该模型已冷却者**，避免把压力集中到某一个 Key。
+- 备用 Key 全部失败时区分收尾：**额度耗尽类**（`INFERENCE_CAP_ERROR` / 报文含 `Daily free limit` / 窗口 ≥ 10 分钟）会附加 `x-should-retry: false`，让 pi-ai 立即放弃而不是空等退避；**瞬时限流**则原样返回，交给 pi-ai 按 `retry-after` 自行重试。
+- Key 原文永不写日志，只记录 8 位哈希标签；冷却状态仅存于进程内存，DSH 重启即清空。
+
+---
+
 ## 📦 安装方法
 
 在终端运行以下命令，将插件安装到 DSH 的 `web` Profile：
@@ -91,9 +137,12 @@ Zen 的放行规则由服务端随时可能调整，更新插件后建议跑一�
 ```bash
 node tools/zen-check.mjs          # 离线断言：头部形状、会话稳定性、渠道隔离、dispose 还原
 node tools/zen-check.mjs --live   # 追加真实网络调用，确认免费通道确实放行
+node tools/cline-key-check.mjs    # Cline 多 Key 轮换：本地 mock 服务器复刻 429，无需真实 Key
 ```
 
 可用 `ZEN_FREE_MODEL=xxx node tools/zen-check.mjs --live` 指定探测用的免费模型。
+
+`cline-key-check.mjs` 覆盖：换 Key 恢复、按模型冷却、LRU 选 Key、三种 Key 来源（config / 环境变量 / 凭据仓库）、单 Key 与瞬时限流下的收尾差异。
 
 ---
 
