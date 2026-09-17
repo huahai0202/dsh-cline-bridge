@@ -1,6 +1,6 @@
 export const name = 'opencode-free-bridge'
 
-const PLUGIN_VERSION = '1.5.0'
+const PLUGIN_VERSION = '1.5.1'
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -527,6 +527,9 @@ export function apply(ctx, config) {
     credentialsFound: false,
     credentialsVia: '',
     credentialsProbeError: '',
+    injectApi: '',
+    injectCallback: '',
+    injectError: '',
     credentialsFileRead: false,
     extrasResolved: false,
     poolSize: 0,
@@ -540,22 +543,41 @@ export function apply(ctx, config) {
   // 额外 key 与请求无关，尽早加载；失败也不影响主链路
   void pool.ensureExtras(ctx, config).catch(() => {})
   // 凭据服务的正路：用「等依赖就绪」的子插件拿服务实例。它不阻塞本插件加载
-  // （没有该服务时插件照常工作，只是额外 key 改由环境变量/凭据文件提供），
-  // 而一旦服务就绪就立刻把实例交给我们并强制重扫一次。
-  try {
-    ctx?.inject?.(['credentials'], (scoped) => {
-      const service = scoped?.credentials ?? scoped?.get?.('credentials')
-      if (!service?.resolve) {
-        diag.credentialsVia = 'inject(no-service)'
-        return
-      }
-      diag.credentialsVia = 'inject'
-      diag.credentialsProbeError = ''
-      pool.setCredentials(service)
-      void pool.ensureExtras(ctx, config, { force: true }).catch(() => {})
-    })
-  } catch (error) {
-    diag.credentialsProbeError = `inject: ${error?.message ?? error}`
+  // （没有该服务时插件照常工作，只是额外 key 改由环境变量/凭据文件提供）。
+  // 诊断记录「哪种 API 可用 + 回调是否触发」，避免再靠猜。
+  const injectVia =
+    typeof ctx?.inject === 'function' ? 'ctx.inject' : typeof ctx?.root?.inject === 'function' ? 'ctx.root.inject' : 'absent'
+  diag.injectApi = injectVia
+  diag.injectCallback = 'pending'
+  if (injectVia === 'absent') {
+    diag.injectError = 'no inject api on ctx'
+  } else {
+    const target = injectVia === 'ctx.inject' ? ctx : ctx.root
+    try {
+      target.inject(['credentials'], (scoped) => {
+        diag.injectCallback = 'fired'
+        let service = scoped?.credentials
+        if (!service?.resolve) {
+          try {
+            service = scoped?.get?.('credentials')
+          } catch (error) {
+            diag.credentialsProbeError = `scoped.get: ${error?.message ?? error}`
+          }
+        }
+        if (!service?.resolve) {
+          diag.credentialsVia = 'inject(no-service)'
+          quotaStore.setDiagnostics(diag)
+          return
+        }
+        diag.credentialsVia = 'inject'
+        diag.credentialsFound = true
+        diag.credentialsProbeError = ''
+        pool.setCredentials(service)
+        void pool.ensureExtras(ctx, config, { force: true }).catch(() => {})
+      })
+    } catch (error) {
+      diag.injectError = String(error?.message ?? error)
+    }
   }
 
   const log = (message) => {
