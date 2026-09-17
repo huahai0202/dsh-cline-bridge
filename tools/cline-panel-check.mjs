@@ -460,7 +460,7 @@ async function renderPanel(payload, { fetchError = null } = {}) {
   check('C15 渲染出用量计数 发送/成功/限流', text.includes('12 / 11 / 1') && text.includes('4 / 4 / 0'))
   check('C16 渲染出统计卡数值', text.includes('61') && text.includes(PLUGIN_VERSION), PLUGIN_VERSION)
   check('C17 渲染出最近决策', text.includes('最近决策') && text.includes('rotated a→b'))
-  check('C18 渲染出运行参数', text.includes('运行参数') && text.includes('15分钟'))
+  check('C18 面板里没有「运行参数」卡片', !text.includes('运行参数') && !text.includes('凭据文件') && !text.includes('15分钟') && !text.includes('Runtime parameters'))
   check('C19 面板里没有掩码说明文字', !text.includes('首尾各 4 位') && !text.includes('掩码预览'))
   check('C20 详情卡里出现 key 池表格表头（且只有 6 列）', text.includes('冷却模型 / 恢复') && text.includes('发送 / 成功 / 限流') && table_headers(tree).length === 6, table_headers(tree).join(' | '))
 
