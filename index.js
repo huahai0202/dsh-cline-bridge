@@ -1,6 +1,6 @@
 export const name = 'opencode-free-bridge'
 
-const PLUGIN_VERSION = '1.4.3'
+const PLUGIN_VERSION = '1.4.4'
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -624,6 +624,7 @@ export function apply(ctx, config) {
       diag.lastRequests = [...(diag.lastRequests ?? []).slice(-2), trace]
       const decide = (reason) => {
         trace.decision = reason
+        diag.poolSize = pool.size // 每轮决策时刷新，避免沿用 ensureExtras 里被 TTL 节流前的旧值
         diag.lastDecision = reason
         quotaStore.setDiagnostics({ ...diag, pool: pool.snapshot().map((e) => ({ label: e.label, cooling: e.cooling })) })
       }
