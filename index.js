@@ -1,6 +1,6 @@
 export const name = 'opencode-free-bridge'
 
-const PLUGIN_VERSION = '1.7.1'
+const PLUGIN_VERSION = '1.8.0'
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -357,6 +357,21 @@ function createKeyPool(quotaStore, diag, log) {
   let extrasResolved = false
   let lastExtrasAttempt = 0
 
+  /** 累加某把 key 在某个模型上的计数。
+   *  用量必须按模型分开记：冷却本来就是「key + 模型」维度，把两个模型的数字混在
+   *  一行里会让人误判（例如 deepseek 上被限、glm 上其实还在正常跑）。
+   *  byModel 用 null 原型，避免模型名撞上 __proto__ 之类的键。 */
+  const bumpModelStat = (entry, model, field) => {
+    if (!model) return
+    let row = entry.stats.byModel[model]
+    if (!row) {
+      row = { sent: 0, ok: 0, limited: 0, lastUsedAt: 0 }
+      entry.stats.byModel[model] = row
+    }
+    row[field] += 1
+    row.lastUsedAt = Date.now()
+  }
+
   /** 来源标签只在首次登记时确定，之后的重复登记不覆盖（保证「它是从哪来的」稳定）。 */
   const register = (key, source) => {
     const value = typeof key === 'string' ? key.trim() : ''
@@ -372,7 +387,7 @@ function createKeyPool(quotaStore, diag, log) {
         cooling: new Map(),
         lastBody: new Map(),
         lastUsedAt: 0,
-        stats: { sent: 0, ok: 0, limited: 0, lastModel: '' },
+        stats: { sent: 0, ok: 0, limited: 0, lastModel: '', byModel: Object.create(null) },
       }
       entries.set(label, entry)
       // 恢复该 key 上次进程留下的额度状态（按 label 匹配，磁盘上没有 key 原文）
@@ -486,6 +501,7 @@ function createKeyPool(quotaStore, diag, log) {
       entry.stats.sent += 1
       entry.stats.lastModel = model
       entry.lastUsedAt = Date.now()
+      bumpModelStat(entry, model, 'sent')
     },
     markCooling(key, model, ms, body) {
       const entry = entries.get(keyLabel(key))
@@ -496,6 +512,7 @@ function createKeyPool(quotaStore, diag, log) {
       entry.lastUsedAt = Date.now()
       entry.stats.limited += 1
       entry.stats.lastModel = model
+      bumpModelStat(entry, model, 'limited')
       quotaStore?.set?.(entry.label, model, readyAt, body)
     },
     markHealthy(key, model) {
@@ -506,6 +523,7 @@ function createKeyPool(quotaStore, diag, log) {
       entry.lastUsedAt = Date.now()
       entry.stats.ok += 1
       entry.stats.lastModel = model
+      bumpModelStat(entry, model, 'ok')
       quotaStore?.clear?.(entry.label, model)
     },
     /** 供自检工具观察状态，不暴露 key 原文。 */
@@ -547,6 +565,13 @@ function createKeyPool(quotaStore, diag, log) {
             lastModel: entry.stats.lastModel,
             lastUsedAt: entry.lastUsedAt,
           },
+          // 按模型的用量明细（面板切到某个模型时看的就是这份）
+          models: Object.fromEntries(
+            Object.entries(entry.stats.byModel).map(([model, row]) => [
+              model,
+              { sent: row.sent, ok: row.ok, limited: row.limited, lastUsedAt: row.lastUsedAt },
+            ]),
+          ),
         }))
     },
   }
@@ -582,12 +607,50 @@ function buildStatus(deps, options) {
   const revealPreview = options?.revealPreview ?? config?.maskKeyPreview !== false
   const keys = pool.describe({ revealPreview })
   const coolingKeys = keys.filter((key) => key.cooling.length > 0).length
+  const recent = (diag.lastRequests ?? []).map((row) => ({
+    at: row.at,
+    model: row.model,
+    decision: row.decision,
+    bodyLen: row.bodyLen,
+    poolSize: row.poolSize,
+  }))
+
+  // 面板顶部那排「按模型查看」的筛选项：把所有出现过的模型按最近活跃排序。
+  // 三个来源都要看——冷却记录（被限过的）、按模型用量（跑过的）、最近请求轨迹（包括 '*'）。
+  const modelSeen = new Map() // model → lastUsedAt
+  const touchModel = (model, at) => {
+    if (!model || model === '*') return
+    modelSeen.set(model, Math.max(modelSeen.get(model) ?? 0, Number(at) || 0))
+  }
+  for (const key of keys) {
+    for (const row of key.cooling) touchModel(row.model, key.stats.lastUsedAt)
+    for (const [model, row] of Object.entries(key.models ?? {})) touchModel(model, row.lastUsedAt)
+    touchModel(key.stats.lastModel, key.stats.lastUsedAt)
+  }
+  for (const row of recent) touchModel(row.model, Date.parse(row.at) || 0)
+
+  // 「当前正在用哪个模型」：最近一条带模型的请求轨迹就是答案（面板默认按它筛选）
+  const latest = [...recent].reverse().find((row) => row.model && row.model !== '*')
+  const currentModel = latest?.model ?? ''
+
+  // 排序：当前模型固定排第一（本地请求常常落在同一毫秒里，只按时间排会退化成字母序，
+  // 于是「当前模型」可能不在第一个，chips 的顺序就变得随机难看）。
+  const models = [...modelSeen.entries()]
+    .sort((a, b) => {
+      if (a[0] === currentModel) return -1
+      if (b[0] === currentModel) return 1
+      return b[1] - a[1] || a[0].localeCompare(b[0])
+    })
+    .map(([id, lastUsedAt]) => ({ id, lastUsedAt }))
+
   return {
     plugin: 'opencode-free-bridge',
     version: PLUGIN_VERSION,
     updatedAt: Date.now(),
     settings: safeConfigSummary(config, deps),
     quotaStatePath: quotaStore.path,
+    models,
+    currentModel: currentModel || models[0]?.id || '',
     totals: {
       poolSize: keys.length,
       readyKeys: keys.length - coolingKeys,
@@ -604,13 +667,7 @@ function buildStatus(deps, options) {
     lastDecision: diag.lastDecision ?? '',
     keys,
     // 最近几次请求的决策轨迹（只有模型名与决策文本，无 key 材料）
-    recent: (diag.lastRequests ?? []).map((row) => ({
-      at: row.at,
-      model: row.model,
-      decision: row.decision,
-      bodyLen: row.bodyLen,
-      poolSize: row.poolSize,
-    })),
+    recent,
   }
 }
 

@@ -36,6 +36,9 @@ const SECRET_B = 'sk-test-EEEE5555FFFF6666GGGG7777HHHH8888'
 const MASK_A = `${SECRET_A.slice(0, 4)}…${SECRET_A.slice(-4)}`
 const MASK_B = `${SECRET_B.slice(0, 4)}…${SECRET_B.slice(-4)}`
 
+/** SECRET_A 只在这个模型上撞每日上限；换到别的模型它仍然可用。 */
+const CAP_ONLY_MODEL = 'cline-free/deepseek-v4.1-flash'
+
 // ───────────────────────── mock Cline 上游 ─────────────────────────
 const seen = []
 const server = createServer((req, res) => {
@@ -47,6 +50,13 @@ const server = createServer((req, res) => {
     try { model = JSON.parse(body).model ?? '?' } catch {}
     seen.push({ key, model })
     if (key === SECRET_B) {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true }))
+      return
+    }
+    // SECRET_A 只在 deepseek 上撞每日上限，在别的模型上照常成功——这正是真实场景
+    // （每日额度是「key + 模型」维度），也是「按模型分别查看」要防住的那种误判。
+    if (key === SECRET_A && model !== CAP_ONLY_MODEL) {
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ ok: true }))
       return
@@ -208,6 +218,58 @@ const callRoute = async (options) => {
   check('H25 磁盘状态文件不含 key 原文', !disk.includes(SECRET_A) && !disk.includes(SECRET_B))
   check('H26 磁盘状态文件连掩码片段也不含', !disk.includes(SECRET_A.slice(0, 4) + '…') && !disk.includes(MASK_A), disk.slice(0, 60))
   check('H27 磁盘状态文件里只有哈希标签', /"entries":\{"[0-9a-f]{8}"/.test(disk))
+}
+
+// ───────────────────────── 4b. 主机端的按模型维度 ─────────────────────────
+// 冷却本来就是「key + 模型」维度，用量也必须分开记：否则面板切到 glm 时会拿
+// deepseek 的数字充数，正是用户报的那个误导。
+{
+  const modelA = CAP_ONLY_MODEL
+  const modelB = 'z-ai/glm-5.3-flash'
+  const post = async (key, model) =>
+    (await globalThis.fetch(ENDPOINT, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
+      body: JSON.stringify({ model, messages: [] }),
+    })).text()
+
+  mount({ clineKeys: [SECRET_A, SECRET_B], skipCoolingRequestKey: true })
+  // modelA：SECRET_A 撞上限 → 换 SECRET_B 成功
+  // modelB：SECRET_A 并未在 modelB 上冷却，所以照旧先用它，而且它能成功
+  await post(SECRET_A, modelA)
+  await post(SECRET_A, modelB)
+  await post(SECRET_A, modelB)
+
+  const r = await callRoute()
+  const keys = r.json.keys ?? []
+  const byLabel = (label) => keys.find((k) => k.label === label)
+  const labelOf = (key) => {
+    let h = 0x811c9dc5
+    for (let i = 0; i < key.length; i++) {
+      h ^= key.charCodeAt(i)
+      h = Math.imul(h, 0x01000193) >>> 0
+    }
+    return h.toString(16).padStart(8, '0')
+  }
+  const a = byLabel(labelOf(SECRET_A))
+  const b = byLabel(labelOf(SECRET_B))
+
+  check('H28 载荷带按模型用量明细', Boolean(a?.models) && Object.keys(a.models).length === 2, JSON.stringify(Object.keys(a?.models ?? {})))
+  check('H29 撞限流那把在 modelA 上是 1 次发送 1 次限流 0 次成功',
+    a?.models?.[modelA]?.sent === 1 && a?.models?.[modelA]?.limited === 1 && a?.models?.[modelA]?.ok === 0,
+    JSON.stringify(a?.models?.[modelA]))
+  check('H30 同一把 key 在 modelB 上照常成功（额度是 key+模型 维度）',
+    a?.models?.[modelB]?.sent === 2 && a?.models?.[modelB]?.ok === 2 && a?.models?.[modelB]?.limited === 0,
+    JSON.stringify(a?.models?.[modelB]))
+  check('H31 modelA 上承压的那把只在 modelA 有记录',
+    b?.models?.[modelA]?.sent === 1 && b?.models?.[modelA]?.ok === 1 && !b?.models?.[modelB],
+    JSON.stringify(b?.models))
+  check('H32 全局总计等于各模型之和',
+    a?.stats?.sent === 3 && a?.stats?.ok === 2 && a?.stats?.limited === 1 && b?.stats?.sent === 1,
+    `${JSON.stringify(a?.stats)} / ${JSON.stringify(b?.stats)}`)
+  check('H33 载荷带模型清单与「当前模型」', Array.isArray(r.json.models) && r.json.models.some((m) => m.id === modelB) && r.json.models.some((m) => m.id === modelA) && r.json.currentModel === modelB,
+    `${JSON.stringify(r.json.models)} current=${r.json.currentModel}`)
+  check('H34 模型清单按最近活跃排序（当前模型在最前）', r.json.models[0]?.id === modelB, r.json.models.map((m) => m.id).join(' > '))
 }
 
 dispose()
@@ -457,7 +519,7 @@ async function renderPanel(payload, { fetchError = null } = {}) {
   check('C12 渲染出冷却模型与恢复倒计时', text.includes('cline-free/deepseek-v4.1-flash') && /2[01]h\d\dm/.test(text), (/[0-9]+h[0-9]{2}m/.exec(text) ?? ['none'])[0])
   check('C13 渲染出状态药丸（可用/冷却中）', text.includes('冷却中') && text.includes('可用'))
   check('C14 表格里没有「来源」这一列', !table_headers(tree).some((h) => /来源|source/i.test(h)) && !text.includes('.credentials.yaml: CLINE_API_KEY_2') && !text.includes('DSH 请求头'), table_headers(tree).join(' | '))
-  check('C15 渲染出用量计数 发送/成功/限流', text.includes('12 / 11 / 1') && text.includes('4 / 4 / 0'))
+  check('C15 渲染出用量计数 发送/成功/限流', text.includes('12/11/1') && text.includes('4/4/0'))
   check('C16 渲染出统计卡数值', text.includes('61') && text.includes(PLUGIN_VERSION), PLUGIN_VERSION)
   check('C17 渲染出最近决策', text.includes('最近决策') && text.includes('rotated a→b'))
   check('C18 面板里没有「运行参数」卡片', !text.includes('运行参数') && !text.includes('凭据文件') && !text.includes('15分钟') && !text.includes('Runtime parameters'))
@@ -468,6 +530,138 @@ async function renderPanel(payload, { fetchError = null } = {}) {
   const table = findNode(tree, (n) => n.type === 'table')
   const bodyRows = table ? findNode(table, (n) => n.type === 'tbody')?.children?.length : 0
   check('C21 表格渲染出 2 行 key', bodyRows === 2, `rows=${bodyRows}`)
+
+  // ── 布局断言：这几条钉的是用户实际看到的问题（长内容把行撑高、表格横向溢出）──
+  const colgroup = findNode(table, (n) => n.type === 'colgroup')
+  const cols = colgroup?.children ?? []
+  check('C26 表格用 colgroup 固定列宽（列宽不再由内容撑开）', cols.length === 6 && cols.every((c) => c.props?.style?.width), cols.map((c) => c.props?.style?.width).join(' | '))
+  check('C27 冷却列吃掉剩余宽度（其余列定宽）', cols[3]?.props?.style?.width === 'auto' && cols.filter((c) => c.props?.style?.width === 'auto').length === 1)
+
+  const firstRow = findNode(table, (n) => n.type === 'tbody')?.children?.[0]
+  const rowCells = firstRow?.children ?? []
+  const lastUsedCell = rowCells[5]
+  const lastUsedSpans = lastUsedCell?.children ?? []
+  const shortModelSpan = lastUsedSpans.find((s) => s.props?.title)
+  check('C28 「最近使用」只显示模型短名，完整名放 title（不再换行撑高行）',
+    Boolean(shortModelSpan) && shortModelSpan.children[0] === 'deepseek-v4.1-flash' && shortModelSpan.props.title === 'cline-free/deepseek-v4.1-flash',
+    `${shortModelSpan?.children?.[0]} / title=${shortModelSpan?.props?.title}`)
+
+  // 冷却单元格：模型与「倒计时 + 绝对时刻」分成两行，不再挤在一行互相顶
+  const coolingCell = rowCells[3]
+  const coolingItems = findNode(coolingCell, (n) => n.type === 'div' && String(n.props?.className ?? '').includes('_dsh_ofb_cooling_item'))
+  check('C29 冷却单元格是「模型一行 + 倒计时一行」的两段结构', Boolean(coolingItems) && (coolingItems.children?.length ?? 0) === 2,
+    JSON.stringify((coolingItems?.children ?? []).map((c) => c.props?.className)))
+
+  // Key 单元格：预览与「标签 + 主 Key 标记」各占一行，且都带裁剪类（不换行）
+  const keyCellItems = rowCells[1]?.children?.[0]?.children ?? []
+  const clipped = (node) => String(node?.props?.className ?? '').includes('_dsh_ofb_clip')
+  check('C30 Key 单元格两行都带裁剪类（预览/标签都不会换行）', clipped(keyCellItems[0]) && String(keyCellItems[1]?.props?.className ?? '').includes('_dsh_ofb_key_meta'),
+    keyCellItems.map((c) => c.props?.className).join(' | '))
+  check('C31 表内所有可能变长的文本节点都带裁剪类', (() => {
+    const offenders = []
+    const walk = (node) => {
+      if (!node || typeof node !== 'object') return
+      if (Array.isArray(node)) return node.forEach(walk)
+      const cls = String(node.props?.className ?? '')
+      if (node.type === 'td' && node.children.some((c) => typeof c === 'string' && c.length > 12)) offenders.push(String(node.children[0]).slice(0, 20))
+      if (cls.includes('_dsh_ofb_mono') && !cls.includes('_dsh_ofb_clip') && !cls.includes('_dsh_ofb_badge')) offenders.push(cls)
+      ;(node.children ?? []).forEach(walk)
+    }
+    walk(table)
+    return offenders.length === 0
+  })(), 'mono 文本必须带 _dsh_ofb_clip 才会省略号收口')
+
+  bundle.mini.dispose()
+}
+
+// ───────────────────────── 5b. 按模型分别查看（用户报告的问题）─────────────────────────
+// 场景：deepseek 撞了每日上限、已切到 glm 继续用。此时面板若仍把 deepseek 的冷却
+// 算作「这把 key 冷却中」，看起来就像没有可用 key——必须在默认筛选（当前模型）下
+// 显示为「可用」，并能切到「全部模型」或具体模型分别查看。
+{
+  const DEEPSEEK = 'cline-free/deepseek-v4.1-flash'
+  const GLM = 'z-ai/glm-5.3-flash'
+  const payload = {
+    plugin: MODULE_ID,
+    version: PLUGIN_VERSION,
+    updatedAt: Date.now(),
+    settings: { maskKeyPreview: true },
+    quotaStatePath: 'C:/Users/x/.dsh/quota.json',
+    models: [{ id: GLM, lastUsedAt: Date.now() }, { id: DEEPSEEK, lastUsedAt: Date.now() - 3600_000 }],
+    currentModel: GLM,
+    totals: { poolSize: 2, readyKeys: 1, coolingKeys: 1, clineRequests: 40, rotations: 2, failFasts: 0 },
+    extras: {},
+    keys: [
+      {
+        index: 1, label: 'db694bbf', preview: MASK_A, source: 'request', isRequestKey: true,
+        cooling: [{ model: DEEPSEEK, readyAt: Date.now() + 21 * 3600 * 1000, readyInMin: 1260 }],
+        stats: { sent: 19, ok: 18, limited: 1, lastModel: GLM, lastUsedAt: Date.now() - 4000 },
+        models: {
+          [DEEPSEEK]: { sent: 16, ok: 15, limited: 1, lastUsedAt: Date.now() - 3600_000 },
+          [GLM]: { sent: 3, ok: 3, limited: 0, lastUsedAt: Date.now() - 4000 },
+        },
+      },
+      {
+        index: 2, label: '761f9875', preview: MASK_B, source: '.credentials.yaml: CLINE_API_KEY_2', isRequestKey: false,
+        cooling: [],
+        stats: { sent: 21, ok: 21, limited: 0, lastModel: GLM, lastUsedAt: Date.now() - 9000 },
+        models: { [GLM]: { sent: 21, ok: 21, limited: 0, lastUsedAt: Date.now() - 9000 } },
+      },
+    ],
+    recent: [{ at: new Date().toISOString(), model: GLM, decision: 'pass-through status=200', bodyLen: 1000, poolSize: 2 }],
+  }
+
+  const { registered, tree, bundle } = await renderPanel(payload)
+  const renderedText = () => textOf(tree).join('\n')
+  const chipsOf = (node) => {
+    const found = []
+    const walk = (current) => {
+      if (!current || typeof current !== 'object') return
+      if (Array.isArray(current)) return current.forEach(walk)
+      if (String(current.props?.className ?? '').includes('_dsh_ofb_chip')) found.push(current)
+      ;(current.children ?? []).forEach(walk)
+    }
+    walk(node)
+    return found
+  }
+  const clickChip = async (label) => {
+    const chip = chipsOf(tree).find((c) => textOf(c).join('') === label)
+    if (!chip) throw new Error(`chip not found: ${label}（现有：${chipsOf(tree).map((c) => textOf(c).join('')).join(',')}）`)
+    chip.props.onClick()
+    // 迷你 React 的 hook 槽按树中路径保存，所以直接再渲染一次就能看到新状态
+    return bundle.mini.render(registered[0].Component, {})
+  }
+  const tableText = (node) => textOf(findNode(node, (n) => n.type === 'table')).join('\n')
+  const rowText = (node, label) => {
+    const body = findNode(node, (n) => n.type === 'tbody')
+    const row = (body?.children ?? []).find((tr) => JSON.stringify(tr).includes(label))
+    return textOf(row).join('\n')
+  }
+
+  const rowA = rowText(tree, 'db694bbf')
+  check('F1 deepseek 上被限的 key 在 glm 视图下显示「可用」', rowA.includes('可用') && !rowA.includes('冷却中'), rowA.replace(/\n/g, ' | '))
+  check('F2 glm 视图下不出现 deepseek 的冷却记录', !tableText(tree).includes('deepseek'), tableText(tree).replace(/\n/g, ' | ').slice(0, 120))
+  check('F3 用量按模型分开：glm 视图显示 glm 的计数', rowA.includes('3/3/0'), rowA.replace(/\n/g, ' | '))
+  check('F4 另一把 key 显示自己的 glm 计数', rowText(tree, '761f9875').includes('21/21/0'), rowText(tree, '761f9875').replace(/\n/g, ' | '))
+  check('F5 概览卡随筛选变化（该模型可用 / 该模型冷却）', renderedText().includes('该模型可用') && renderedText().includes('该模型冷却'), textOf(tree).filter((s) => s.includes('该模型')).join(' | '))
+
+  const chips = chipsOf(tree).map((c) => textOf(c).join(''))
+  check('F6 提供「全部模型」与每个模型各一个筛选按钮', chips.length === 3 && chips.includes('全部模型') && chips.includes('deepseek-v4.1-flash') && chips.includes('glm-5.3-flash'), chips.join(' / '))
+  const activeChip = chipsOf(tree).find((c) => String(c.props.className).includes('_dsh_ofb_chip_on'))
+  check('F7 默认选中项是当前模型（glm）', textOf(activeChip ?? {}).join('') === 'glm-5.3-flash', textOf(activeChip ?? {}).join(''))
+
+  // 切到「全部模型」：两个模型的数据同时出现
+  const allView = await clickChip('全部模型')
+  const allText = tableText(allView)
+  check('F8 切到「全部模型」后 deepseek 的冷却重新出现', allText.includes('deepseek-v4.1-flash') && allText.includes('冷却中'), allText.replace(/\n/g, ' | ').slice(0, 140))
+  check('F9 「全部模型」下用量回到总计', rowText(allView, 'db694bbf').includes('19/18/1'), rowText(allView, 'db694bbf').replace(/\n/g, ' | '))
+
+  // 再切到 deepseek：只看 deepseek 的数据
+  const dsView = await clickChip('deepseek-v4.1-flash')
+  const dsRow = rowText(dsView, 'db694bbf')
+  check('F10 切到 deepseek 后该 key 显示冷却中，用量是 deepseek 的计数', dsRow.includes('冷却中') && dsRow.includes('16/15/1'), dsRow.replace(/\n/g, ' | '))
+  const dsOther = rowText(dsView, '761f9875')
+  check('F11 另一把在 deepseek 上没跑过：0/0/0 且无冷却，最近使用显示「从未」', dsOther.includes('0/0/0') && dsOther.includes('可用') && dsOther.includes('从未'), dsOther.replace(/\n/g, ' | '))
 
   bundle.mini.dispose()
 }
