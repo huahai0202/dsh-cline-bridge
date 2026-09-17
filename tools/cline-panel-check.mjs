@@ -729,6 +729,34 @@ const ctxStatusOf = (options) => lastCtx?.__opencodeFreeBridge?.status?.(options
   check('P20 重置后统计起点也写进了磁盘', Number(afterResetDisk.totals?.since) === afterReset.json.totals.since, String(afterResetDisk.totals?.since))
 }
 
+// ───────────────── 4i. 主 Key 挂载即入池（不必等第一条请求） ─────────────────
+// 以前主 Key 只在随请求头出现时才登记，于是 DSH 重启后面板只有备用 key，
+// 得先发一条请求才变全——这一组钉住「挂载即补齐」。
+{
+  const credsFile = join(TEST_STATE_DIR, `main-key-${++stateSeq}.yaml`)
+  writeFileSync(credsFile, 'version: 1\nrefs:\n  CLINE_API_KEY: "' + SECRET_A + '"\n  CLINE_API_KEY_2: "' + SECRET_B + '"\n', 'utf8')
+  // 设置表里的 Cline baseURL 必须命中本用例的 clineMatch（与真实判据同构，见 4c），
+  // 否则插件认不出「哪个提供方是 Cline 通道」，也就找不到主 Key 的 apiKeyEnv。
+  const table = {
+    providers: {
+      cline: { displayName: 'Cline', apiKeyEnv: 'CLINE_API_KEY', baseURL: `http://${match}/api/v1`, models: [{ id: 'cline-free/deepseek-v4.1-flash' }] },
+    },
+  }
+  mount({ clineKeys: [], credentialsFile: credsFile, __settingsValues: { 'llm-pi-ai': table } })
+  await new Promise((r) => setTimeout(r, 30)) // 主 Key 的解析挂在微任务上，等它落地
+  const r = await callRoute()
+  const keys = r.json.keys ?? []
+  check('W1 重启后主 Key 直接在池子里（不必先发一条请求）', keys.length === 2, `keys=${keys.length}`)
+  check('W2 主 Key 来源标成 DSH 请求（与请求头同义）',
+    keys.find((k) => k.label === label8(SECRET_A))?.source === 'request',
+    String(keys.find((k) => k.label === label8(SECRET_A))?.source))
+  check('W3 备用 key 的来源不受影响',
+    keys.find((k) => k.label === label8(SECRET_B))?.source === '.credentials.yaml: CLINE_API_KEY_2',
+    String(keys.find((k) => k.label === label8(SECRET_B))?.source))
+  check('W4 载荷里依然没有 key 原文', !r.body.includes(SECRET_A) && !r.body.includes(SECRET_B))
+  check('W5 settings 缺席时也不报错（静默跳过）', r.status === 200, `status=${r.status}`)
+}
+
 // 主机半边测完再关 mock 服务器（G 组还要发请求，不能提前关）
 dispose()
 server.closeAllConnections?.()

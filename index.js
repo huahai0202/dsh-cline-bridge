@@ -23,7 +23,7 @@ import { createQuotaStore, parseRetryWindowMs } from './lib/host/quota-state.js'
 import { readAuthTarget, readKeyOf, readModelOf, replayableBody, writeKeyTo } from './lib/host/request-shape.js'
 import { normalizeUsage, tapUsage } from './lib/host/usage.js'
 import { createKeyPool } from './lib/host/key-pool.js'
-import { buildStatus } from './lib/host/status.js'
+import { buildStatus, clineApiKeyEnvOf } from './lib/host/status.js'
 import { isTrustedRequest, readJsonBody, sendJson } from './lib/host/http.js'
 import { readCredentialRefsFromFile, writeCredentialRefToFile } from './lib/host/credentials.js'
 import { importClineKeys, MAX_IMPORT_KEYS } from './lib/host/key-import.js'
@@ -91,6 +91,7 @@ export function apply(ctx, config) {
   if (typeof ctx.inject === 'function') {
     ctx.inject(['settings'], (settingsCtx) => {
       settingsService = settingsCtx.get('settings') ?? settingsCtx.settings
+      scheduleMainKeyRegistration()
     })
   }
 
@@ -113,8 +114,53 @@ export function apply(ctx, config) {
       // 不必等 EXTRAS_TTL_MS 那 5 分钟节流——「刚加进去的 key 为什么不在池子里」就是这么来的。
       credentialsCtx.on?.('credentials/reference-updated', () => {
         void pool.ensureExtras(ctx, config, { force: true }).catch(() => {})
+        scheduleMainKeyRegistration()
       })
+      scheduleMainKeyRegistration()
     })
+  }
+
+  // 主 Key（提供方 apiKeyEnv 指向的那把）挂载即入池：不然 DSH 重启后面板只有备用 key，
+  // 要等第一条请求把它带上来才补齐，看着像少了一把。它本来就是 DSH 会随请求头携带的
+  // 那把，所以来源仍标 request（面板不显示来源，载荷里与「请求头带来」同义）。
+  // settings 与凭据服务谁后到都行：两边就绪时才解析；解析不到（比如确实没配）就静默跳过。
+  async function registerMainKey() {
+    const ref = clineApiKeyEnvOf(safeSettingsTable(), clineMatch)
+    if (!ref) return
+    let value
+    const service = credentialsService
+    if (service && typeof service.resolve === 'function') {
+      try {
+        value = (await service.resolve(ref))?.value
+      } catch {
+        value = undefined // 解析失败当作没有，凭据变更事件会再触发一次
+      }
+    }
+    if (!value && config?.readCredentialsFile !== false) {
+      try {
+        value = readCredentialRefsFromFile(resolveCredentialsFilePath(config), [ref]).get(ref)
+      } catch {
+        value = undefined
+      }
+    }
+    if (!value) return
+    pool.register(value, 'request')
+  }
+
+  /** 挂到微任务上执行：inject 回调可能在 apply() 半路同步触发，那时下面的 let 还没初始化。 */
+  function scheduleMainKeyRegistration() {
+    queueMicrotask(() => {
+      registerMainKey().catch(() => {})
+    })
+  }
+
+  /** settings 快照只读一次（与面板同款的防抛错包装）。 */
+  function safeSettingsTable() {
+    try {
+      return settingsService?.get?.('llm-pi-ai')
+    } catch {
+      return undefined
+    }
   }
 
   globalThis.fetch = async function (input, init) {
