@@ -676,14 +676,19 @@ async function renderPanel(payload, { fetchError = null } = {}) {
     plugin: MODULE_ID,
     version: PLUGIN_VERSION,
     updatedAt: Date.now(),
-    totals: { poolSize: 2, readyKeys: 1, coolingKeys: 1, clineRequests: 61, rotations: 3, failFasts: 1 },
+    // 主机端总会带上模型清单与「当前模型」——面板恒定按某个模型看，靠它们出筛选条
+    models: [{ id: 'cline-free/deepseek-v4.1-flash', lastUsedAt: Date.now() }],
+    currentModel: 'cline-free/deepseek-v4.1-flash',
+    totals: { poolSize: 2, clineRequests: 61, rotations: 3, failFasts: 1 },
     extras: { credentialsFileRead: true, extrasResolved: true, lastExtrasAt: '2026-09-17T07:45:16.602Z' },
     keys: [
       { index: 1, label: 'db694bbf', preview: MASK_A, source: 'request',
         cooling: [{ model: 'cline-free/deepseek-v4.1-flash', readyAt: Date.now() + 21 * 3600 * 1000, readyInMin: 1300 }],
-        stats: { sent: 12, ok: 11, limited: 1, lastModel: 'cline-free/deepseek-v4.1-flash', lastUsedAt: Date.now() - 5000 } },
+        stats: { sent: 12, ok: 11, limited: 1, lastModel: 'cline-free/deepseek-v4.1-flash', lastUsedAt: Date.now() - 5000, tokens: { input: 16800, output: 1500, total: 18300, cached: 900 } },
+        models: { 'cline-free/deepseek-v4.1-flash': { sent: 12, ok: 11, limited: 1, lastUsedAt: Date.now() - 5000, tokens: { input: 16800, output: 1500, total: 18300, cached: 900 } } } },
       { index: 2, label: '761f9875', preview: MASK_B, source: '.credentials.yaml: CLINE_API_KEY_2',
-        cooling: [], stats: { sent: 4, ok: 4, limited: 0, lastModel: 'cline-free/deepseek-v4.1-flash', lastUsedAt: Date.now() - 61000 } },
+        cooling: [], stats: { sent: 4, ok: 4, limited: 0, lastModel: 'cline-free/deepseek-v4.1-flash', lastUsedAt: Date.now() - 61000 },
+        models: { 'cline-free/deepseek-v4.1-flash': { sent: 4, ok: 4, limited: 0, lastUsedAt: Date.now() - 61000, tokens: { input: 0, output: 0, total: 0, cached: 0 } } } },
     ],
     recent: [{ at: new Date().toISOString(), model: 'cline-free/deepseek-v4.1-flash', decision: 'rotated a→b', bodyLen: 413503, poolSize: 2 }],
   }
@@ -717,7 +722,7 @@ async function renderPanel(payload, { fetchError = null } = {}) {
   check('C9 渲染出两把 key 的掩码预览', text.includes(MASK_A) && text.includes(MASK_B))
   check('C10 渲染树里不含任何 key 原文', !serialized.includes(SECRET_A) && !serialized.includes(SECRET_B))
   check('C11 渲染出哈希标签', text.includes('db694bbf') && text.includes('761f9875'))
-  check('C12 渲染出冷却模型与恢复倒计时', text.includes('cline-free/deepseek-v4.1-flash') && /2[01]h\d\dm/.test(text), (/[0-9]+h[0-9]{2}m/.exec(text) ?? ['none'])[0])
+  check('C12 渲染出模型筛选条、恢复倒计时与该模型的用量明细', /2[01]h\d\dm/.test(text) && text.includes('deepseek-v4.1-flash') && text.includes('16.8k'), (/[0-9]+h[0-9]{2}m/.exec(text) ?? ['none'])[0])
   check('C13 渲染出状态药丸（可用/冷却中）', text.includes('冷却中') && text.includes('可用'))
   check('C14 表格里没有「来源」这一列', !table_headers(tree).some((h) => /来源|source/i.test(h)) && !text.includes('.credentials.yaml: CLINE_API_KEY_2') && !text.includes('DSH 请求头'), table_headers(tree).join(' | '))
   check('C15 渲染出用量计数 发送/成功/限流', text.includes('12/11/1') && text.includes('4/4/0'))
@@ -758,11 +763,11 @@ async function renderPanel(payload, { fetchError = null } = {}) {
     lastUsedText === '5 秒前' && lastUsedCell?.children?.[0]?.props?.title === 'cline-free/deepseek-v4.1-flash',
     `${lastUsedText} / title=${lastUsedCell?.children?.[0]?.props?.title}`)
 
-  // 冷却单元格：模型与「倒计时 + 绝对时刻」分成两行，不再挤在一行互相顶
+  // 冷却单元格：按模型视图下一把 key 最多一条记录，所以只显示「倒计时 + 恢复时刻」
   const coolingCell = rowCells[3]
-  const coolingItems = findNode(coolingCell, (n) => n.type === 'div' && String(n.props?.className ?? '').includes('_dsh_ofb_cooling_item'))
-  check('C29 冷却单元格是「模型一行 + 倒计时一行」的两段结构', Boolean(coolingItems) && (coolingItems.children?.length ?? 0) === 2,
-    JSON.stringify((coolingItems?.children ?? []).map((c) => c.props?.className)))
+  check('C29 冷却单元格只显示倒计时与恢复时刻（模型由筛选条决定）',
+    textOf(coolingCell).join(' ').includes('h') && findNode(coolingCell, (n) => String(n.props?.className ?? '') === '_dsh_ofb_cooling_line') !== undefined,
+    textOf(coolingCell).join(' | '))
 
   // Key 单元格：预览与哈希标签各占一行，且都带裁剪类（不换行）
   const keyCellItems = rowCells[1]?.children?.[0]?.children ?? []
@@ -860,20 +865,18 @@ async function renderPanel(payload, { fetchError = null } = {}) {
   check('F5 概览卡随筛选变化（该模型可用 / 该模型冷却）', renderedText().includes('该模型可用') && renderedText().includes('该模型冷却'), textOf(tree).filter((s) => s.includes('该模型')).join(' | '))
 
   const chips = chipsOf(tree).map((c) => textOf(c).join(''))
-  check('F6 提供「全部模型」与每个模型各一个筛选按钮', chips.length === 3 && chips.includes('全部模型') && chips.includes('deepseek-v4.1-flash') && chips.includes('glm-5.3-flash'), chips.join(' / '))
+  check('F6 筛选条只列模型本身（没有「全部模型」选项）',
+    chips.length === 2 && chips.includes('deepseek-v4.1-flash') && chips.includes('glm-5.3-flash') && !chips.some((c) => c.includes('全部')),
+    chips.join(' / '))
   const activeChip = chipsOf(tree).find((c) => String(c.props.className).includes('_dsh_ofb_chip_on'))
   check('F7 默认选中项是当前模型（glm）', textOf(activeChip ?? {}).join('') === 'glm-5.3-flash', textOf(activeChip ?? {}).join(''))
 
-  // 切到「全部模型」：两个模型的数据同时出现
-  const allView = await clickChip('全部模型')
-  const allText = tableText(allView)
-  check('F8 切到「全部模型」后 deepseek 的冷却重新出现', allText.includes('deepseek-v4.1-flash') && allText.includes('冷却中'), allText.replace(/\n/g, ' | ').slice(0, 140))
-  check('F9 「全部模型」下用量回到总计', rowText(allView, 'db694bbf').includes('19/18/1'), rowText(allView, 'db694bbf').replace(/\n/g, ' | '))
-
-  // 再切到 deepseek：只看 deepseek 的数据
+  // 切到 deepseek：只剩 deepseek 的数据（面板没有「跨模型汇总」这种视图）
   const dsView = await clickChip('deepseek-v4.1-flash')
   const dsRow = rowText(dsView, 'db694bbf')
-  check('F10 切到 deepseek 后该 key 显示冷却中，用量是 deepseek 的计数', dsRow.includes('冷却中') && dsRow.includes('16/15/1'), dsRow.replace(/\n/g, ' | '))
+  check('F8 切到 deepseek 后该 key 显示冷却中并给出恢复倒计时', dsRow.includes('冷却中') && /2[01]h\d\dm/.test(dsRow), dsRow.replace(/\n/g, ' | '))
+  check('F9 切到 deepseek 后用量是 deepseek 的计数', dsRow.includes('16/15/1'), dsRow.replace(/\n/g, ' | '))
+  check('F10 切回 glm 后该 key 恢复「可用」', rowText(tree, 'db694bbf').includes('可用'), rowText(tree, 'db694bbf').replace(/\n/g, ' | '))
   const dsOther = rowText(dsView, '761f9875')
   check('F11 另一把在 deepseek 上没跑过：0/0/0 且无冷却，最近使用显示「从未」', dsOther.includes('0/0/0') && dsOther.includes('可用') && dsOther.includes('从未'), dsOther.replace(/\n/g, ' | '))
 
@@ -894,14 +897,14 @@ async function renderPanel(payload, { fetchError = null } = {}) {
     return out.join(' | ')
   }
 
-  const usageAll = usageOf(allView, 'db694bbf')
+  const usageDsRow = usageOf(dsView, 'db694bbf')
   // 每个数值各占一列（发送|成功|限流、输入|输出），所以 textOf 用空格连接
-  check('I1 「全部模型」下每把 key 逐行列出各模型用量',
-    usageAll.includes('cline-free/deepseek-v4.1-flash 16 15 1 12.3k 1.2k') && usageAll.includes('z-ai/glm-5.3-flash 3 3 0 4.5k 300'),
-    usageAll)
-  check('I2 明细里两把 key 都有自己的行', usageOf(allView, '761f9875').includes('z-ai/glm-5.3-flash 21 21 0 21k 2.1k'), usageOf(allView, '761f9875'))
+  check('I1 明细卡按当前模型逐行列出用量（deepseek 视图）',
+    usageDsRow.includes('cline-free/deepseek-v4.1-flash 16 15 1 12.3k 1.2k'), usageDsRow)
+  check('I2 另一把 key 在 glm 视图下有自己的一行',
+    usageOf(tree, '761f9875').includes('z-ai/glm-5.3-flash 21 21 0 21k 2.1k'), usageOf(tree, '761f9875'))
   const usageHeadOf = (node) => findNode(usageCardOf(node), (n) => String(n.props?.className ?? '') === '_dsh_ofb_usage_head')
-  const usageHeadSpans = usageHeadOf(allView)?.children ?? []
+  const usageHeadSpans = usageHeadOf(tree)?.children ?? []
   // 表头与数据行同构：每列一个标签，含义直接可见（不靠悬停），且短标签不会折行
   const usageHeadFlat = usageHeadSpans.map((s) => textOf(s).join('')).join('|')
   check('I3 明细卡表头逐列标注（发送/成功/限流、输入/输出），与数据列一一对应',
@@ -911,29 +914,27 @@ async function renderPanel(payload, { fetchError = null } = {}) {
     usageHeadFlat)
 
   const usageGlm = usageOf(tree, 'db694bbf')
-  check('I4 筛到 glm 时明细只剩 glm 那一行', usageGlm.includes('z-ai/glm-5.3-flash 3 3 0') && !usageGlm.includes('deepseek'), usageGlm)
+  check('I4 glm 视图下明细不含 deepseek 的行', usageGlm.includes('z-ai/glm-5.3-flash 3 3 0') && !usageGlm.includes('deepseek'), usageGlm)
 
   // 该模型上没用过的 key 不再各占一块，而是折叠成一行提示（否则半张卡都是「没用过」）
   const cardText = (node) => textOf(usageCardOf(node)).join('\n')
-  check('I5 筛到 deepseek 时未使用的 key 折叠成一行提示',
+  check('I5 该模型上未使用的 key 折叠成一行提示',
     cardText(dsView).includes('其余 1 把在该模型上没用过') && !cardText(dsView).includes('761f9875'),
     cardText(dsView).replace(/\n/g, ' | '))
-  const usageDsMine = usageOf(dsView, 'db694bbf')
-  check('I6 筛到 deepseek 时明细显示 deepseek 的计数', usageDsMine.includes('cline-free/deepseek-v4.1-flash 16 15 1'), usageDsMine)
+  check('I6 切到 glm 时同一把 key 显示 glm 的计数', usageGlm.includes('z-ai/glm-5.3-flash 3 3 0 4.5k 300'), usageGlm)
 
   // ── Token 用量（用户真正要的是这个）──
-  check('I7 明细卡逐行显示每个模型的输入/输出 token',
-    usageAll.includes('12.3k 1.2k') && usageAll.includes('4.5k 300') && usageOf(allView, '761f9875').includes('21k 2.1k'),
-    usageAll)
   const tokenRowOf = (node, label) => {
     const body = findNode(node, (n) => n.type === 'tbody')
     const row = (body?.children ?? []).find((tr) => JSON.stringify(tr).includes(label))
     const cell = (row?.children ?? [])[4]
     return textOf(cell).join(' | ')
   }
-  check('I8 表格用量列第二行显示 token（「全部模型」下是总计）',
-    tokenRowOf(allView, 'db694bbf').includes('16.8k/1.5k'), tokenRowOf(allView, 'db694bbf'))
-  check('I9 表格用量列跟随筛选显示该模型的 token',
+  check('I7 明细卡显示该模型的输入/输出 token',
+    usageDsRow.includes('12.3k 1.2k'), usageDsRow)
+  check('I8 表格用量列第二行是该模型的 token（glm 视图）',
+    tokenRowOf(tree, 'db694bbf').includes('4.5k/300'), tokenRowOf(tree, 'db694bbf'))
+  check('I9 切到 deepseek 后表格 token 跟着换成 deepseek 的',
     tokenRowOf(dsView, 'db694bbf').includes('12.3k/1.2k'), tokenRowOf(dsView, 'db694bbf'))
   check('I10 该模型上没用过的 key：token 显示 0/0，不能退回全局总计',
     tokenRowOf(dsView, '761f9875') === '0/0/0 | 0/0', tokenRowOf(dsView, '761f9875'))
@@ -951,8 +952,9 @@ async function renderPanel(payload, { fetchError = null } = {}) {
     return found
   }
   const fillOf = (bar) => findNode(bar, (n) => String(n.props?.className ?? '') === '_dsh_ofb_bar_fill')
-  const bars = barsOf(allView)
-  check('I11 每行 token 都配一根占比条', bars.length === 3, `bars=${bars.length}`)
+  // glm 视图下有两行有数据：db694bbf(4.5k+300=4800) 与 761f9875(21k+2.1k=23100)
+  const bars = barsOf(tree)
+  check('I11 每行 token 都配一根占比条', bars.length === 2, `bars=${bars.length}`)
   const barWidths = bars.map((bar) => Number.parseFloat(fillOf(bar)?.props?.style?.width ?? '0'))
   check('I12 用量最大的那行占满整条（条长按卡内最大用量归一）',
     Math.max(...barWidths) === 100 && barWidths.filter((w) => w === 100).length === 1, barWidths.map((w) => w.toFixed(0) + '%').join(' / '))
@@ -962,15 +964,15 @@ async function renderPanel(payload, { fetchError = null } = {}) {
       return segs.includes('_dsh_ofb_bar_in') && segs.includes('_dsh_ofb_bar_out')
     }), JSON.stringify(bars.map((bar) => (fillOf(bar)?.children ?? []).map((c) => String(c.props?.className ?? '').replace('_dsh_ofb_bar_', '')))))
   const inputShare = Number.parseFloat(
-    (fillOf(bars[1])?.children ?? []).find((c) => String(c.props?.className ?? '') === '_dsh_ofb_bar_in')?.props?.style?.width ?? '0',
+    (fillOf(bars[0])?.children ?? []).find((c) => String(c.props?.className ?? '') === '_dsh_ofb_bar_in')?.props?.style?.width ?? '0',
   )
-  check('I14 输入段占比与数值一致（12300/13500）', Math.abs(inputShare - (12300 / 13500) * 100) < 0.2, inputShare.toFixed(1) + '%')
-  check('I15 标题行给出合计（请求 + token，取自面板整体文本，因为它在卡片外）',
+  check('I14 输入段占比与数值一致（4500/4800）', Math.abs(inputShare - (4500 / 4800) * 100) < 0.2, inputShare.toFixed(1) + '%')
+  check('I15 标题行给出当前模型的合计（请求 + token，取自面板整体文本，因为它在卡片外）',
     (() => {
-      const whole = textOf(allView).join('\n')
-      return whole.includes('合计') && whole.includes('40/39/1') && whole.includes('37.8k/3.6k')
+      const whole = textOf(tree).join('\n')
+      return whole.includes('合计') && whole.includes('24/24/0') && whole.includes('25.5k/2.4k')
     })(),
-    textOf(allView).filter((s) => s.includes('合计')).join(' '))
+    textOf(tree).filter((s) => s.includes('合计')).join(' '))
   check('I16 条与数字都带完整数值 title（悬停看精确值）',
     String(findNode(bars[0], (n) => typeof n.props?.title === 'string')?.props?.title ?? '').includes('输入 ') === true,
     findNode(bars[0], (n) => typeof n.props?.title === 'string')?.props?.title)
