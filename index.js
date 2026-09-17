@@ -400,8 +400,11 @@ function createKeyPool(quotaStore, diag, log) {
       if (!extrasResolved && config?.readCredentialsFile !== false) {
         const path = resolveCredentialsFilePath(config)
         try {
-          for (const value of readCredentialRefsFromFile(path, refs).values()) register(value)
+          const fromFile = readCredentialRefsFromFile(path, refs)
+          for (const value of fromFile.values()) register(value)
           diag.credentialsFileRead = true
+          // 兜底成功也算已解析：改为 5 分钟复扫，避免每个请求都读盘
+          if (fromFile.size > 0) extrasResolved = true
         } catch {
           diag.credentialsFileRead = false
         }
