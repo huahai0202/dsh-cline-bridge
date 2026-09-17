@@ -74,13 +74,18 @@ Cline 的免费额度是**按 Key + 按模型**的每日上限，撞限流时服
 
 > DSH 原生不支持多 Key：`apiKeyEnv` 是单个凭据引用，路由在请求进入 pi-ai 前只解析出一个 Key，pi-ai 的重试也始终复用同一个 Key。所以这个能力只能由插件在 fetch 层提供。
 
-### 提供额外 Key 的三种方式（可组合）
+### 提供额外 Key 的四种方式（可组合）
 
 | 方式 | 用法 |
 | --- | --- |
-| **DSH 凭据仓库**（推荐） | 在凭据中存 `CLINE_API_KEY_2`、`CLINE_API_KEY_3`…（插件默认探测 `_2`~`_10`），通过 `ctx.credentials.resolve(ref)` 读取，Key 不进代码与配置文件 |
+| **DSH 凭据仓库**（推荐） | 在凭据中存 `CLINE_API_KEY_2`、`CLINE_API_KEY_3`…（插件默认探测 `_2`~`_10`），通过 `ctx.get('credentials').resolve(ref)` 读取，Key 不进代码与配置文件 |
+| **`.credentials.yaml` 直读兜底** | 凭据服务尚未注册或不可用时，直接解析 `<DSH_HOME>/.credentials.yaml` 的 `refs` 段（只取上述 ref 名，其余内容不碰） |
 | **启动环境变量** | 启动 DSH 前设置 `CLINE_API_KEYS=k2,k3`（逗号/空格/分号分隔），或直接 `CLINE_API_KEY_2`、`CLINE_API_KEY_3`… |
 | **插件 config** | 在 profile 的 `cordis.patch.yml` 里给条目加配置（支持 `!!js` 表达式） |
+
+> 额外 Key 的解析**不会一次性上锁**：服务未就绪时每 2 秒重试，就绪后每 5 分钟复扫一次——运行期新增的 ref 也会被发现。
+>
+> 排查入口：状态文件里带 `diagnostics` 字段（插件版本、`credentialsFound`、`poolSize`、`clineRequests`/`rotations`/`failFasts` 计数、`lastDecision`、各 Key 的冷却模型），一眼能看出「为什么没换 Key」。日志里 Key 只以 8 位哈希标签出现。
 
 ```yaml
 # 加在 profile 的 cordis.patch.yml（即 ~/.dsh/profiles/web/cordis.patch.yml）。

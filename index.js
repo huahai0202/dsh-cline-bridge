@@ -1,5 +1,7 @@
 export const name = 'opencode-free-bridge'
 
+const PLUGIN_VERSION = '1.4.1'
+
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -98,6 +100,9 @@ const DEFAULT_FAIL_FAST_MIN_MS = 5 * 60 * 1000
 const MAX_ROTATE_ATTEMPTS = 6
 // 默认从凭据仓库 / 启动环境探测的额外 key 名（主 key 由 DSH 的 CLINE_API_KEY 提供）
 const DEFAULT_CLINE_KEY_REFS = Array.from({ length: 9 }, (_, i) => `CLINE_API_KEY_${i + 2}`)
+// 额外 key 的解析节流：服务未就绪时 2 秒后重试；就绪后每 5 分钟复扫一次以发现新增 ref
+const EXTRAS_RETRY_MS = 2000
+const EXTRAS_TTL_MS = 5 * 60 * 1000
 const CLINE_ROTATE_STATUSES = [429]
 
 /** 429 是否属于「额度已耗尽」这类终局错误：这类错误退避重试毫无意义。 */
@@ -118,19 +123,30 @@ const QUOTA_STATE_MAX_KEYS = 200
 
 function resolveQuotaStatePath(config) {
   if (typeof config?.quotaStatePath === 'string' && config.quotaStatePath) return config.quotaStatePath
-  const home = globalThis.process?.env?.DSH_HOME || join(homedir(), '.dsh')
-  return join(home, '.opencode-free-bridge-cline-quota.json')
+  return join(resolveDshHome(config), '.opencode-free-bridge-cline-quota.json')
+}
+
+function resolveDshHome(config) {
+  if (typeof config?.dshHome === 'string' && config.dshHome) return config.dshHome
+  return globalThis.process?.env?.DSH_HOME || join(homedir(), '.dsh')
+}
+
+function resolveCredentialsFilePath(config) {
+  if (typeof config?.credentialsFile === 'string' && config.credentialsFile) return config.credentialsFile
+  return join(resolveDshHome(config), '.credentials.yaml')
 }
 
 /** 磁盘上的额度状态：{ entries: { <keyLabel>: { <model>: { readyAt, body } } } } —— 不含 key 原文。 */
 function createQuotaStore(path) {
   let records = new Map() // label → Map<model, { readyAt, body }>
+  let diagnostics = {}
   let dirty = false
   let timer
 
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf8'))
     const now = Date.now()
+    diagnostics = typeof parsed?.diagnostics === 'object' && parsed.diagnostics ? parsed.diagnostics : {}
     for (const [label, models] of Object.entries(parsed?.entries ?? {})) {
       const kept = new Map()
       for (const [model, record] of Object.entries(models ?? {})) {
@@ -153,7 +169,7 @@ function createQuotaStore(path) {
       }
       mkdirSync(dirname(path), { recursive: true })
       const tmp = `${path}.tmp`
-      writeFileSync(tmp, JSON.stringify({ version: QUOTA_STATE_VERSION, updatedAt: Date.now(), entries }))
+      writeFileSync(tmp, JSON.stringify({ version: QUOTA_STATE_VERSION, updatedAt: Date.now(), entries, diagnostics }))
       renameSync(tmp, path)
     } catch {
       // 落盘失败绝不影响请求
@@ -175,6 +191,11 @@ function createQuotaStore(path) {
 
   return {
     path,
+    /** 记录诊断信息（池规模、凭据服务是否可达、各类决策计数），随状态文件一起落盘便于排查。 */
+    setDiagnostics(next) {
+      diagnostics = { ...diagnostics, ...next }
+      schedule()
+    },
     forLabel(label) {
       const now = Date.now()
       return [...(records.get(label) ?? new Map()).entries()].filter(([, record]) => record.readyAt > now)
@@ -273,11 +294,51 @@ function writeKeyTo(headers, key, target) {
   else headers.set('authorization', `${target.scheme || 'Bearer'} ${key}`)
 }
 
+/** 从 DSH 凭据服务读取额外 key（首选路径）。
+ *  dsh-credentials / dsh-llm-pi-ai 都用 `ctx.get('credentials')`，这里同时兜一下直接属性访问。 */
+function resolveCredentialService(ctx) {
+  for (const access of [() => ctx?.get?.('credentials'), () => ctx?.credentials]) {
+    try {
+      const service = access()
+      if (service?.resolve) return service
+    } catch {
+      // 忽略：换下一种访问方式
+    }
+  }
+  return undefined
+}
+
+/** 兜底路径：直接解析 .credentials.yaml 的 refs 段（凭据服务尚未就绪或不可用时）。
+ *  只取显式需要的 ref，文件的其余内容一概不碰。 */
+function readCredentialRefsFromFile(path, wantedRefs) {
+  const wanted = new Set(wantedRefs)
+  const out = new Map()
+  let inRefs = false
+  for (const rawLine of readFileSync(path, 'utf8').split(/\r?\n/)) {
+    if (/^refs:\s*$/.test(rawLine)) {
+      inRefs = true
+      continue
+    }
+    if (!inRefs) continue
+    if (/^\S/.test(rawLine)) break // 回到顶层：refs 段结束
+    const matched = /^\s{2}([A-Za-z0-9_]+):\s*(.+?)\s*$/.exec(rawLine)
+    if (!matched || !wanted.has(matched[1])) continue
+    let value = matched[2]
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1)
+    }
+    if (value) out.set(matched[1], value)
+  }
+  return out
+}
+
 /** key 池：按模型维度记录冷却时间，选 key 时用 LRU 避开刚用过的那个。
  *  冷却状态会经由 quotaStore 落到磁盘，DSH 重启后仍知道「哪个 key 在哪个模型上被限到几点」。 */
-function createKeyPool(quotaStore) {
+function createKeyPool(quotaStore, diag, log) {
   const entries = new Map() // label → { key, label, cooling: Map<model, readyAt>, lastBody: Map<model, text>, lastUsedAt }
-  let extrasLoaded = false
+  // 额外 key 未就绪时必须可重试：凭据服务可能在插件挂载之后才注册
+  let extrasResolved = false
+  let lastExtrasAttempt = 0
 
   const register = (key) => {
     const value = typeof key === 'string' ? key.trim() : ''
@@ -301,10 +362,14 @@ function createKeyPool(quotaStore) {
       return entries.size
     },
     register,
-    /** 加载 config / 环境变量 / 凭据仓库里的额外 key（仅一次）。 */
+    /** 加载 config / 环境变量 / 凭据仓库里的额外 key。
+     *  未拿到凭据服务时不会永久上锁——按节流反复重试，直到服务就绪；就绪后按 TTL 定期复扫，
+     *  这样运行期新增的 ref 也能被发现。 */
     async ensureExtras(ctx, config) {
-      if (extrasLoaded) return
-      extrasLoaded = true
+      const now = Date.now()
+      const throttle = extrasResolved ? EXTRAS_TTL_MS : EXTRAS_RETRY_MS
+      if (now - lastExtrasAttempt < throttle) return
+      lastExtrasAttempt = now
 
       for (const key of config?.clineKeys ?? []) register(key)
 
@@ -316,23 +381,37 @@ function createKeyPool(quotaStore) {
       for (const ref of DEFAULT_CLINE_KEY_REFS) register(env[ref])
 
       const refs = config?.clineKeyRefs ?? DEFAULT_CLINE_KEY_REFS
-      let credentials
-      try {
-        credentials = ctx?.get?.('credentials')
-      } catch {
-        credentials = undefined
-      }
-      if (credentials?.resolve) {
+      const credentials = resolveCredentialService(ctx)
+      diag.credentialsFound = Boolean(credentials)
+      if (credentials) {
         for (const ref of refs) {
           try {
             const resolved = await credentials.resolve(ref)
             const value = typeof resolved === 'string' ? resolved : resolved?.value
             if (typeof value === 'string') register(value)
           } catch {
-            // 凭据服务不可用或该 ref 未配置：忽略，不影响其余来源
+            // 单个 ref 失败不影响其余来源
           }
         }
+        extrasResolved = true
       }
+
+      // 兜底：服务不可用时直接读 .credentials.yaml（只取需要的 ref）
+      if (!extrasResolved && config?.readCredentialsFile !== false) {
+        const path = resolveCredentialsFilePath(config)
+        try {
+          for (const value of readCredentialRefsFromFile(path, refs).values()) register(value)
+          diag.credentialsFileRead = true
+        } catch {
+          diag.credentialsFileRead = false
+        }
+      }
+
+      diag.extrasResolved = extrasResolved
+      diag.poolSize = entries.size
+      diag.lastExtrasAt = new Date(now).toISOString()
+      quotaStore?.setDiagnostics?.(diag)
+      log?.(`Cline key 池：${entries.size} 个 key（凭据服务${credentials ? '可用' : '不可用'}，config/env 已合并）`)
     },
     pick(model) {
       const now = Date.now()
@@ -422,7 +501,20 @@ export function apply(ctx, config) {
   const allCoolingFailFast = config?.allCoolingFailFast !== false
   const failFastMinMs = Number.isFinite(config?.failFastMinMs) ? Math.max(0, config.failFastMinMs) : DEFAULT_FAIL_FAST_MIN_MS
   const quotaStore = createQuotaStore(resolveQuotaStatePath(config))
-  const pool = createKeyPool(quotaStore)
+  // 诊断信息随状态文件落盘：池规模、凭据服务是否可达、各类决策计数（便于线上排查“为什么没换 key”）
+  const diag = {
+    pluginVersion: PLUGIN_VERSION,
+    credentialsFound: false,
+    credentialsFileRead: false,
+    extrasResolved: false,
+    poolSize: 0,
+    lastExtrasAt: '',
+    clineRequests: 0,
+    rotations: 0,
+    failFasts: 0,
+    lastDecision: '',
+  }
+  const pool = createKeyPool(quotaStore, diag, (message) => log(message))
   // 额外 key 与请求无关，尽早加载；失败也不影响主链路
   void pool.ensureExtras(ctx, config).catch(() => {})
 
@@ -507,6 +599,9 @@ export function apply(ctx, config) {
       if (requestKey) pool.register(requestKey)
       // 额外 key 必须在首次判定前就位，否则「全池冷却」与「挑备用 key」都会失真
       await pool.ensureExtras(ctx, config).catch(() => {})
+      diag.clineRequests += 1
+      diag.lastDecision = `request key=${requestKey ? keyLabel(requestKey) : '(none)'} model=${readModelOf(init?.body)}`
+      quotaStore.setDiagnostics({ ...diag, pool: pool.snapshot().map((e) => ({ label: e.label, cooling: e.cooling })) })
 
       // Request 形态下 body 只能消费一次：若存在多个 key（可能轮换），先缓冲一份可重发副本
       let bufferedBody
@@ -529,6 +624,9 @@ export function apply(ctx, config) {
         const soonest = pool.soonestReady(model)
         if (soonest && soonest.readyAt - Date.now() >= failFastMinMs) {
           const waitMin = Math.max(1, Math.round((soonest.readyAt - Date.now()) / 60000))
+          diag.failFasts += 1
+          diag.lastDecision = `fail-fast model=${model} pool=${pool.size} waitMin=${waitMin}`
+          quotaStore.setDiagnostics({ ...diag, pool: pool.snapshot().map((e) => ({ label: e.label, cooling: e.cooling })) })
           log(`Cline 全部 key 在 ${model} 上均冷却（最早 ${waitMin} 分钟后恢复），直接返回缓存报错`)
           const body =
             soonest.body ||
@@ -601,6 +699,9 @@ export function apply(ctx, config) {
 
         if (!rotateStatuses.includes(retried.status)) {
           pool.markHealthy(next.key, model)
+          diag.rotations += 1
+          diag.lastDecision = `rotated ${keyLabel(currentKey)}→${next.label} model=${model}`
+          quotaStore.setDiagnostics({ ...diag, pool: pool.snapshot().map((e) => ({ label: e.label, cooling: e.cooling })) })
           log(`Cline 限流已换 key 恢复（${keyLabel(currentKey)} → ${next.label}, model=${model}）`)
           return retried
         }

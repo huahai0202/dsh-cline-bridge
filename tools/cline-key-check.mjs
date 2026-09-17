@@ -10,7 +10,7 @@
  */
 
 import { createServer } from 'node:http'
-import { mkdirSync, readFileSync, rmSync } from 'node:fs'
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply } from '../index.js'
@@ -22,6 +22,15 @@ let stateSeq = 0
 
 // ── mock Cline 服务端 ────────────────────────────────────────────────
 const seen = [] // { key, model, headers }
+const tag = (key) => {
+  if (typeof key !== 'string' || key.length <= 8) return String(key)
+  let h = 0x811c9dc5
+  for (let i = 0; i < key.length; i++) {
+    h ^= key.charCodeAt(i)
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+  return h.toString(16).padStart(8, '0')
+}
 const LIMITED_PREFIXES = ['k1', 'k5', 'e1', 'c1'] // 这些 key 一律撞「每日免费额度」上限
 const TRANSIENT_PREFIXES = ['r1'] // 这些 key 返回瞬时限流（无每日上限字样）
 
@@ -53,7 +62,8 @@ const server = createServer((req, res) => {
       return
     }
     res.writeHead(200, { 'content-type': 'application/json' })
-    res.end(JSON.stringify({ ok: true, servedBy: key, model }))
+    // 回包同样只回哈希标签，避免 key 原文出现在测试输出里
+    res.end(JSON.stringify({ ok: true, servedByTag: tag(key), model }))
   })
 })
 
@@ -74,16 +84,33 @@ function mount(config = {}, credentialsStub) {
       if (event === 'dispose') dispose = fn
     },
     logger: { warn: () => {} },
-    get: (name) => (name === 'credentials' ? credentialsStub : undefined),
+    // credentialsStub 可以是对象，也可以是「返回对象或 undefined」的函数（用于模拟服务晚就绪）
+    get: (name) =>
+      name === 'credentials' ? (typeof credentialsStub === 'function' ? credentialsStub() : credentialsStub) : undefined,
   }
   const merged = { ...config }
   if (merged.quotaStatePath === undefined) merged.quotaStatePath = join(TEST_STATE_DIR, `state-${++stateSeq}.json`)
+  // 隔离：绝不读用户真实的 .credentials.yaml（除非用例显式提供自己的凭据文件）
+  if (merged.credentialsFile === undefined && merged.readCredentialsFile === undefined) {
+    merged.credentialsFile = join(TEST_STATE_DIR, 'no-such-credentials.yaml')
+  }
   apply(ctx, merged)
   lastCtx = ctx
   return ctx
 }
 
-const attemptsText = (attempts) => attempts.map((a) => a.key).join('→')
+/** 输出里永不出现 key 原文：长于 8 字符的一律换成 8 位哈希标签（与插件日志同一算法）。 */
+const keyTag = (key) => {
+  if (typeof key !== 'string') return String(key)
+  if (key.length <= 8) return key
+  let h = 0x811c9dc5
+  for (let i = 0; i < key.length; i++) {
+    h ^= key.charCodeAt(i)
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+  return h.toString(16).padStart(8, '0')
+}
+const attemptsText = (attempts) => attempts.map((a) => keyTag(a.key)).join('→')
 const ctxSnapshot = () => lastCtx?.__opencodeFreeBridge?.clineKeys?.() ?? []
 const ctxFlush = () => lastCtx?.__opencodeFreeBridge?.flushQuotaState?.()
 
@@ -318,6 +345,35 @@ const since = (n) => seen.slice(n)
 
   ctxFlush()
   rmSync(statePath, { force: true })
+}
+
+// ── N. 额外 key 来源的健壮性 ─────────────────────────────────────────
+{
+  // N1：凭据服务不可用时，直接读 .credentials.yaml 兜底
+  const credPath = join(TEST_STATE_DIR, `credentials-${++stateSeq}.yaml`)
+  writeFileSync(
+    credPath,
+    ['version: 1', 'refs:', '  CLINE_API_KEY: "p1"', '  CLINE_API_KEY_2: "n2"', 'records:', '  x:', '    kind: grant'].join('\n'),
+  )
+  mount({ clineKeys: [], clineMatch: match, credentialsFile: credPath }, undefined) // ctx.get('credentials') → undefined
+  const n = mark()
+  const r = await call('k1')
+  const a = since(n)
+  check('N1 凭据服务不可用时仍能从 .credentials.yaml 取到额外 key', r.status === 200 && a.length === 2 && a[1].key === 'n2', attemptsText(a))
+
+  // N2：服务“稍后才注册”时不能被永久上锁（第一次 get 必须真的取不到服务）
+  let serviceReady = false
+  const lateStub = { resolve: async (ref) => (ref === 'CLINE_API_KEY_9' ? { value: 'z9' } : undefined) }
+  mount({ clineKeys: ['k1'], clineMatch: match, readCredentialsFile: false }, () => (serviceReady ? lateStub : undefined))
+  const r0 = await call('k1')
+  check('N2a 服务未就绪时先按单 key 处理', r0.status === 429, String(r0.status))
+
+  serviceReady = true
+  await new Promise((r) => setTimeout(r, 2200)) // 越过 2s 重试节流
+  const n2 = mark()
+  const r2 = await call('k1')
+  const a2 = since(n2)
+  check('N2b 服务就绪后额外 key 自动补入池（无永久上锁）', r2.status === 200 && a2.some((x) => x.key === 'z9'), attemptsText(a2))
 }
 
 dispose()
