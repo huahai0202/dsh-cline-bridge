@@ -1,6 +1,6 @@
 export const name = 'opencode-free-bridge'
 
-const PLUGIN_VERSION = '1.4.4'
+const PLUGIN_VERSION = '1.5.0'
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -294,17 +294,27 @@ function writeKeyTo(headers, key, target) {
   else headers.set('authorization', `${target.scheme || 'Bearer'} ${key}`)
 }
 
-/** 从 DSH 凭据服务读取额外 key（首选路径）。
- *  dsh-credentials / dsh-llm-pi-ai 都用 `ctx.get('credentials')`；这里再兜两条：
- *  根上下文的 get，以及直接属性访问（声明式注入的服务会挂成属性）。 */
-function resolveCredentialService(ctx) {
-  const accesses = [() => ctx?.get?.('credentials'), () => ctx?.root?.get?.('credentials'), () => ctx?.credentials]
-  for (const access of accesses) {
+/** 从 DSH 凭据服务读取额外 key（可选来源之一）。
+ *  注意 Cordis 的语义：`ctx.get(name)` 会沿 fiber 链校验 isolate 映射，插件未声明该依赖时
+ *  取值会**抛错**（而不是返回 undefined）——所以这里既记录错误，也只当它是候选来源之一。
+ *  真正可靠的路径是 apply() 里通过 `ctx.inject(['credentials'], cb)` 拿到的服务实例。 */
+function resolveCredentialService(ctx, diag) {
+  const accesses = [
+    ['ctx.get', () => ctx?.get?.('credentials')],
+    ['ctx.root.get', () => ctx?.root?.get?.('credentials')],
+    ['ctx.credentials', () => ctx?.credentials],
+  ]
+  for (const [via, access] of accesses) {
     try {
       const service = access()
-      if (service?.resolve) return service
-    } catch {
-      // 忽略：换下一种访问方式
+      if (service?.resolve) {
+        if (diag) diag.credentialsVia = via
+        return service
+      }
+      if (diag) diag.credentialsVia = `${via}(undefined)`
+    } catch (error) {
+      // isolate 不匹配会走到这里：记下来，避免再把“抛错”误判成“服务不存在”
+      if (diag) diag.credentialsProbeError = `${via}: ${error?.message ?? error}`
     }
   }
   return undefined
@@ -341,6 +351,7 @@ function createKeyPool(quotaStore, diag, log) {
   // 额外 key 未就绪时必须可重试：凭据服务可能在插件挂载之后才注册
   let extrasResolved = false
   let lastExtrasAttempt = 0
+  let credentialsService
 
   const register = (key) => {
     const value = typeof key === 'string' ? key.trim() : ''
@@ -364,12 +375,16 @@ function createKeyPool(quotaStore, diag, log) {
       return entries.size
     },
     register,
+    /** 由 ctx.inject(['credentials'], cb) 提供的服务实例（最可靠的服务来源）。 */
+    setCredentials(service) {
+      credentialsService = service
+    },
     /** 加载 config / 环境变量 / 凭据仓库里的额外 key。
      *  未拿到凭据服务时不会永久上锁——按节流反复重试，直到服务就绪；就绪后按 TTL 定期复扫，
      *  这样运行期新增的 ref 也能被发现。 */
-    async ensureExtras(ctx, config) {
+    async ensureExtras(ctx, config, options) {
       const now = Date.now()
-      const throttle = extrasResolved ? EXTRAS_TTL_MS : EXTRAS_RETRY_MS
+      const throttle = options?.force ? 0 : extrasResolved ? EXTRAS_TTL_MS : EXTRAS_RETRY_MS
       if (now - lastExtrasAttempt < throttle) return
       lastExtrasAttempt = now
 
@@ -383,7 +398,7 @@ function createKeyPool(quotaStore, diag, log) {
       for (const ref of DEFAULT_CLINE_KEY_REFS) register(env[ref])
 
       const refs = config?.clineKeyRefs ?? DEFAULT_CLINE_KEY_REFS
-      const credentials = resolveCredentialService(ctx)
+      const credentials = credentialsService ?? resolveCredentialService(ctx, diag)
       diag.credentialsFound = Boolean(credentials)
       if (credentials) {
         for (const ref of refs) {
@@ -510,6 +525,8 @@ export function apply(ctx, config) {
   const diag = {
     pluginVersion: PLUGIN_VERSION,
     credentialsFound: false,
+    credentialsVia: '',
+    credentialsProbeError: '',
     credentialsFileRead: false,
     extrasResolved: false,
     poolSize: 0,
@@ -522,6 +539,24 @@ export function apply(ctx, config) {
   const pool = createKeyPool(quotaStore, diag, (message) => log(message))
   // 额外 key 与请求无关，尽早加载；失败也不影响主链路
   void pool.ensureExtras(ctx, config).catch(() => {})
+  // 凭据服务的正路：用「等依赖就绪」的子插件拿服务实例。它不阻塞本插件加载
+  // （没有该服务时插件照常工作，只是额外 key 改由环境变量/凭据文件提供），
+  // 而一旦服务就绪就立刻把实例交给我们并强制重扫一次。
+  try {
+    ctx?.inject?.(['credentials'], (scoped) => {
+      const service = scoped?.credentials ?? scoped?.get?.('credentials')
+      if (!service?.resolve) {
+        diag.credentialsVia = 'inject(no-service)'
+        return
+      }
+      diag.credentialsVia = 'inject'
+      diag.credentialsProbeError = ''
+      pool.setCredentials(service)
+      void pool.ensureExtras(ctx, config, { force: true }).catch(() => {})
+    })
+  } catch (error) {
+    diag.credentialsProbeError = `inject: ${error?.message ?? error}`
+  }
 
   const log = (message) => {
     try {

@@ -77,16 +77,22 @@ const check = (label, ok, detail = '') => results.push(`${ok ? 'PASS' : 'FAIL'} 
 
 let dispose = () => {}
 let lastCtx
-function mount(config = {}, credentialsStub) {
+function mount(config = {}, credentialsStub, injectService) {
   dispose()
   const ctx = {
     on: (event, fn) => {
       if (event === 'dispose') dispose = fn
     },
     logger: { warn: () => {} },
-    // credentialsStub 可以是对象，也可以是「返回对象或 undefined」的函数（用于模拟服务晚就绪）
+    // credentialsStub 可为对象，或「返回对象/undefined 或抛错」的函数（模拟服务晚就绪或 isolate 不匹配）
     get: (name) =>
       name === 'credentials' ? (typeof credentialsStub === 'function' ? credentialsStub() : credentialsStub) : undefined,
+    // 模拟 Cordis 的「等依赖就绪」子插件：deps 命中且提供了服务时才回调
+    inject: (deps, callback) => {
+      if (Array.isArray(deps) && deps.includes('credentials') && injectService) {
+        callback({ credentials: injectService, get: (name) => (name === 'credentials' ? injectService : undefined) })
+      }
+    },
   }
   const merged = { ...config }
   if (merged.quotaStatePath === undefined) merged.quotaStatePath = join(TEST_STATE_DIR, `state-${++stateSeq}.json`)
@@ -111,6 +117,10 @@ const keyTag = (key) => {
   return h.toString(16).padStart(8, '0')
 }
 const attemptsText = (attempts) => attempts.map((a) => keyTag(a.key)).join('→')
+/** 复刻 Cordis 的真实行为：插件未声明依赖时，ctx.get(name) 会抛错而非返回 undefined。 */
+const isolateMismatch = () => {
+  throw new Error('cannot get property "credentials" without provide (isolate)')
+}
 const ctxSnapshot = () => lastCtx?.__opencodeFreeBridge?.clineKeys?.() ?? []
 const ctxFlush = () => lastCtx?.__opencodeFreeBridge?.flushQuotaState?.()
 
@@ -349,13 +359,13 @@ const since = (n) => seen.slice(n)
 
 // ── N. 额外 key 来源的健壮性 ─────────────────────────────────────────
 {
-  // N1：凭据服务不可用时，直接读 .credentials.yaml 兜底
+  // N1：凭据服务取不到（真实情形是 ctx.get 抛 isolate 不匹配）时，直接读 .credentials.yaml 兜底
   const credPath = join(TEST_STATE_DIR, `credentials-${++stateSeq}.yaml`)
   writeFileSync(
     credPath,
     ['version: 1', 'refs:', '  CLINE_API_KEY: "p1"', '  CLINE_API_KEY_2: "n2"', 'records:', '  x:', '    kind: grant'].join('\n'),
   )
-  mount({ clineKeys: [], clineMatch: match, credentialsFile: credPath }, undefined) // ctx.get('credentials') → undefined
+  mount({ clineKeys: [], clineMatch: match, credentialsFile: credPath }, isolateMismatch)
   const n = mark()
   const r = await call('k1')
   const a = since(n)
@@ -374,6 +384,30 @@ const since = (n) => seen.slice(n)
   const r2 = await call('k1')
   const a2 = since(n2)
   check('N2b 服务就绪后额外 key 自动补入池（无永久上锁）', r2.status === 200 && a2.some((x) => x.key === 'z9'), attemptsText(a2))
+}
+
+// ── O. ctx.inject 通路（线上真实走法）───────────────────────────────
+{
+  const statePath = join(TEST_STATE_DIR, `state-${++stateSeq}.json`)
+  const service = { resolve: async (ref) => (ref === 'CLINE_API_KEY_2' ? { value: 'inj2' } : undefined) }
+  mount({ clineKeys: ['k1'], clineMatch: match, quotaStatePath: statePath, readCredentialsFile: false }, isolateMismatch, service)
+  await new Promise((r) => setTimeout(r, 30)) // 等 inject 回调落地
+  const n = mark()
+  const r = await call('k1')
+  const a = since(n)
+  check('O1 ctx.get 抛错时改由 ctx.inject 提供的服务取额外 key', r.status === 200 && a.length === 2 && a[1].key === 'inj2', attemptsText(a))
+
+  ctxFlush()
+  const d1 = JSON.parse(readFileSync(statePath, 'utf8')).diagnostics
+  check('O2 诊断标明走的是 inject 路径', d1.credentialsVia === 'inject' && d1.credentialsFound === true, JSON.stringify({ via: d1.credentialsVia, found: d1.credentialsFound }))
+
+  // O3：只有 get 通路且它会抛错时，错误原因必须被记下来（而不是被当成“服务不存在”）
+  const statePath2 = join(TEST_STATE_DIR, `state-${++stateSeq}.json`)
+  mount({ clineKeys: ['k1'], clineMatch: match, quotaStatePath: statePath2, readCredentialsFile: false }, isolateMismatch)
+  await call('k1')
+  ctxFlush()
+  const d2 = JSON.parse(readFileSync(statePath2, 'utf8')).diagnostics
+  check('O3 ctx.get 抛错的原因被记入诊断', /isolate/.test(d2.credentialsProbeError ?? ''), (d2.credentialsProbeError ?? '').slice(0, 60))
 }
 
 dispose()
