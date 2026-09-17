@@ -1,5 +1,9 @@
 export const name = 'opencode-free-bridge'
 
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
+
 const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
 const LOWER_HEX = '0123456789abcdef'
 
@@ -90,6 +94,7 @@ function canonicalSession(hint, fallback) {
 // 成功响应就直接返回，pi-ai 根本看不到那次 429。
 const DEFAULT_CLINE_MATCH = 'api.cline.bot'
 const DEFAULT_CLINE_COOLDOWN_MS = 15 * 60 * 1000
+const DEFAULT_FAIL_FAST_MIN_MS = 5 * 60 * 1000
 const MAX_ROTATE_ATTEMPTS = 6
 // 默认从凭据仓库 / 启动环境探测的额外 key 名（主 key 由 DSH 的 CLINE_API_KEY 提供）
 const DEFAULT_CLINE_KEY_REFS = Array.from({ length: 9 }, (_, i) => `CLINE_API_KEY_${i + 2}`)
@@ -102,6 +107,110 @@ const TERMINAL_WINDOW_MS = 10 * 60 * 1000
 /** 只用于日志的短标签，绝不记录 key 原文。 */
 function keyLabel(key) {
   return seedOf(key).toString(16).padStart(8, '0')
+}
+
+// ── 额度状态持久化 ───────────────────────────────────────────────────
+// 报错报文里的「Try again in 22h 47m」是一个绝对可用的恢复时刻。把它连同 key 的
+// 哈希标签一起落盘，DSH 重启后就能立刻知道哪个 key 在哪个模型上被限到几点，
+// 既不必再白撞一次 429，也能在全池耗尽时直接回放服务端原始报错。
+const QUOTA_STATE_VERSION = 1
+const QUOTA_STATE_MAX_KEYS = 200
+
+function resolveQuotaStatePath(config) {
+  if (typeof config?.quotaStatePath === 'string' && config.quotaStatePath) return config.quotaStatePath
+  const home = globalThis.process?.env?.DSH_HOME || join(homedir(), '.dsh')
+  return join(home, '.opencode-free-bridge-cline-quota.json')
+}
+
+/** 磁盘上的额度状态：{ entries: { <keyLabel>: { <model>: { readyAt, body } } } } —— 不含 key 原文。 */
+function createQuotaStore(path) {
+  let records = new Map() // label → Map<model, { readyAt, body }>
+  let dirty = false
+  let timer
+
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8'))
+    const now = Date.now()
+    for (const [label, models] of Object.entries(parsed?.entries ?? {})) {
+      const kept = new Map()
+      for (const [model, record] of Object.entries(models ?? {})) {
+        if (typeof record?.readyAt === 'number' && record.readyAt > now) {
+          kept.set(model, { readyAt: record.readyAt, body: typeof record.body === 'string' ? record.body : '' })
+        }
+      }
+      if (kept.size) records.set(label, kept)
+    }
+  } catch {
+    // 首次运行、文件损坏或不可读：按空状态处理
+  }
+
+  const write = () => {
+    try {
+      const entries = {}
+      for (const [label, models] of records) {
+        entries[label] = {}
+        for (const [model, record] of models) entries[label][model] = { readyAt: record.readyAt, body: record.body }
+      }
+      mkdirSync(dirname(path), { recursive: true })
+      const tmp = `${path}.tmp`
+      writeFileSync(tmp, JSON.stringify({ version: QUOTA_STATE_VERSION, updatedAt: Date.now(), entries }))
+      renameSync(tmp, path)
+    } catch {
+      // 落盘失败绝不影响请求
+    }
+  }
+
+  const schedule = () => {
+    dirty = true
+    if (timer) return
+    timer = setTimeout(() => {
+      timer = undefined
+      if (dirty) {
+        dirty = false
+        write()
+      }
+    }, 500)
+    timer.unref?.()
+  }
+
+  return {
+    path,
+    forLabel(label) {
+      const now = Date.now()
+      return [...(records.get(label) ?? new Map()).entries()].filter(([, record]) => record.readyAt > now)
+    },
+    get(label, model) {
+      const record = records.get(label)?.get(model)
+      return record && record.readyAt > Date.now() ? record : undefined
+    },
+    set(label, model, readyAt, body) {
+      if (!records.has(label)) records.set(label, new Map())
+      records.get(label).set(model, { readyAt, body: body ?? '' })
+      if (records.size > QUOTA_STATE_MAX_KEYS) {
+        const trimmed = [...records.entries()].sort((a, b) => {
+          const latest = (entry) => Math.max(...[...entry[1].values()].map((r) => r.readyAt), 0)
+          return latest(b) - latest(a)
+        })
+        records = new Map(trimmed.slice(0, QUOTA_STATE_MAX_KEYS))
+      }
+      schedule()
+    },
+    clear(label, model) {
+      const models = records.get(label)
+      if (!models?.delete(model)) return
+      if (!models.size) records.delete(label)
+      schedule()
+    },
+    flush() {
+      if (!timer && !dirty) return
+      if (timer) {
+        clearTimeout(timer)
+        timer = undefined
+      }
+      dirty = false
+      write()
+    },
+  }
 }
 
 /** 从报文中解析 "Try again in 22h 47m" 这类重试窗口；解析不出则返回 0。 */
@@ -164,18 +273,25 @@ function writeKeyTo(headers, key, target) {
   else headers.set('authorization', `${target.scheme || 'Bearer'} ${key}`)
 }
 
-/** key 池：按模型维度记录冷却时间，选 key 时用 LRU 避开刚用过的那个。 */
-function createKeyPool() {
-  const entries = new Map() // key → { key, label, cooling: Map<model, until>, lastUsedAt }
+/** key 池：按模型维度记录冷却时间，选 key 时用 LRU 避开刚用过的那个。
+ *  冷却状态会经由 quotaStore 落到磁盘，DSH 重启后仍知道「哪个 key 在哪个模型上被限到几点」。 */
+function createKeyPool(quotaStore) {
+  const entries = new Map() // label → { key, label, cooling: Map<model, readyAt>, lastBody: Map<model, text>, lastUsedAt }
   let extrasLoaded = false
 
   const register = (key) => {
     const value = typeof key === 'string' ? key.trim() : ''
     if (!value || /^(Bearer|undefined|null)$/i.test(value)) return undefined
-    let entry = entries.get(value)
+    const label = keyLabel(value)
+    let entry = entries.get(label)
     if (!entry) {
-      entry = { key: value, label: keyLabel(value), cooling: new Map(), lastUsedAt: 0 }
-      entries.set(value, entry)
+      entry = { key: value, label, cooling: new Map(), lastBody: new Map(), lastUsedAt: 0 }
+      entries.set(label, entry)
+      // 恢复该 key 上次进程留下的额度状态（按 label 匹配，磁盘上没有 key 原文）
+      for (const [model, record] of quotaStore?.forLabel?.(label) ?? []) {
+        entry.cooling.set(model, record.readyAt)
+        if (record.body) entry.lastBody.set(model, record.body)
+      }
     }
     return entry
   }
@@ -229,22 +345,49 @@ function createKeyPool() {
       return best
     },
     isCooling(key, model) {
-      const entry = entries.get(key)
+      const entry = entries.get(keyLabel(key))
       if (!entry) return false
       const until = entry.cooling.get(model)
       return until !== undefined && until > Date.now()
     },
-    markCooling(key, model, ms) {
-      const entry = entries.get(key)
+    /** 该模型上是否所有已知 key 都还在冷却。 */
+    allCooling(model) {
+      const now = Date.now()
+      let seen = 0
+      for (const entry of entries.values()) {
+        seen++
+        const until = entry.cooling.get(model)
+        if (until === undefined || until <= now) return false
+      }
+      return seen > 0
+    },
+    /** 冷却中恢复最早的那个 key（含缓存报文，用于快速失败时回放真实报错）。 */
+    soonestReady(model) {
+      const now = Date.now()
+      let best
+      for (const entry of entries.values()) {
+        const until = entry.cooling.get(model)
+        if (until === undefined || until <= now) continue
+        if (!best || until < best.readyAt) best = { key: entry.key, label: entry.label, readyAt: until, body: entry.lastBody.get(model) ?? '' }
+      }
+      return best
+    },
+    markCooling(key, model, ms, body) {
+      const entry = entries.get(keyLabel(key))
       if (!entry) return
-      entry.cooling.set(model, Date.now() + ms)
+      const readyAt = Date.now() + ms
+      entry.cooling.set(model, readyAt)
+      if (body) entry.lastBody.set(model, body)
       entry.lastUsedAt = Date.now()
+      quotaStore?.set?.(entry.label, model, readyAt, body)
     },
     markHealthy(key, model) {
-      const entry = entries.get(key)
+      const entry = entries.get(keyLabel(key))
       if (!entry) return
       entry.cooling.delete(model)
+      entry.lastBody.delete(model)
       entry.lastUsedAt = Date.now()
+      quotaStore?.clear?.(entry.label, model)
     },
     /** 供自检工具观察状态，不暴露 key 原文。 */
     snapshot() {
@@ -252,6 +395,9 @@ function createKeyPool() {
       return [...entries.values()].map((entry) => ({
         label: entry.label,
         cooling: [...entry.cooling.entries()].filter(([, until]) => until > now).map(([model]) => model),
+        quota: [...entry.cooling.entries()]
+          .filter(([, until]) => until > now)
+          .map(([model, until]) => ({ model, readyAt: until, readyInMin: Math.max(1, Math.round((until - now) / 60000)) })),
         lastUsedAt: entry.lastUsedAt,
       }))
     },
@@ -271,7 +417,12 @@ export function apply(ctx, config) {
   // 默认 false：首发送始终用 DSH 配置的 key，冷却中的 key 也先试一次（更可预测）。
   // 置 true：本地已记录该 key 在当前模型上冷却时，首发送就改用健康 key，省掉一次白撞。
   const skipCoolingRequestKey = config?.skipCoolingRequestKey === true
-  const pool = createKeyPool()
+  // 全池都在冷却、且最早恢复时刻还在 failFastMinMs 之外时：直接回放服务端原始 429，
+  // 不再发一次注定失败的请求（报文里的恢复时刻就是依据）。默认开启，可配置关闭。
+  const allCoolingFailFast = config?.allCoolingFailFast !== false
+  const failFastMinMs = Number.isFinite(config?.failFastMinMs) ? Math.max(0, config.failFastMinMs) : DEFAULT_FAIL_FAST_MIN_MS
+  const quotaStore = createQuotaStore(resolveQuotaStatePath(config))
+  const pool = createKeyPool(quotaStore)
   // 额外 key 与请求无关，尽早加载；失败也不影响主链路
   void pool.ensureExtras(ctx, config).catch(() => {})
 
@@ -354,6 +505,8 @@ export function apply(ctx, config) {
       const authTarget = readAuthTarget(headers)
       const requestKey = readKeyOf(headers, authTarget)
       if (requestKey) pool.register(requestKey)
+      // 额外 key 必须在首次判定前就位，否则「全池冷却」与「挑备用 key」都会失真
+      await pool.ensureExtras(ctx, config).catch(() => {})
 
       // Request 形态下 body 只能消费一次：若存在多个 key（可能轮换），先缓冲一份可重发副本
       let bufferedBody
@@ -369,6 +522,26 @@ export function apply(ctx, config) {
         input instanceof Request
           ? readModelOf(bufferedBody ? new TextDecoder().decode(bufferedBody) : undefined)
           : readModelOf(init?.body)
+
+      // 全池冷却的快速失败：报文里的恢复时刻还在阈值之外时，不再发注定失败的请求，
+      // 直接回放服务端原始 429（磁盘上有报文就用原始的，没有则合成一条诚实说明）。
+      if (allCoolingFailFast && pool.allCooling(model)) {
+        const soonest = pool.soonestReady(model)
+        if (soonest && soonest.readyAt - Date.now() >= failFastMinMs) {
+          const waitMin = Math.max(1, Math.round((soonest.readyAt - Date.now()) / 60000))
+          log(`Cline 全部 key 在 ${model} 上均冷却（最早 ${waitMin} 分钟后恢复），直接返回缓存报错`)
+          const body =
+            soonest.body ||
+            JSON.stringify({
+              code: 'INFERENCE_CAP_ERROR',
+              message: `Error 429: Daily free limit reached on model ${model}. Try again in ${waitMin}m (local cache)`,
+            })
+          return new Response(body, {
+            status: 429,
+            headers: { 'content-type': 'application/json', 'x-should-retry': 'false' },
+          })
+        }
+      }
 
       // 首发送始终沿用请求自带的 key（即 DSH 里配置的那个），轮换只作为撞限流后的兜底。
       // 即使该 key 已被本地记为「冷却中」也仍然先试一次：本地冷却只是推测，
@@ -409,7 +582,7 @@ export function apply(ctx, config) {
       if (!replayable || !currentKey) return response
 
       let lastText = await response.clone().text()
-      pool.markCooling(currentKey, model, parseRetryWindowMs(lastText) || clineCooldownMs)
+      pool.markCooling(currentKey, model, parseRetryWindowMs(lastText) || clineCooldownMs, lastText)
       await pool.ensureExtras(ctx, config).catch(() => {})
 
       for (let attempt = 0; attempt < MAX_ROTATE_ATTEMPTS; attempt++) {
@@ -433,7 +606,7 @@ export function apply(ctx, config) {
         }
 
         lastText = await retried.clone().text()
-        pool.markCooling(next.key, model, parseRetryWindowMs(lastText) || clineCooldownMs)
+        pool.markCooling(next.key, model, parseRetryWindowMs(lastText) || clineCooldownMs, lastText)
         currentKey = next.key
         response = retried
       }
@@ -450,7 +623,9 @@ export function apply(ctx, config) {
 
       const exhausted = new Headers(response.headers)
       exhausted.set('x-should-retry', 'false')
-      log(`Cline 额度已耗尽（model=${model}，重试窗口约 ${Math.max(1, Math.round(windowMs / 60000))} 分钟），放弃重试`)
+      const soonest = pool.soonestReady(model)
+      const resetHint = soonest ? `，最早 ${new Date(soonest.readyAt).toLocaleTimeString('zh-CN', { hour12: false })} 恢复` : ''
+      log(`Cline 额度已耗尽（model=${model}，重试窗口约 ${Math.max(1, Math.round(windowMs / 60000))} 分钟${resetHint}），放弃重试`)
       return new Response(response.body, {
         status: response.status,
         statusText: response.statusText,
@@ -464,11 +639,14 @@ export function apply(ctx, config) {
 
   ctx.on('dispose', () => {
     globalThis.fetch = originalFetch
+    quotaStore.flush()
   })
 
   // 自检工具用的观察入口（不含 key 原文）
   ctx.__opencodeFreeBridge = {
     clineKeys: () => pool.snapshot(),
     parseRetryWindowMs,
+    quotaStatePath: quotaStore.path,
+    flushQuotaState: () => quotaStore.flush(),
   }
 }

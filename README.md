@@ -96,7 +96,23 @@ Cline 的免费额度是**按 Key + 按模型**的每日上限，撞限流时服
     # clineCooldownMs: 900000
     # 可选：主 key 已知在冷却时，首发送就改用健康 key（默认 false，保持「先试主 key」的可预测行为）
     # skipCoolingRequestKey: true
+    # 可选：额度状态落盘位置（默认 <DSH_HOME 或 ~/.dsh>/.opencode-free-bridge-cline-quota.json）
+    # quotaStatePath: 'D:/somewhere/quota.json'
+    # 可选：全池冷却时是否快速失败（默认 true）
+    # allCoolingFailFast: false
+    # 可选：最早恢复时刻至少还有这么久，才快速失败（毫秒，默认 5 分钟；设 0 表示只要全池冷却就快速失败）
+    # failFastMinMs: 300000
 ```
+
+### 用报错里的「恢复时刻」做的三件事
+
+那份 429 报文里的 `Try again in 22h 47m` 是一个可直接使用的**绝对恢复时刻**，插件把它变成了三件事：
+
+1. **额度状态跨进程持久化。** 冷却状态（key 的 8 位哈希标签 + 模型 + 恢复时刻 + 服务端原始报文）每 500ms 去抖后原子落盘到 `.opencode-free-bridge-cline-quota.json`，**文件里没有任何 key 原文**。于是 DSH 重启后不必再靠"撞一次才知道"——启动第一次请求就已经知道主 key 被限到几点，直接走健康 key。
+2. **全池冷却时快速失败。** 若所有已知 key 在该模型上的最早恢复时刻还在 `failFastMinMs`（默认 5 分钟）之外，插件**不发**那个注定失败的请求，直接回放磁盘上缓存的服务端原始 429 并附 `x-should-retry: false`，让上层立即放弃而不是空等退避。若恢复时刻已在阈值内，则照常尝试（避免因服务端倒计时取整而误判）。
+3. **恢复时间可观测。** 日志会打印绝对恢复时间（如"最早 12:40 恢复"），自检快照里也带 `readyInMin`。
+
+> 缓存成功后会清掉该 key 的冷却记录，所以状态是自纠正的：一旦某个 key 实际已经恢复，它下一次成功就会把磁盘记录抹掉。
 
 凭据仓库方式则是直接在 `~/.dsh/.credentials.yaml` 的 `refs` 下追加（或用 DSH Web 设置里的凭据页）：
 
@@ -114,7 +130,8 @@ refs:
 - 撞限流后按 **`key + 模型`** 维度记录冷却：同一个 Key 在模型 A 上耗尽，不影响它在模型 B 上继续用；重试窗口优先从报文的 `Try again in 22h 47m` 解析，解析不出则用 `clineCooldownMs`。
 - 挑选备用 Key 时用 **LRU + 跳过该模型已冷却者**，避免把压力集中到某一个 Key。
 - 备用 Key 全部失败时区分收尾：**额度耗尽类**（`INFERENCE_CAP_ERROR` / 报文含 `Daily free limit` / 窗口 ≥ 10 分钟）会附加 `x-should-retry: false`，让 pi-ai 立即放弃而不是空等退避；**瞬时限流**则原样返回，交给 pi-ai 按 `retry-after` 自行重试。
-- Key 原文永不写日志，只记录 8 位哈希标签；冷却状态仅存于进程内存，DSH 重启即清空。
+- Key 原文永不写日志，只记录 8 位哈希标签；额度状态落盘时同样只写标签，**文件里不含任何 key**。
+- 冷却状态跨 DSH 重启保留（见下「用报错里的恢复时刻做的三件事」）；缓存成功后自动清除对应记录。
 
 ---
 
@@ -154,7 +171,9 @@ node tools/cline-key-check.mjs    # Cline 多 Key 轮换：本地 mock 服务器
 
 可用 `ZEN_FREE_MODEL=xxx node tools/zen-check.mjs --live` 指定探测用的免费模型。
 
-`cline-key-check.mjs` 覆盖：换 Key 恢复、按模型冷却、LRU 选 Key、三种 Key 来源（config / 环境变量 / 凭据仓库）、单 Key 与瞬时限流下的收尾差异。
+`cline-key-check.mjs` 覆盖：换 Key 恢复、按模型冷却、LRU 选 Key、三种 Key 来源（config / 环境变量 / 凭据仓库）、单 Key 与瞬时限流下的收尾差异、**额度状态跨重启持久化**、**全池冷却快速失败**。
+
+> 自检默认把额度状态写到临时目录，不会碰你真实的 `.opencode-free-bridge-cline-quota.json`。
 
 ---
 

@@ -10,11 +10,19 @@
  */
 
 import { createServer } from 'node:http'
+import { mkdirSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { apply } from '../index.js'
+
+// 额度状态默认落在 DSH home；自检必须隔离到临时目录，绝不碰用户真实状态文件
+const TEST_STATE_DIR = join(tmpdir(), `ofb-cline-state-${process.pid}`)
+mkdirSync(TEST_STATE_DIR, { recursive: true })
+let stateSeq = 0
 
 // ── mock Cline 服务端 ────────────────────────────────────────────────
 const seen = [] // { key, model, headers }
-const LIMITED_PREFIXES = ['k1', 'e1', 'c1'] // 这些 key 一律撞「每日免费额度」上限
+const LIMITED_PREFIXES = ['k1', 'k5', 'e1', 'c1'] // 这些 key 一律撞「每日免费额度」上限
 const TRANSIENT_PREFIXES = ['r1'] // 这些 key 返回瞬时限流（无每日上限字样）
 
 const server = createServer((req, res) => {
@@ -58,7 +66,8 @@ const results = []
 const check = (label, ok, detail = '') => results.push(`${ok ? 'PASS' : 'FAIL'} | ${label}${detail ? ' | ' + detail : ''}`)
 
 let dispose = () => {}
-function mount(config, credentialsStub) {
+let lastCtx
+function mount(config = {}, credentialsStub) {
   dispose()
   const ctx = {
     on: (event, fn) => {
@@ -67,9 +76,16 @@ function mount(config, credentialsStub) {
     logger: { warn: () => {} },
     get: (name) => (name === 'credentials' ? credentialsStub : undefined),
   }
-  apply(ctx, config)
+  const merged = { ...config }
+  if (merged.quotaStatePath === undefined) merged.quotaStatePath = join(TEST_STATE_DIR, `state-${++stateSeq}.json`)
+  apply(ctx, merged)
+  lastCtx = ctx
   return ctx
 }
+
+const attemptsText = (attempts) => attempts.map((a) => a.key).join('→')
+const ctxSnapshot = () => lastCtx?.__opencodeFreeBridge?.clineKeys?.() ?? []
+const ctxFlush = () => lastCtx?.__opencodeFreeBridge?.flushQuotaState?.()
 
 const call = async (key, model = 'deepseek/deepseek-v4.1-flash') => {
   const res = await globalThis.fetch(ENDPOINT, {
@@ -231,7 +247,81 @@ const since = (n) => seen.slice(n)
   check('K3 两次仅鉴权头不同，其余 Cline 指纹头一致', attempts[0].key === 'k1' && attempts[1].key === 'k2' && attempts[0].headers['x-client-type'] === attempts[1].headers['x-client-type'])
 }
 
+// ── L. 额度状态跨进程持久化（用报错里的恢复时刻）─────────────────────
+{
+  const statePath = join(TEST_STATE_DIR, `state-${++stateSeq}.json`)
+  rmSync(statePath, { force: true })
+
+  // 第一个进程：k1 撞上限，记录恢复时刻并落盘
+  mount({ clineKeys: ['k1', 'k2'], clineMatch: match, quotaStatePath: statePath, skipCoolingRequestKey: true, allCoolingFailFast: false })
+  const n = mark()
+  const r1 = await call('k1')
+  const a1 = since(n)
+  ctxFlush()
+  dispose()
+
+  const saved = JSON.parse(readFileSync(statePath, 'utf8'))
+  const flat = Object.values(saved.entries ?? {}).flatMap((m) => Object.values(m))
+  check('L1 首次轮换成功且状态已落盘', r1.status === 200 && a1.length === 2 && flat.length === 1, attemptsText(a1))
+  check('L2 落盘的是恢复时刻而非 key 原文', flat[0]?.readyAt > Date.now() + 60 * 60 * 1000 && !readFileSync(statePath, 'utf8').includes('k1'), `readyInMin=${Math.round((flat[0]?.readyAt - Date.now()) / 60000)}`)
+  check('L3 缓存了服务端原始报错供回放', /INFERENCE_CAP_ERROR/.test(flat[0]?.body ?? ''), (flat[0]?.body ?? '').slice(0, 60))
+
+  // 模拟 DSH 重启：全新实例读同一份状态
+  mount({ clineKeys: ['k1', 'k2'], clineMatch: match, quotaStatePath: statePath, skipCoolingRequestKey: true, allCoolingFailFast: false })
+  const n2 = mark()
+  const r2 = await call('k1')
+  const a2 = since(n2)
+  check(
+    'L4 重启后直接跳过已限 key（不再白撞 429）',
+    r2.status === 200 && a2.length === 1 && a2[0].key === 'k2',
+    attemptsText(a2),
+  )
+  const snap = ctxSnapshot()
+  check('L5 恢复后的冷却状态可读且带恢复时间', snap.some((e) => e.quota?.some((q) => q.readyInMin > 60)), JSON.stringify(snap.find((e) => e.quota?.length)?.quota ?? []))
+  ctxFlush()
+  rmSync(statePath, { force: true })
+}
+
+// ── M. 全池冷却：用恢复时刻直接快速失败，不发注定失败的请求 ──────────
+{
+  const statePath = join(TEST_STATE_DIR, `state-${++stateSeq}.json`)
+  mount({ clineKeys: ['k1', 'k5'], clineMatch: match, quotaStatePath: statePath })
+
+  // k1 与 k5 在 mock 里都返回每日上限；第一次请求会把两个 key 都打上冷却
+  const n = mark()
+  const r1 = await call('k1')
+  since(n)
+  check('M1 两个 key 都撞上限后返回 429', r1.status === 429, String(r1.status))
+
+  const n2 = mark()
+  const r2 = await call('k1')
+  const a2 = since(n2)
+  check('M2 全池冷却时不再发请求（快速失败）', a2.length === 0, `server 收到 ${a2.length} 次`)
+  check('M3 回放的是服务端原始报文', /INFERENCE_CAP_ERROR/.test(r2.text) && /Try again in/.test(r2.text), r2.text.slice(0, 90))
+  check('M4 标记 x-should-retry:false', r2.noRetry === 'false', String(r2.noRetry))
+
+  // 恢复时刻落在阈值之内时不应快速失败，仍要实际请求。
+  // failFastMinMs 的语义：最早恢复时刻距离现在「至少这么远」才快速失败；设 0 表示只要全池冷却就快速失败。
+  const statePath2 = join(TEST_STATE_DIR, `state-${++stateSeq}.json`)
+  mount({ clineKeys: ['k1'], clineMatch: match, quotaStatePath: statePath2, failFastMinMs: 365 * 24 * 3600 * 1000 })
+  await call('k1')
+  const n3 = mark()
+  await call('k1')
+  check('M5 阈值大于实际恢复间隔时不快速失败（照常请求）', since(n3).length === 1, `server 收到 ${since(n3).length} 次`)
+
+  const statePath3 = join(TEST_STATE_DIR, `state-${++stateSeq}.json`)
+  mount({ clineKeys: ['k1'], clineMatch: match, quotaStatePath: statePath3, failFastMinMs: 0 })
+  await call('k1')
+  const n4 = mark()
+  await call('k1')
+  check('M6 failFastMinMs=0 表示只要全池冷却就快速失败', since(n4).length === 0, `server 收到 ${since(n4).length} 次`)
+
+  ctxFlush()
+  rmSync(statePath, { force: true })
+}
+
 dispose()
+rmSync(TEST_STATE_DIR, { recursive: true, force: true })
 server.closeAllConnections?.()
 await new Promise((resolve) => server.close(resolve))
 
