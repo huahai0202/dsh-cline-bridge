@@ -609,8 +609,10 @@ function loadClientBundle() {
     console,
     window: { __ModuleLoader__: { load: (definition) => { captured = definition } } },
     document: {
+      // 有状态的 document 桩：appendChild 真的把元素记下来，getElementById 也能找到它，
+      // 这样「重复加载时覆盖同一个 <style>」才测得到（否则每次都返回 null，永远走新建分支）。
       head: { appendChild: (el) => styleTags.push(el) },
-      getElementById: () => null,
+      getElementById: (id) => styleTags.find((el) => el.id === id) ?? null,
       hidden: false,
       createElement: () => ({ dataset: {}, textContent: '', id: '' }),
     },
@@ -710,7 +712,15 @@ async function renderPanel(payload, { fetchError = null } = {}) {
   const enKeys = Object.keys(dictionaries.find((d) => d[1] === 'en')?.[2] ?? {}).sort()
   check('C6b zh/en 字典键集合完全一致', zhKeys.length > 0 && zhKeys.join('|') === enKeys.join('|'),
     `zh=${zhKeys.length} en=${enKeys.length}${zhKeys.join('|') === enKeys.join('|') ? '' : ' 差异=' + zhKeys.filter((k) => !enKeys.includes(k)).concat(enKeys.filter((k) => !zhKeys.includes(k))).join(',')}`)
-  check('C7 样式只注入一次 <style> 并带 plugin 标记', bundle.styleTags.length === 1 && bundle.styleTags[0].dataset.plugin === MODULE_ID, `tags=${bundle.styleTags.length}`)
+  check('C7 样式只注入一个 <style> 并带 plugin 标记', bundle.styleTags.length === 1 && bundle.styleTags[0].dataset.plugin === MODULE_ID, `tags=${bundle.styleTags.length}`)
+  // 重复加载（模拟客户端 bundle 热重载 / 插件更新后不刷新页面）必须**覆盖**同一个
+  // <style> 的内容，而不是「已存在就跳过」——跳过会让新结构配旧 CSS，布局错乱极难查。
+  const styleTag = bundle.styleTags[0]
+  styleTag.textContent = 'STALE-CSS-FROM-PREVIOUS-VERSION'
+  bundle.load.factory((request) => (request === 'react' ? bundle.mini.React : { Button: 'button' }))
+  check('C7b 重复加载时覆盖同一 <style> 的内容，且不会多插一个',
+    bundle.styleTags.length === 1 && styleTag.textContent !== 'STALE-CSS-FROM-PREVIOUS-VERSION' && styleTag.textContent.includes('_dsh_ofb_table'),
+    `tags=${bundle.styleTags.length} len=${styleTag.textContent.length}`)
 
   check('C8 渲染出标题', text.includes('Cline Key 使用情况'), text.split('\n').slice(0, 3).join(' / '))
   check('C9 渲染出两把 key 的掩码预览', text.includes(MASK_A) && text.includes(MASK_B))
@@ -900,7 +910,14 @@ async function renderPanel(payload, { fetchError = null } = {}) {
     usageAll.includes('cline-free/deepseek-v4.1-flash 16/15/1') && usageAll.includes('z-ai/glm-5.3-flash 3/3/0'),
     usageAll)
   check('I2 明细里两把 key 都有自己的行', usageOf(allView, '761f9875').includes('z-ai/glm-5.3-flash 21/21/0'), usageOf(allView, '761f9875'))
-  check('I3 明细卡带「发送/成功/限流」表头说明', textOf(usageCardOf(allView)).join(' ').includes('发送/成功/限流'), textOf(usageCardOf(allView)).join(' ').slice(0, 80))
+  const usageHeadOf = (node) => findNode(usageCardOf(node), (n) => String(n.props?.className ?? '') === '_dsh_ofb_usage_head')
+  const usageHeadSpans = usageHeadOf(allView)?.children ?? []
+  check('I3 明细卡表头用极短标签 + title 承载完整含义（表头不换行、与条左端对齐）',
+    usageHeadSpans.map((s) => textOf(s).join('')).join(' | ') === '模型 | 请求 | Token | 最近使用' &&
+      usageHeadSpans[1]?.props?.title === '发送 / 成功 / 撞限流' &&
+      usageHeadSpans[2]?.props?.title === '输入 / 输出 token' &&
+      String(usageHeadSpans[2]?.props?.className ?? '') === '_dsh_ofb_tokencell',
+    usageHeadSpans.map((s) => textOf(s).join('')).join(' | '))
 
   const usageGlm = usageOf(tree, 'db694bbf')
   check('I4 筛到 glm 时明细只剩 glm 那一行', usageGlm.includes('z-ai/glm-5.3-flash 3/3/0') && !usageGlm.includes('deepseek'), usageGlm)
