@@ -1,6 +1,6 @@
 export const name = 'opencode-free-bridge'
 
-const PLUGIN_VERSION = '1.6.1'
+const PLUGIN_VERSION = '1.7.0'
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -348,7 +348,7 @@ function readCredentialRefsFromFile(path, wantedRefs) {
   return out
 }
 
-/** key 池：按模型维度记录冷却时间，选 key 时用 LRU 避开刚用过的那个。
+/** key 池：按模型维度记录冷却时间，选 key 时**粘性优先**——先把一把用到限流再换下一把。
  *  冷却状态会经由 quotaStore 落到磁盘，DSH 重启后仍知道「哪个 key 在哪个模型上被限到几点」。
  *  每把 key 另带来源标签与本次运行的用量计数，供设置面板展示（这些只留在内存里）。 */
 function createKeyPool(quotaStore, diag, log) {
@@ -432,13 +432,22 @@ function createKeyPool(quotaStore, diag, log) {
       quotaStore?.setDiagnostics?.(diag)
       log?.(`Cline key 池：${entries.size} 个 key（来源：config、启动环境变量、.credentials.yaml）`)
     },
+    /** 挑一把备用 key：**粘性**优先，即「先把一把用到限流，再换下一把」。
+     *
+     *  取的是「最近还在用的那把」（MRU），而不是轮换摊派（LRU）。原因是 Cline 的免费
+     *  额度按 `key + 模型` 每天重置：摊开用会让池子里所有 key 几乎同时逼近上限、
+     *  一起失去后备；压着一把烧完再换，池子里才始终留着没动过的额度。
+     *  冷却是硬条件——当前模型上已冷却的 key 一律跳过，所以「用到限流」时自然会换人。
+     *
+     *  lastUsedAt 的取值为 0 表示这把 key 本次运行还没碰过；MRU 会优先选已经用过
+     *  （即已经烧掉一部分额度）的那把，而不是去开一把全新的，正是这个语义要的效果。 */
     pick(model) {
       const now = Date.now()
       let best
       for (const entry of entries.values()) {
         const until = entry.cooling.get(model)
         if (until !== undefined && until > now) continue
-        if (!best || entry.lastUsedAt < best.lastUsedAt) best = entry
+        if (!best || entry.lastUsedAt > best.lastUsedAt) best = entry
       }
       return best
     },

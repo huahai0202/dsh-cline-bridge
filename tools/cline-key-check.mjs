@@ -6,7 +6,7 @@
  * 起一个本地 mock 服务器复刻 Cline 的限流报文：
  *   429 {"code":"INFERENCE_CAP_ERROR","message":"Error 429: Daily free limit reached
  *        on model <model>. Try again in 22h 47m"}
- * 然后验证插件的四种 key 来源、按模型冷却、LRU 选 key，以及整池耗尽时的收尾行为。
+ * 然后验证插件的四种 key 来源、按模型冷却、粘性选 key（先烧完一把再换），以及整池耗尽时的收尾行为。
  */
 
 import { createServer } from 'node:http'
@@ -122,6 +122,7 @@ const isolateMismatch = () => {
   throw new Error('cannot get property "credentials" without provide (isolate)')
 }
 const ctxSnapshot = () => lastCtx?.__opencodeFreeBridge?.clineKeys?.() ?? []
+const ctxStatus = (options) => lastCtx?.__opencodeFreeBridge?.status?.(options) ?? null
 const ctxFlush = () => lastCtx?.__opencodeFreeBridge?.flushQuotaState?.()
 
 const call = async (key, model = 'deepseek/deepseek-v4.1-flash') => {
@@ -245,6 +246,57 @@ const since = (n) => seen.slice(n)
   const r2 = await call('k1')
   const a2 = since(n2)
   check('J2 开启后冷却中的 key 不再被先撞（一次成功）', r2.status === 200 && a2.length === 1 && a2[0].key === 'k2', a2.map((a) => a.key).join('→'))
+}
+
+// ─ O. 粘性选 key：先把一把用到限流，再换下一把（不把压力摊到所有 key）─────
+// 场景就是用户实际遇到的：主 key 已撞每日上限，池里还有几把健康 key。
+// 期望行为是「一直用同一把备用 key，直到它也撞上限才换下一把」，
+// 而不是每个请求轮换一把（那会让所有 key 几乎同时逼近上限、一起失去后备）。
+{
+  mount({ clineKeys: ['z1', 'z2', 'z3'], clineMatch: match, skipCoolingRequestKey: true })
+
+  // 第 1 个请求：主 key k1 撞上限 → 换到池内第一把
+  const n0 = mark()
+  const r1 = await call('k1')
+  const first = since(n0)
+  check('O1 首次轮换落到一把备用 key 上并成功', r1.status === 200 && first.length === 2 && first[1].key === 'z1', first.map((a) => a.key).join('→'))
+
+  // 之后连续 4 个请求：应当全部复用同一把（z1），不能轮换到 z2/z3
+  const n1 = mark()
+  for (let i = 0; i < 4; i++) await call('k1')
+  const followUp = since(n1)
+  const usedKeys = [...new Set(followUp.map((a) => a.key))]
+  check('O2 后续请求全部复用同一把备用 key（粘性）', usedKeys.length === 1 && usedKeys[0] === 'z1', `4 个请求用到 ${usedKeys.length} 把：${usedKeys.join(',')}`)
+  check('O3 粘性期间没有碰过池里其它 key', !followUp.some((a) => a.key === 'z2' || a.key === 'z3'), followUp.map((a) => a.key).join('→'))
+
+  // 面板口径也应如此：z1 多次发送，z2/z3 一次都没发过。
+  // 注意：短测试 key 的掩码预览会退化成同一个「…」，所以这里按 8 位标签取，而不是掩码。
+  const labelOf = (key) => {
+    let h = 0x811c9dc5
+    for (let i = 0; i < key.length; i++) {
+      h ^= key.charCodeAt(i)
+      h = Math.imul(h, 0x01000193) >>> 0
+    }
+    return h.toString(16).padStart(8, '0')
+  }
+  const keys = ctxStatus().keys
+  const sentOf = (key) => keys.find((k) => k.label === labelOf(key))?.stats.sent ?? -1
+  const coolingOf = (key) => keys.find((k) => k.label === labelOf(key))?.cooling ?? []
+  check('O4 面板统计里被粘住的那把计数最多', sentOf('z1') === 5 && sentOf('z2') === 0 && sentOf('z3') === 0,
+    `z1=${sentOf('z1')} z2=${sentOf('z2')} z3=${sentOf('z3')}`)
+  check('O5 被粘住的 key 仍然健康（没有冷却）', Array.isArray(coolingOf('z1')) && coolingOf('z1').length === 0)
+  check('O6 主 key 只在首个请求撞过一次，之后不再白撞', sentOf('k1') === 1, `k1=${sentOf('k1')}`)
+
+  // 备用 key 自己也撞上限时才该换人：k1、k5 都限流，z2 健康
+  mount({ clineKeys: ['k1', 'k5', 'z2'], clineMatch: match, skipCoolingRequestKey: true })
+  const n2 = mark()
+  await call('k1') // k1 限流 → 换到 k5（也限流）→ 换到 z2 成功
+  const recovery = since(n2)
+  check('O7 连续撞限流时会依次换到下一把，直到找到健康 key', recovery.length === 3 && recovery[2].key === 'z2', recovery.map((a) => a.key).join('→'))
+  const n3 = mark()
+  await call('k1')
+  const sticky2 = since(n3)
+  check('O8 换到健康 key 后同样粘住它（不再回到已限流的 k5）', sticky2.length === 1 && sticky2[0].key === 'z2', sticky2.map((a) => a.key).join('→'))
 }
 
 // ── K. 轮换重发是否影响会话内容：请求体必须逐字节相同 ────────────────

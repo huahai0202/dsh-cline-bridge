@@ -137,7 +137,7 @@ refs:
 - **首发送默认始终使用 DSH 里配置的那个 Key**，轮换只作为兜底；即使该 Key 已被本地记为「冷却中」也仍会先试一次（本地冷却只是推测，服务端额度可能已重置，先试一次更可预测）。
   - 代价是：当主 Key 在某模型上被限了一整天时，每一轮都会先白撞一次 429 再换 Key。若想省掉这次白撞，把 `skipCoolingRequestKey: true` 打开，首发送就会直接改用健康 Key（实测数据见下）。
 - 撞限流后按 **`key + 模型`** 维度记录冷却：同一个 Key 在模型 A 上耗尽，不影响它在模型 B 上继续用；重试窗口优先从报文的 `Try again in 22h 47m` 解析，解析不出则用 `clineCooldownMs`。
-- 挑选备用 Key 时用 **LRU + 跳过该模型已冷却者**，避免把压力集中到某一个 Key。
+- 挑选备用 Key 时**粘性优先**：一直用同一把（最近在用的那把），**直到它也撞上限才换下一把**，并始终跳过该模型上已冷却者。原因是 Cline 的免费额度按 `key + 模型` 每日重置：摊开轮换会让池内所有 Key 几乎同时逼近上限、一起失去后备；压着一把烧完再换，池子里才始终留着没动过的额度。面板上会看到某一把的「发送」持续增长、其余保持 0，这是预期形态。
 - 备用 Key 全部失败时区分收尾：**额度耗尽类**（`INFERENCE_CAP_ERROR` / 报文含 `Daily free limit` / 窗口 ≥ 10 分钟）会附加 `x-should-retry: false`，让 pi-ai 立即放弃而不是空等退避；**瞬时限流**则原样返回，交给 pi-ai 按 `retry-after` 自行重试。
 - Key 原文永不写日志，只记录 8 位哈希标签；额度状态落盘时同样只写标签，**文件里不含任何 key**。设置页面板是唯一的例外通道：它经同源只读路由展示每个 Key 的**首尾各 4 位掩码**（例如 `sk-a…9f2c`），方便你认出是哪一把；可用 `maskKeyPreview: false` 彻底关闭。
 - 冷却状态跨 DSH 重启保留（见下「用报错里的恢复时刻做的三件事」）；缓存成功后自动清除对应记录。
@@ -191,7 +191,14 @@ dsh plugin --profile web add github:huahai0202/opencode-free-bridge
 
 ## 🧪 自检
 
-Zen 的放行规则由服务端随时可能调整，更新插件后建议跑一遍自检：
+Zen 的放行规则由服务端随时可能调整，更新插件后建议跑一遍自检。**平时只需要这一条命令**（它依次跑完全部分项，最后打印汇总表）：
+
+```bash
+node tools/self-check.mjs            # 一键跑完全部（zen + cline-key + cline-panel）
+node tools/self-check.mjs cline-key  # 只跑名字匹配的分项
+```
+
+分项文件各自也能单独运行（定位失败时更顺手）：
 
 ```bash
 node tools/zen-check.mjs          # 离线断言：头部形状、会话稳定性、渠道隔离、dispose 还原
@@ -202,7 +209,7 @@ node tools/cline-panel-check.mjs  # 设置页面板：只读路由契约 + 浏�
 
 可用 `ZEN_FREE_MODEL=xxx node tools/zen-check.mjs --live` 指定探测用的免费模型。
 
-`cline-key-check.mjs` 覆盖：换 Key 恢复、按模型冷却、LRU 选 Key、三种 Key 来源（config / 环境变量 / 凭据仓库）、单 Key 与瞬时限流下的收尾差异、**额度状态跨重启持久化**、**全池冷却快速失败**。
+`cline-key-check.mjs` 覆盖：换 Key 恢复、按模型冷却、**粘性选 Key（先烧完一把再换下一把）**、三种 Key 来源（config / 环境变量 / 凭据仓库）、单 Key 与瞬时限流下的收尾差异、**额度状态跨重启持久化**、**全池冷却快速失败**。
 
 `cline-panel-check.mjs` 覆盖：路由只在 `ctx.inject(['webServer'])` 里注册（不门控主链路）、同源校验与 `GET`/`HEAD` 限制、载荷**不含任何 Key 原文**且只带首尾掩码、`maskKeyPreview: false` 时连片段也不下发、**磁盘状态文件里连掩码都没有**、用量计数与来源标签正确；浏览器半边则在 `node:vm` 沙箱里用迷你 React 真正渲染一遍（有数据 / 空池 / 请求失败三条路径），断言渲染树里不出现 Key 原文。
 

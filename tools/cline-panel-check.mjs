@@ -23,6 +23,10 @@ const TEST_STATE_DIR = join(tmpdir(), `ofb-panel-state-${process.pid}`)
 mkdirSync(TEST_STATE_DIR, { recursive: true })
 let stateSeq = 0
 
+// 版本号只从 package.json 读，避免每发一次版就要来改一次断言
+const MANIFEST = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+const PLUGIN_VERSION = MANIFEST.version
+
 const results = []
 const check = (label, ok, detail = '') => results.push(`${ok ? 'PASS' : 'FAIL'} | ${label}${detail ? ' | ' + detail : ''}`)
 
@@ -407,7 +411,7 @@ async function renderPanel(payload, { fetchError = null } = {}) {
 {
   const payload = {
     plugin: MODULE_ID,
-    version: '1.6.1',
+    version: PLUGIN_VERSION,
     updatedAt: Date.now(),
     settings: {
       clineMatch: 'cline.bot', clineCooldownMs: 900000, failFastMinMs: 300000,
@@ -454,7 +458,7 @@ async function renderPanel(payload, { fetchError = null } = {}) {
   check('C13 渲染出状态药丸（可用/冷却中）', text.includes('冷却中') && text.includes('可用'))
   check('C14 表格里没有「来源」这一列', !table_headers(tree).some((h) => /来源|source/i.test(h)) && !text.includes('.credentials.yaml: CLINE_API_KEY_2') && !text.includes('DSH 请求头'), table_headers(tree).join(' | '))
   check('C15 渲染出用量计数 发送/成功/限流', text.includes('12 / 11 / 1') && text.includes('4 / 4 / 0'))
-  check('C16 渲染出统计卡数值', text.includes('61') && text.includes('1.6.1'))
+  check('C16 渲染出统计卡数值', text.includes('61') && text.includes(PLUGIN_VERSION), PLUGIN_VERSION)
   check('C17 渲染出最近决策', text.includes('最近决策') && text.includes('rotated a→b'))
   check('C18 渲染出运行参数', text.includes('运行参数') && text.includes('15分钟'))
   check('C19 面板里没有掩码说明文字', !text.includes('首尾各 4 位') && !text.includes('掩码预览'))
@@ -472,7 +476,7 @@ async function renderPanel(payload, { fetchError = null } = {}) {
 {
   // 空池：应给出空态而不是空白
   const empty = await renderPanel({
-    plugin: MODULE_ID, version: '1.6.1', updatedAt: Date.now(),
+    plugin: MODULE_ID, version: PLUGIN_VERSION, updatedAt: Date.now(),
     settings: { maskKeyPreview: true }, totals: { poolSize: 0, readyKeys: 0, coolingKeys: 0 }, extras: {}, keys: [], recent: [],
   })
   const emptyText = textOf(empty.tree).join('\n')
@@ -503,7 +507,7 @@ async function renderPanel(payload, { fetchError = null } = {}) {
 // 条目名三者对齐时才会被 dsh-client-modules 打包投放。这一组断言就是防止
 // 「面板代码写好了但根本没被装载」这种静默失败。
 {
-  const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+  const manifest = MANIFEST
   const clientRel = manifest.exports?.['./client']
   const clientAbs = new URL(`../${String(clientRel).replace(/^\.\//, '')}`, import.meta.url)
 
