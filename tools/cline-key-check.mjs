@@ -197,22 +197,19 @@ const since = (n) => seen.slice(n)
   delete process.env.CLINE_API_KEYS
 }
 
-// ── G. 来源三：DSH 凭据仓库（ctx.credentials.resolve）──────────────
+// ── G. 来源三：.credentials.yaml，且 ref 名可配置（未声明的 ref 必须被忽略）──
 {
-  const resolved = []
-  const stub = {
-    resolve: async (ref) => {
-      resolved.push(ref)
-      return ref === 'CLINE_API_KEY_2' ? { value: 'c2', source: 'file' } : undefined
-    },
-  }
-  mount({ clineMatch: match, clineKeyRefs: ['CLINE_API_KEY_2'] }, stub)
-  await new Promise((r) => setTimeout(r, 20)) // 等 ensureExtras 落地
+  const credPath = join(TEST_STATE_DIR, `credentials-refs-${++stateSeq}.yaml`)
+  writeFileSync(
+    credPath,
+    ['version: 1', 'refs:', '  MY_CLINE_KEY: "g2"', '  CLINE_API_KEY_2: "must-be-ignored"'].join('\n'),
+  )
+  mount({ clineKeys: ['k1'], clineMatch: match, credentialsFile: credPath, clineKeyRefs: ['MY_CLINE_KEY'] })
   const n = mark()
-  const r = await call('c1')
+  const r = await call('k1')
   const attempts = since(n)
-  check('G1 凭据仓库的 key 参与轮换', r.status === 200 && attempts.length === 2 && attempts[1].key === 'c2', attempts.map((a) => a.key).join('→'))
-  check('G2 按配置的 ref 名解析', resolved.includes('CLINE_API_KEY_2'), resolved.join(','))
+  check('G1 自定义 ref 名被采纳并完成轮换', r.status === 200 && attempts.length === 2 && attempts[1].key === 'g2', attemptsText(attempts))
+  check('G2 未列在 clineKeyRefs 中的 ref 被忽略', !attempts.some((a) => a.key === 'must-be-ignored'), attemptsText(attempts))
 }
 
 // ── H. 其它渠道零副作用 ─────────────────────────────────────────────
@@ -357,57 +354,32 @@ const since = (n) => seen.slice(n)
   rmSync(statePath, { force: true })
 }
 
-// ── N. 额外 key 来源的健壮性 ─────────────────────────────────────────
+// ── N. 额外 key 来源的健壮性（不再使用 DSH 凭据服务，见 index.js 顶部说明）──
 {
-  // N1：凭据服务取不到（真实情形是 ctx.get 抛 isolate 不匹配）时，直接读 .credentials.yaml 兜底
+  // N1：ctx.get 拿不到凭据服务时，直接读 .credentials.yaml
   const credPath = join(TEST_STATE_DIR, `credentials-${++stateSeq}.yaml`)
   writeFileSync(
     credPath,
     ['version: 1', 'refs:', '  CLINE_API_KEY: "p1"', '  CLINE_API_KEY_2: "n2"', 'records:', '  x:', '    kind: grant'].join('\n'),
   )
-  mount({ clineKeys: [], clineMatch: match, credentialsFile: credPath }, isolateMismatch)
+  mount({ clineKeys: [], clineMatch: match, credentialsFile: credPath })
   const n = mark()
   const r = await call('k1')
   const a = since(n)
-  check('N1 凭据服务不可用时仍能从 .credentials.yaml 取到额外 key', r.status === 200 && a.length === 2 && a[1].key === 'n2', attemptsText(a))
+  check('N1 从 .credentials.yaml 取到额外 key 并完成轮换', r.status === 200 && a.length === 2 && a[1].key === 'n2', attemptsText(a))
 
-  // N2：服务“稍后才注册”时不能被永久上锁（第一次 get 必须真的取不到服务）
-  let serviceReady = false
-  const lateStub = { resolve: async (ref) => (ref === 'CLINE_API_KEY_9' ? { value: 'z9' } : undefined) }
-  mount({ clineKeys: ['k1'], clineMatch: match, readCredentialsFile: false }, () => (serviceReady ? lateStub : undefined))
+  // N2：文件稍后才出现（例如首次读取时 DSH 还没写盘）不能被永久上锁
+  const latePath = join(TEST_STATE_DIR, `credentials-late-${++stateSeq}.yaml`)
+  mount({ clineKeys: ['k1'], clineMatch: match, credentialsFile: latePath })
   const r0 = await call('k1')
-  check('N2a 服务未就绪时先按单 key 处理', r0.status === 429, String(r0.status))
+  check('N2a 文件不存在时先按单 key 处理', r0.status === 429, String(r0.status))
 
-  serviceReady = true
+  writeFileSync(latePath, ['version: 1', 'refs:', '  CLINE_API_KEY_9: "z9"'].join('\n'))
   await new Promise((r) => setTimeout(r, 2200)) // 越过 2s 重试节流
   const n2 = mark()
   const r2 = await call('k1')
   const a2 = since(n2)
-  check('N2b 服务就绪后额外 key 自动补入池（无永久上锁）', r2.status === 200 && a2.some((x) => x.key === 'z9'), attemptsText(a2))
-}
-
-// ── O. ctx.inject 通路（线上真实走法）───────────────────────────────
-{
-  const statePath = join(TEST_STATE_DIR, `state-${++stateSeq}.json`)
-  const service = { resolve: async (ref) => (ref === 'CLINE_API_KEY_2' ? { value: 'inj2' } : undefined) }
-  mount({ clineKeys: ['k1'], clineMatch: match, quotaStatePath: statePath, readCredentialsFile: false }, isolateMismatch, service)
-  await new Promise((r) => setTimeout(r, 30)) // 等 inject 回调落地
-  const n = mark()
-  const r = await call('k1')
-  const a = since(n)
-  check('O1 ctx.get 抛错时改由 ctx.inject 提供的服务取额外 key', r.status === 200 && a.length === 2 && a[1].key === 'inj2', attemptsText(a))
-
-  ctxFlush()
-  const d1 = JSON.parse(readFileSync(statePath, 'utf8')).diagnostics
-  check('O2 诊断标明走的是 inject 路径', d1.credentialsVia === 'inject' && d1.credentialsFound === true, JSON.stringify({ via: d1.credentialsVia, found: d1.credentialsFound }))
-
-  // O3：只有 get 通路且它会抛错时，错误原因必须被记下来（而不是被当成“服务不存在”）
-  const statePath2 = join(TEST_STATE_DIR, `state-${++stateSeq}.json`)
-  mount({ clineKeys: ['k1'], clineMatch: match, quotaStatePath: statePath2, readCredentialsFile: false }, isolateMismatch)
-  await call('k1')
-  ctxFlush()
-  const d2 = JSON.parse(readFileSync(statePath2, 'utf8')).diagnostics
-  check('O3 ctx.get 抛错的原因被记入诊断', /isolate/.test(d2.credentialsProbeError ?? ''), (d2.credentialsProbeError ?? '').slice(0, 60))
+  check('N2b 文件稍后出现后额外 key 自动补入池（无永久上锁）', r2.status === 200 && a2.some((x) => x.key === 'z9'), attemptsText(a2))
 }
 
 dispose()
