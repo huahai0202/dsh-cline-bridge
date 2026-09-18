@@ -917,6 +917,76 @@ const since = (n) => seen.slice(n)
     `${u5.status} ${attemptsText(u5attempts)} limited=${u5row?.models?.['deepseek/deepseek-v4.1-flash']?.limited}`)
 }
 
+// ── V. 面板选定的「使用中」Key：首发送优先用它，但不接管轮换 ──────────────
+// 选定只回答「从哪把开始」：撞 429 后照常换 key 重发（轮换靠「本次试过的 key」集合，
+// 与冷却记录无关）。选定状态与冷却、统计共用同一个状态文件，且只有 8 位标签、没有原文。
+{
+  const pickedKey = 'v1-selected-key-aaaa'
+  const backupKey = 'v2-backup-key-bbbb'
+  const requestKey = 'v9-request-key-cccc'
+  const limitedKey = 'k1-selected-limited-aaaa' // 前缀 k1 命中 mock 的「每日上限」名单
+  const pickedLabel = keyTag(pickedKey)
+  const limitedLabel = keyTag(limitedKey)
+
+  // V1/V2：选定后首发送改用这把（覆盖请求自带的 key），面板载荷也带上它
+  const ctx = mount({ clineKeys: [pickedKey, backupKey], clineMatch: match })
+  const accepted = ctx.__dshClineBridge.setSelection(pickedLabel)
+  check('V1 选定池内已知标签被接受，且面板载荷带上它',
+    accepted === true && ctxStatus().selection?.label === pickedLabel,
+    `accepted=${accepted} selection=${JSON.stringify(ctxStatus().selection)}`)
+  const v1n = mark()
+  const v1 = await call(requestKey)
+  const v1attempts = since(v1n)
+  check('V2 首发送改用选定的 key（请求自带的 key 不再被使用）',
+    v1.status === 200 && v1attempts.length === 1 && v1attempts[0].key === pickedKey,
+    `${v1.status} ${attemptsText(v1attempts)}`)
+
+  // V3：只有形状合法还不够——池里没有的标签一律拒绝，且不改动已有选定
+  const foreign = ctx.__dshClineBridge.setSelection('deadbeef')
+  const malformed = ctx.__dshClineBridge.setSelection('not-a-label')
+  check('V3 池内不存在的标签与形状非法的标签都被拒绝（不写入任何状态）',
+    foreign === false && malformed === false && ctxStatus().selection?.label === pickedLabel,
+    `foreign=${foreign} malformed=${malformed} selection=${JSON.stringify(ctxStatus().selection)}`)
+
+  // V4：选定的 key 撞 429 时照常换下一把——选定只决定起点，不接管轮换
+  mount({ clineKeys: [limitedKey, backupKey], clineMatch: match })
+  lastCtx.__dshClineBridge.setSelection(limitedLabel)
+  const v4n = mark()
+  const v4 = await call(requestKey)
+  const v4attempts = since(v4n)
+  check('V4 选定的 key 撞 429 后照常换下一把重发（选定不接管轮换）',
+    v4.status === 200 && v4attempts.length === 2 && v4attempts[0].key === limitedKey && v4attempts[1].key === backupKey,
+    `${v4.status} ${attemptsText(v4attempts)}`)
+
+  // V5：取消选定（空标签）→ 首发送回到请求自带的 key
+  mount({ clineKeys: [pickedKey, backupKey], clineMatch: match })
+  lastCtx.__dshClineBridge.setSelection(pickedLabel)
+  const cleared = lastCtx.__dshClineBridge.setSelection('')
+  const v5n = mark()
+  const v5 = await call(requestKey)
+  const v5attempts = since(v5n)
+  check('V5 取消选定（空标签）后首发送回到请求自带的 key',
+    cleared === true && ctxStatus().selection === null && v5attempts.length === 1 && v5attempts[0].key === requestKey,
+    `${attemptsText(v5attempts)} selection=${JSON.stringify(ctxStatus().selection)}`)
+
+  // V6/V7：选定跨重启保留 + 落盘只有标签（与冷却、统计同一个状态文件）
+  const sharedPath = join(TEST_STATE_DIR, `select-state-${++stateSeq}.json`)
+  const first = mount({ clineKeys: [pickedKey, backupKey], clineMatch: match, quotaStatePath: sharedPath })
+  first.__dshClineBridge.setSelection(pickedLabel)
+  first.__dshClineBridge.flushQuotaState()
+  const second = mount({ clineKeys: [pickedKey, backupKey], clineMatch: match, quotaStatePath: sharedPath })
+  const v6n = mark()
+  const v6 = await call(requestKey)
+  const v6attempts = since(v6n)
+  check('V6 选定跨重启保留（新实例读同一状态文件后仍从选定那把开始）',
+    second.__dshClineBridge.selectedLabel() === pickedLabel && v6attempts.length === 1 && v6attempts[0].key === pickedKey,
+    `label=${second.__dshClineBridge.selectedLabel()} ${attemptsText(v6attempts)}`)
+  const stateText = readFileSync(sharedPath, 'utf8')
+  check('V7 状态文件里只有 8 位标签，没有 key 原文',
+    stateText.includes(pickedLabel) && !stateText.includes(pickedKey) && !stateText.includes(backupKey),
+    `hasLabel=${stateText.includes(pickedLabel)} hasRaw=${stateText.includes(pickedKey)}`)
+}
+
 dispose()
 rmSync(TEST_STATE_DIR, { recursive: true, force: true })
 server.closeAllConnections?.()

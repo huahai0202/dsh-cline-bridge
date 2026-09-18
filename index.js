@@ -310,11 +310,19 @@ export function apply(ctx, config) {
         }
       }
 
-      // 首发送始终沿用请求自带的 key（即 DSH 里配置的那个），轮换只作为撞限流后的兜底。
+      // 首发送默认沿用请求自带的 key（即 DSH 里配置的那个），轮换只作为撞限流后的兜底。
+      // 面板里选定了「使用中」的 key 时它优先：首发送改用选定那把（请求没带 key 时也由它补上）。
+      // 选定只决定「从哪把开始」——撞限流后的轮换、快速失败等一概不变；选定的 key
+      // 已不在池中（凭据被删 / ref 改过）时 selected() 返回 undefined，静默退回原行为。
+      let currentKey = requestKey
+      const selected = pool.selected()
+      if (selected) {
+        currentKey = selected.key
+        writeKeyTo(headers, currentKey, authTarget)
+      }
       // 即使该 key 已被本地记为「冷却中」也仍然先试一次：本地冷却只是推测，
       // 服务端额度可能已重置，先试一次比直接换 key 更可预测。
       // 若确实希望省掉这次白撞（例如主 key 已被限 22 小时），把 skipCoolingRequestKey 打开。
-      let currentKey = requestKey
       if (skipCoolingRequestKey && currentKey && pool.isCooling(currentKey, model)) {
         const healthy = pool.pick(model)
         if (healthy && healthy.key !== currentKey) {
@@ -464,6 +472,7 @@ export function apply(ctx, config) {
   // 除此之外它只写 refs 段里名单内的 ref，且回包只带 ref / 哈希标签 / 掩码——没有 Key 原文。
   const importPath = '/dsh-cline-bridge/keys/import'
   const resetPath = '/dsh-cline-bridge/keys/stats/reset'
+  const selectPath = '/dsh-cline-bridge/keys/select'
 
   /** ref → 当前值：凭据服务优先（反映 DSH 眼里的真实值），服务缺席或未就绪时直读文件。 */
   const readClineKeyRefs = async () => {
@@ -597,6 +606,35 @@ export function apply(ctx, config) {
     })
   }
 
+  /** 选定 / 取消「使用中」的 Key：只认池内已知的 8 位标签，空值＝取消（幂等）。
+   *  它不改凭据——只决定插件发请求时从哪把开始（撞限流后照常轮换），所以闸门与
+   *  另两条写路由完全一致，回包也只有标签，没有任何 Key 材料。 */
+  const handleKeySelect = async (req, res) => {
+    if (!passWriteGuard(req, res)) return
+    if (!isJsonRequest(req)) return sendJson(res, 415, { error: 'content-type must be application/json' })
+    let payload
+    try {
+      payload = await readJsonBody(req, 1024)
+    } catch (error) {
+      const tooLarge = error?.code === 'PAYLOAD_TOO_LARGE'
+      return sendJson(res, tooLarge ? 413 : 400, { error: String(error?.message ?? error) })
+    }
+    const raw = payload?.label
+    // 类型不对时明确报错，而不是静默当成「取消」——面板永远发字符串，这里是防手改请求
+    if (raw !== undefined && raw !== null && typeof raw !== 'string') {
+      return sendJson(res, 400, { error: 'label must be a string' })
+    }
+    const label = typeof raw === 'string' ? raw.trim() : ''
+    if (!pool.setSelection(label)) return sendJson(res, 400, { error: 'unknown key label' })
+    const applied = pool.selected()
+    log(applied ? `已选定使用 key ${applied.label}` : '已取消选定的 key')
+    return sendJson(res, 200, {
+      ok: true,
+      selection: applied ? { label: applied.label } : null,
+      poolSize: pool.size,
+    })
+  }
+
   // ───────────────────── 设置面板：只读状态路由 ─────────────────────
   // 面板本体是浏览器半边（lib/client.js，经 package.json 的 dsh.client 声明由
   // dsh-client-modules 打包投放）；它需要主机端把 key 池状态交出来，这里用一条
@@ -681,6 +719,20 @@ export function apply(ctx, config) {
           }),
         'dsh-cline-bridge: cline stats reset route',
       )
+      // 选定「使用中」的 Key：与另两条写路由同一个 webServer 门（headless/acp 下三条一起缺席）
+      webCtx.effect(
+        () =>
+          webCtx.webServer.register({
+            kind: 'exact',
+            path: selectPath,
+            handler: (req, res) => {
+              handleKeySelect(req, res).catch((error) => {
+                if (!res.headersSent) sendJson(res, 500, { error: String(error?.message ?? error) })
+              })
+            },
+          }),
+        'dsh-cline-bridge: cline key select route',
+      )
     })
   }
 
@@ -690,6 +742,9 @@ export function apply(ctx, config) {
     /** 累计计数与统计起点（自检用来断言「跨重启没丢」）。 */
     statsTotals: () => quotaStore.totals(),
     resetStats: () => pool.resetStats(),
+    /** 面板选定的「使用中」Key（自检用；只有 8 位标签，不含 key 原文）。 */
+    selectedLabel: () => pool.selected()?.label ?? '',
+    setSelection: (label) => pool.setSelection(label),
     status: (options) => statusRoute.build(options),
     routePath: statusRoute.path,
     // 强制立刻重扫一次额外 key 来源（自检用；运行期新增 ref 的正式路径是 5 分钟自动复扫）

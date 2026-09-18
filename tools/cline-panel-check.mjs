@@ -18,6 +18,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createContext, runInContext } from 'node:vm'
 import { apply } from '../index.js'
+import { PLUGIN_VERSION as HOST_VERSION } from '../lib/host/defaults.js'
 import { readCredentialRefsFromFile, writeCredentialRefToFile } from '../lib/host/credentials.js'
 import { parseKeyInput } from '../lib/host/key-import.js'
 
@@ -207,6 +208,7 @@ function mount(config = {}) {
 const READ_PATH = '/dsh-cline-bridge/keys'
 const IMPORT_PATH = '/dsh-cline-bridge/keys/import'
 const RESET_PATH = '/dsh-cline-bridge/keys/stats/reset'
+const SELECT_PATH = '/dsh-cline-bridge/keys/select'
 
 /** 假请求：带正文的那几条会按真实流式形状分两片投递 data、再 end，
  *  这样「带上限的正文读取」真的走到累加与上限分支。 */
@@ -288,12 +290,14 @@ const ctxStatusOf = (options) => lastCtx?.__dshClineBridge?.status?.(options)
 // ───────────────────────── 1. 路由注册与契约 ─────────────────────────
 {
   mount({ skipCoolingRequestKey: true })
-  check('H1 只在 ctx.inject([\'webServer\']) 里注册路由（不门控整个插件）', routes.length === 3, `routes=${routes.length}`)
+  check('H1 只在 ctx.inject([\'webServer\']) 里注册路由（不门控整个插件）', routes.length === 4, `routes=${routes.length}`)
   const readRoute = routes.find((row) => row.path === READ_PATH)
   const importRoute = routes.find((row) => row.path === IMPORT_PATH)
   const resetRoute = routes.find((row) => row.path === RESET_PATH)
-  check('H2 只读 / 导入 / 重置统计三条路由都是 exact 匹配且路径固定',
-    Boolean(readRoute && importRoute && resetRoute) && [readRoute, importRoute, resetRoute].every((row) => row.kind === 'exact'),
+  const selectRoute = routes.find((row) => row.path === SELECT_PATH)
+  check('H2 只读 / 导入 / 重置统计 / 选定四条路由都是 exact 匹配且路径固定',
+    Boolean(readRoute && importRoute && resetRoute && selectRoute) &&
+      [readRoute, importRoute, resetRoute, selectRoute].every((row) => row.kind === 'exact'),
     routes.map((row) => `${row.kind} ${row.path}`).join(' + '))
 
   const ok = await callRoute()
@@ -753,6 +757,56 @@ const ctxStatusOf = (options) => lastCtx?.__dshClineBridge?.status?.(options)
     parsed.values.join('|'))
 }
 
+// ───────────────── 4f-2. 选定「使用中」的 Key（第三条写路由）─────────────────
+// 语义：选定只决定「首发送从哪把开始」——不改凭据、不写 key 原文、撞限流照常轮换。
+// 这一组钉：写路由的三道闸、标签校验、取消是幂等清空、载荷同步、落盘与跨重启保留。
+{
+  const statePath = join(TEST_STATE_DIR, `select-${++stateSeq}.json`)
+  rmSync(statePath, { force: true })
+  mount({ clineKeys: [SECRET_A, SECRET_B], quotaStatePath: statePath })
+  const selectPost = (options = {}) => callRoute({ path: SELECT_PATH, method: 'POST', contentType: 'application/json', ...options })
+  const labelA = label8(SECRET_A)
+
+  const notPost = await callRoute({ path: SELECT_PATH, method: 'GET' })
+  check('W1 选定路由只收 POST（GET → 405）', notPost.status === 405, String(notPost.status))
+  const crossSite = await callRoute({ path: SELECT_PATH, method: 'POST', contentType: 'application/json', referer: 'http://evil.example/x' })
+  check('W2 非同源 → 403', crossSite.status === 403, String(crossSite.status))
+  const wrongType = await selectPost({ contentType: 'text/plain', body: '{}' })
+  check('W3 非 application/json → 415', wrongType.status === 415, String(wrongType.status))
+  const badJson = await selectPost({ body: '{oops' })
+  check('W4 坏 JSON → 400', badJson.status === 400, String(badJson.status))
+  const notString = await selectPost({ body: JSON.stringify({ label: 42 }) })
+  check('W5 label 不是字符串 → 400（不静默当成取消）', notString.status === 400, String(notString.status))
+  const unknown = await selectPost({ body: JSON.stringify({ label: 'deadbeef' }) })
+  check('W6 池内没有的标签 → 400，且选定保持为空',
+    unknown.status === 400 && ctxStatusOf().selection === null, `${unknown.status} ${JSON.stringify(ctxStatusOf().selection)}`)
+  const chosen = await selectPost({ body: JSON.stringify({ label: labelA }) })
+  check('W7 选定池内已知标签 → 200，只读载荷同步可见',
+    chosen.status === 200 && chosen.json?.selection?.label === labelA && ctxStatusOf().selection?.label === labelA,
+    `${chosen.status} ${JSON.stringify(chosen.json?.selection ?? null)}`)
+  lastCtx.__dshClineBridge.flushQuotaState()
+  const fileText = readFileSync(statePath, 'utf8')
+  check('W8 选定落盘只有 8 位标签，没有 key 原文',
+    fileText.includes(labelA) && !fileText.includes(SECRET_A) && !fileText.includes(SECRET_B),
+    `hasLabel=${fileText.includes(labelA)} hasRaw=${fileText.includes(SECRET_A)}`)
+  const cleared = await selectPost({ body: JSON.stringify({ label: '' }) })
+  check('W9 空标签 → 200 且清空（幂等）',
+    cleared.status === 200 && cleared.json?.selection === null && ctxStatusOf().selection === null,
+    JSON.stringify(cleared.json?.selection ?? null))
+  const clearedAgain = await selectPost({ body: '{}' })
+  check('W9b 缺省 label 同样是清空（幂等）', clearedAgain.status === 200 && clearedAgain.json?.selection === null, String(clearedAgain.status))
+  mount({ clineKeys: [SECRET_A], keyImport: false })
+  const disabled = await selectPost({ body: JSON.stringify({ label: 'deadbeef' }) })
+  check('W10 keyImport:false 时选定路由一并 403（与另两条写路由同一开关）', disabled.status === 403, String(disabled.status))
+  // 跨重启：选一次 → 落盘 → 换全新实例读同一份文件
+  mount({ clineKeys: [SECRET_A, SECRET_B], quotaStatePath: statePath })
+  const restored = await selectPost({ body: JSON.stringify({ label: labelA }) })
+  lastCtx.__dshClineBridge.flushQuotaState()
+  mount({ clineKeys: [SECRET_A, SECRET_B], quotaStatePath: statePath })
+  check('W11 选定跨重启保留（新实例读同一状态文件后仍在）',
+    restored.status === 200 && ctxStatusOf().selection?.label === labelA, JSON.stringify(ctxStatusOf().selection ?? null))
+}
+
 // ───────────────── 4g. 统计跨重启持久化 + 重置统计 ─────────────────
 // 以前这些数字只活在内存里：插件一更新（= DSH 重启）就全变 0，看着像「白用了」。
 // 现在统计与冷却共用同一个状态文件，按 8 位哈希标签恢复——这一组就是钉住这件事。
@@ -1005,6 +1059,7 @@ const MODULE_ID = 'dsh-cline-bridge'
 const ROUTE = '/dsh-cline-bridge/keys'
 const CLIENT_IMPORT_ROUTE = '/dsh-cline-bridge/keys/import'
 const CLIENT_RESET_ROUTE = '/dsh-cline-bridge/keys/stats/reset'
+const CLIENT_SELECT_ROUTE = '/dsh-cline-bridge/keys/select'
 
 /** 把客户端半边装进 vm 沙箱，返回它的模块导出。 */
 function loadClientBundle() {
@@ -1156,7 +1211,7 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
   check('C17 渲染出最近决策', text.includes('最近决策') && text.includes('rotated a→b'))
   check('C18 面板里没有「运行参数」卡片', !text.includes('运行参数') && !text.includes('凭据文件') && !text.includes('15分钟') && !text.includes('Runtime parameters'))
   check('C19 面板里没有掩码说明文字', !text.includes('首尾各 4 位') && !text.includes('掩码预览'))
-  check('C20 表格表头恰好是这 6 列', table_headers(tree).join('|') === '#|Key|状态|冷却 / 恢复|请求 / Token|最近使用', table_headers(tree).join(' | '))
+  check('C20 表格表头恰好是这 7 列', table_headers(tree).join('|') === '#|Key|状态|冷却 / 恢复|请求 / Token|最近使用|使用', table_headers(tree).join(' | '))
 
   // 关键 DOM 结构：表格确实有 2 行数据
   const table = findNode(tree, (n) => n.type === 'table')
@@ -1168,7 +1223,7 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
   const cols = colgroup?.children ?? []
   const widths = cols.map((c) => String(c.props?.style?.width ?? ''))
   check('C26 表格用 colgroup 按百分比分配列宽（跟着容器走，不由内容撑开）',
-    cols.length === 6 && widths.every((w) => /^\d+(\.\d+)?%$/.test(w)), widths.join(' | '))
+    cols.length === 7 && widths.every((w) => /^\d+(\.\d+)?%$/.test(w)), widths.join(' | '))
   check('C27 列宽百分比之和正好 100%（不会几列互相挤压）',
     Math.abs(widths.reduce((sum, w) => sum + Number.parseFloat(w), 0) - 100) < 0.001, String(widths.reduce((s, w) => s + Number.parseFloat(w), 0)))
 
@@ -1535,6 +1590,116 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
   bundle.mini.dispose()
 }
 
+// ──────────────── 5d. 选定「使用中」的 Key：按钮 → POST → 徽标切换 ────────────────
+// 表格最后一列「使用」：点一下就把这把设为「使用中」（首发送优先用它），再点一次取消。
+// 这一组把整条链路走一遍——按钮存在、点击发出一次 JSON POST、成功后重拉、徽标跟着切换。
+{
+  const bundle = loadClientBundle()
+  const calls = []
+  const payload = {
+    plugin: MODULE_ID,
+    version: PLUGIN_VERSION,
+    models: [{ id: 'cline-free/deepseek-v4.1-flash', lastUsedAt: 0 }],
+    currentModel: 'cline-free/deepseek-v4.1-flash',
+    totals: { poolSize: 2, clineRequests: 3, rotations: 1, failFasts: 0, since: Date.now() - 3600_000 },
+    keys: [
+      { index: 1, label: 'db694bbf', preview: 'sk_c…ead1', source: 'request', cooling: [], stats: { sent: 0, ok: 0, failed: 0, limited: 0, lastUsedAt: 0, tokens: {} }, models: {} },
+      { index: 2, label: '761f9875', preview: 'sk_t…8888', source: '.credentials.yaml: CLINE_API_KEY_2', cooling: [], stats: { sent: 0, ok: 0, failed: 0, limited: 0, lastUsedAt: 0, tokens: {} }, models: {} },
+    ],
+    // 第 2 把是当前「使用中」的：面板应当把它那行的按钮点亮
+    selection: { label: '761f9875' },
+    recent: [],
+  }
+  const jsonResponse = (body) => ({
+    ok: true,
+    status: 200,
+    headers: { get: (name) => (String(name).toLowerCase() === 'etag' ? '"select-etag"' : null) },
+    json: async () => body,
+  })
+  const selectReply = { ok: true, selection: { label: 'db694bbf' }, poolSize: 2 }
+  bundle.sandbox.fetch = async (url, init) => {
+    const method = (init && init.method) || 'GET'
+    calls.push({ url, method, headers: (init && init.headers) || {}, body: init && init.body })
+    return jsonResponse(url === CLIENT_SELECT_ROUTE ? selectReply : payload)
+  }
+
+  const registered = []
+  const slots = {
+    inject: (name, cb) => cb(),
+    register: (options, Component) => { registered.push({ options, Component }); return () => {} },
+  }
+  bundle.exports.apply({ get: (name) => (name === 'slots' ? slots : undefined), inject: () => undefined })
+  const Component = registered[0].Component
+  let tree = await bundle.mini.render(Component, {})
+
+  const collectUseButtons = (node, out = []) => {
+    if (!node || typeof node !== 'object') return out
+    if (Array.isArray(node)) {
+      for (const child of node) collectUseButtons(child, out)
+      return out
+    }
+    if (String(node.props?.className ?? '').includes('_dsh_ofb_usebtn')) out.push(node)
+    for (const child of node.children ?? []) collectUseButtons(child, out)
+    return out
+  }
+  const headers = table_headers(tree)
+  let useButtons = collectUseButtons(tree)
+  check('X1 表格末尾新增「使用」列，每行一个按钮',
+    headers.join('|') === '#|Key|状态|冷却 / 恢复|请求 / Token|最近使用|使用' && useButtons.length === 2,
+    `${headers.join('|')} buttons=${useButtons.length}`)
+  const activeButton = useButtons.find((n) => String(n.props.className).includes('_on'))
+  check('X2 选定的那把显示「使用中」并带 aria-pressed（其余显示「使用」）',
+    Boolean(activeButton) && textOf(activeButton).join('') === '使用中' && activeButton.props['aria-pressed'] === 'true' &&
+      useButtons.some((n) => textOf(n).join('') === '使用'),
+    useButtons.map((n) => textOf(n).join('')).join(' | '))
+
+  // 点未选中的那把 → POST 它的标签
+  const passive = useButtons.find((n) => !String(n.props.className).includes('_on'))
+  const pending = passive.props.onClick()
+  await new Promise((r) => setTimeout(r, 20))
+  if (pending && typeof pending.then === 'function') await pending
+  tree = await bundle.mini.render(Component, {})
+  const post = calls.find((c) => c.method === 'POST')
+  check('X3 点击发出一次 JSON POST（body 是这把的 8 位标签）',
+    post?.url === CLIENT_SELECT_ROUTE && post?.headers['content-type'] === 'application/json' && JSON.parse(post.body).label === 'db694bbf',
+    post ? `${post.url} ${post.body}` : 'no POST')
+  check('X4 成功后自动重拉面板数据（不必等 5 秒轮询）',
+    calls.filter((c) => c.method === 'GET').length >= 2, `GET=${calls.filter((c) => c.method === 'GET').length}`)
+
+  // 再点「使用中」那把 → 发空标签（取消）
+  useButtons = collectUseButtons(tree)
+  const activeAgain = useButtons.find((n) => String(n.props.className).includes('_on'))
+  const clearPending = activeAgain ? activeAgain.props.onClick() : undefined
+  await new Promise((r) => setTimeout(r, 20))
+  if (clearPending && typeof clearPending.then === 'function') await clearPending
+  const posts = calls.filter((c) => c.method === 'POST')
+  check('X5 再点「使用中」发出空标签（取消选定）',
+    posts.length === 2 && JSON.parse(posts[1].body).label === '',
+    posts.map((c) => String(c.body)).join(' ; '))
+  check('X6 渲染树里不出现 Key 原文', !JSON.stringify(tree).includes(SECRET_A) && !JSON.stringify(tree).includes(SECRET_B))
+  bundle.mini.dispose()
+}
+
+{
+  // 选定的 Key 已不在池中（凭据被删）：面板要给出提示，而不是让徽标凭空消失
+  const missing = await renderPanel({
+    plugin: MODULE_ID,
+    version: PLUGIN_VERSION,
+    models: [{ id: 'cline-free/deepseek-v4.1-flash', lastUsedAt: 0 }],
+    currentModel: 'cline-free/deepseek-v4.1-flash',
+    totals: { poolSize: 1, clineRequests: 0, rotations: 0, failFasts: 0, since: Date.now() },
+    keys: [{ index: 1, label: 'db694bbf', preview: 'sk_c…ead1', source: 'request', cooling: [], stats: { sent: 0, ok: 0, failed: 0, limited: 0, lastUsedAt: 0, tokens: {} }, models: {} }],
+    selection: { label: 'aaaaaaaa' },
+    recent: [],
+  })
+  const missingText = textOf(missing.tree).join('\n')
+  check('X7 选定的 Key 已不在池中时给出提示（且没有任何行被点亮）',
+    missingText.includes('选定的 Key 已不在池中') &&
+      !findNode(missing.tree, (n) => String(n.props?.className ?? '').includes('_dsh_ofb_usebtn_on')),
+    missingText.split('\n').filter((s) => s.includes('不在池中')).join(''))
+  missing.bundle.mini.dispose()
+}
+
 {
   // 空池：应给出空态而不是空白
   const empty = await renderPanel({
@@ -1589,6 +1754,7 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
         },
       },
     ],
+    selection: { label: 'db694bbf' },
     recent: [{ at: new Date().toISOString(), model: 'cline-free/deepseek-v4.1-flash', decision: 'pass-through status=200' }],
   }
 
@@ -1669,6 +1835,12 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
   const bundle = loadClientBundle()
   check('M7 bundle 自报的 id == 包名', bundle.id === manifest.name, `${bundle.id} vs ${manifest.name}`)
   check('M8 主机半边入口存在', existsSync(new URL('../index.js', import.meta.url)))
+  // 版本号有两个来源：package.json（清单）与 defaults.js 的主机端常量（随载荷下发到面板，
+  // 也是诊断里的 pluginVersion）。两处不一致时，用户在面板上看到的版本就是错的。
+  check('M9 主机端 PLUGIN_VERSION 与 package.json 的 version 一致', HOST_VERSION === manifest.version, `${HOST_VERSION} vs ${manifest.version}`)
+  mount({})
+  check('M9b 只读载荷下发的 version 就是主机端那个常量', ctxStatusOf()?.version === HOST_VERSION, String(ctxStatusOf()?.version))
+  dispose()
   bundle.mini.dispose()
 }
 
