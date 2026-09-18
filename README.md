@@ -1,66 +1,40 @@
-# opencode-free-bridge
+# dsh-cline-bridge
 
-**OpenCode Zen & Cline 渠道增强桥接器 — 专为 DeepSeek Harness (DSH) 打造。**
+**Cline 渠道桥接器 — 专为 DeepSeek Harness (DSH) 打造。**
 
-无需复杂代理，无需在 DSH 界面手动填写繁琐的客户端自定义头，直接赋能 DSH 原生 `opencode` 渠道与 `cline` 官方中转渠道。
+无需复杂代理，无需在 DSH 界面手动填写繁琐的客户端自定义头，直接赋能 DSH 的 `cline` 官方中转渠道：官方客户端特征头自动补全，撞每日免费额度自动换 Key 重发，配一块跨重启保留用量的设置页面板。
+
+> **v2.0.0 破坏性变更**：本插件由 `opencode-free-bridge` 更名而来，并**移除了 OpenCode Zen 渠道**（原因见下节）。从旧版升级需要两件事：
+>
+> 1. profile 的 `cordis.patch.yml` 里把条目 id 从 `opencode-free-bridge` 改成 `dsh-cline-bridge`（配置键不变）；
+> 2. 重新安装插件（包名已变，仓库地址不变）：`dsh plugin --profile web remove opencode-free-bridge && dsh plugin --profile web add github:huahai0202/opencode-free-bridge`。
+>
+> 旧状态文件 `.opencode-free-bridge-cline-quota.json` 会在首次启动时自动迁移为 `.dsh-cline-bridge-quota.json`，冷却与累计统计不丢。
 
 ---
 
 ## ✨ 特性
 
-- **多渠道官方协议特征自动注入**：
-  - **OpenCode Zen 渠道 (`opencode.ai/zen`)**：
-    - 严格对齐官方 `session/llm/request.ts` 的头部构造：`User-Agent: opencode/<版本号>`、`x-opencode-client: cli`、`x-opencode-project: global`、`x-opencode-session`、`x-opencode-request`；
-    - 按 opencode 官方 ID 规范生成 `x-opencode-session`（`ses_` + 12 位小写十六进制 + 14 位 base62，总长 30），彻底解决 `MissingSessionID` 报错与免费通道 `403 FreeTierError`；
-    - 主动剥离 `x-session-affinity` / `X-Session-Id`：官方这两个头只用于「非 opencode 提供方」分支，DSH 底层 pi-ai 却会下发，直接透传会把非规范值带进 Zen 请求；
-    - 同一会话稳定复用同一 session ID（服务端据此做路由固定与提示缓存），不同会话自动隔离；
-    - 每轮请求自动生成唯一的规范 `x-opencode-request`（对应官方 `input.user.id`）；
-    - 未配置 Key（或误填 URL）时自动使用官方匿名通道（`Bearer public`）。
-  - **Cline 渠道 (`api.cline.bot`)**：
-    - 自动注入完整的 Cline 官方客户端特征头（`user-agent: Cline/4.1.16`、`x-client-type: cline-vscode`、`x-platform: vscode`、`http-referer` 等）；
-    - 主 Key 完全由用户在 DSH 设置中配置，原生透传直通，不设代码层内置 Key 兜底；
-    - **可选**多 Key 池：额外提供 Key 后，撞到「每日免费额度」类限流会自动换 Key 重发（未提供额外 Key 时行为与之前完全一致，零影响）；
-    - **设置页面板**：在 DSH 设置里新增「Cline Key」分区，逐把列出每个 Key 的来源、掩码预览、健康/冷却状态、各模型的恢复倒计时与**跨重启保留**的累计用量（发送 / 成功 / 限流、输入输出 token）。
-    - **累计统计跨重启保留**：每把 Key 的发送/成功/限流、输入输出 token、按模型明细、最近使用时刻，以及三个累计计数与「最近决策」，都按 8 位哈希标签与冷却一起落盘；面板标出统计起点，顶部另有「重置统计」（两段式确认，只清统计、不碰冷却与凭据）。
-    - **面板直接导入 Key**：面板右上角（插件版本卡右边）一个「导入 Key」按钮，粘贴一把或多把即可写进凭据仓库的空闲槽位（`CLINE_API_KEY_2`~`_10`），写完立刻进池、当轮即可参与轮换；重复的自动跳过，可用 `keyImport: false` 关掉整条写入口。
-- **100% 流量精准隔离**：
-  - 仅在网络请求目标为 `opencode.ai/zen` 或 `api.cline.bot` 时介入；
-  - 对 DeepSeek 官方模型、OpenAI、Claude、Gemini 等其他所有渠道 100% 原样直通，零副作用。
+- **Cline 官方客户端特征头自动注入**（`user-agent: Cline/4.1.16`、`x-client-type: cline-vscode`、`x-platform: vscode`、`http-referer` 等）——请求头无需手动复制；
+- **主 Key 完全由用户在 DSH 设置中配置**，原生透传直通，不设代码层内置 Key 兜底；
+- **可选**多 Key 池：额外提供 Key 后，撞到「每日免费额度」类限流会自动换 Key 重发（未提供额外 Key 时行为与单 Key 完全一致，零影响）；
+- **设置页面板**：在 DSH 设置里新增「Cline Key」分区，逐把列出每个 Key 的来源、掩码预览、健康/冷却状态、各模型的恢复倒计时与**跨重启保留**的累计用量（发送 / 成功 / 限流、输入输出 token）；
+- **累计统计跨重启保留**：每把 Key 的发送/成功/限流、输入输出 token、按模型明细、最近使用时刻，以及三个累计计数与「最近决策」，都按 8 位哈希标签与冷却一起落盘；面板标出统计起点，顶部另有「重置统计」（两段式确认，只清统计、不碰冷却与凭据）；
+- **面板直接导入 Key**：面板右上角（插件版本卡右边）一个「导入 Key」按钮，粘贴一把或多把即可写进凭据仓库的空闲槽位（`CLINE_API_KEY_2`~`_10`），写完立刻进池、当轮即可参与轮换；重复的自动跳过，可用 `keyImport: false` 关掉整条写入口；
+- **100% 流量精准隔离**：仅在请求目标命中 `clineMatch`（默认 `api.cline.bot`）时介入；对 DeepSeek、OpenAI、Claude、Gemini 等其他所有渠道 100% 原样直通，零副作用；
 - **纯原生轻量中间件**：体积仅数 KB，基于 DSH Cordis 插件架构，支持热插拔与无残留卸载。
 
 ---
 
-## 🔍 免费通道放行条件（实测）
+## ❌ 为什么不再支持 OpenCode Zen
 
-Zen 免费模型（`mimo-v2.5-free`、`nemotron-3.5-lightning-free` 等）由 Console 上游按「客户端指纹」放行，实测规则如下：
+v1 曾通过注入官方客户端特征头（`User-Agent: opencode/…`、`x-opencode-session` 等）让 DSH 直接使用 Zen 免费模型。2026-09 实测，Zen 免费档的门禁已从「HTTP 请求头形状」升级为「传输层客户端指纹」，头注入方案整体失效：
 
-| 请求头 | 是否必须 | 说明 |
-| --- | --- | --- |
-| `x-opencode-session` | ✅ 必须 | 须匹配 `ses_` + **12 位小写十六进制** + 14 位 base62（总长 30）。缺失、`req_`/`msg_` 前缀、大写十六进制、长度不符或任意字符串一律 `403 FreeTierError` |
-| `User-Agent` | ✅ 必须 | 只需包含 `opencode/` 前缀；官方源码为裸写 `opencode/${InstallationVersion}`，插件同此。附加 `ai-sdk/...`、`runtime/...` 后缀也能通过，但并非官方所发 |
-| `x-opencode-client` / `x-opencode-project` / `x-opencode-request` | ❌ 非必需 | 取值任意、甚至整头省略都能通过（官方取 `flags.client` 默认 `cli`、`context.project.id`、`input.user.id`） |
+- 同一台机器、同一个账号 Key、同一个模型：官方 CLI（v2.0.7）返回 200；把它的 HTTP 请求**逐字节重放**（相同的头、头序、大小写、UA、鉴权与 body）从 Node 发出，仍然 `403 FreeTierError: OpenCode's free tier can only be used from within OpenCode`——HTTP 层能对齐的全部对齐了，判定依据在报文之外；
+- 三种客户端的 TLS ClientHello（JA3）互不相同：官方 CLI `5260242a…`（BoringSSL 式扩展序、含 X25519MLKEM768）、Bun fetch `e97f5146…`、Node/undici `a44663b9…`；
+- `GET /zen/v1/models` 从 Node 发是 200，付费模型回 `401 CreditsError`（仅提示未绑卡）——被拦的只有免费额度这一档。
 
-服务端校验的是**形状**而非来源：会话 ID 中的 12 位十六进制时间戳不参与校验（可用随机值冒充），因此插件用「同一会话稳定映射」的方式生成合法 ID，在不牺牲路由固定与提示缓存的前提下通过校验。
-
-补充实测边界（供后人少走弯路）：
-
-| 会话值 | 结果 |
-| --- | --- |
-| `ses_` + 12 位小写 hex + 14 位大写字母 / 14 位纯数字 | ✅ 200（第 13 位起只需是 base62） |
-| `ses_` + 26 位小写 hex | ✅ 200（恰为合法 base62 子集） |
-| `ses_` + 首位字母大写 + 后 25 位 | ❌ 403（**首位必须是小写十六进制**） |
-| `ses_` + 64 位 hex（opencode core runner 的 `promptCacheKey` 分支出现过此形态） | ❌ 403 |
-| 任意字符串 / UUID / `req_`、`msg_` 前缀 | ❌ 403 |
-
-覆盖面：门禁对 `/v1/chat/completions` 与 `/v1/responses`（`muse-spark-*-free` 走 `@ai-sdk/openai`）**一视同仁**，插件对 `opencode.ai/zen` 全路径生效，无需额外配置。
-
-> ⚠️ 端点错配陷阱：`muse-spark-1.2-contributor-free` / `muse-spark-1.3-contributor-free` **只支持 Responses 端点**（`/v1/responses`）。实测走 `/v1/chat/completions` 会返回 `500 Internal server error`，看起来像服务故障，其实是端点用错了（对照 `mimo-v2.5-free` 走 chat/completions 正常）。DSH 内置目录（pi-ai）已把这两个模型标记为 `openai-responses`，因此在 DSH 中使用无需干预；把这两个 ID 拿去配置只支持 chat/completions 的客户端则会踩坑。
-
-> ⚠️ `deepseek-v4-flash-free` 目前对任何头部组合都返回 `400 Model is unavailable`，属上游模型侧故障，与本插件无关。
->
->  models.dev 上 `opencode` 提供方登记了 29 个免费模型，但 live `/zen/v1/models` 实际仅列出 7 个：`mimo-v2.5-free`、`nemotron-3.5-lightning-free`、`nemotron-3-ultra-free`、`ling-3.0-flash-fin-free`、`muse-spark-1.2-contributor-free`、`muse-spark-1.3-contributor-free`、`deepseek-v4-flash-free`（最后一个即上文 400 的那个）。模型可见性由 DSH 内置目录（pi-ai）决定，与本插件无关。
->
->  关于两个 Muse Spark 免费 SKU：Muse Spark 是 Meta 的模型，Meta 自身分为 Standard（不使用你的数据训练）与 Contributor（允许训练换取折扣）两档；Zen 又加了第三档 Contributor Free（$0，限期收集反馈）。模型有 1.2（2026-08-05）与 1.3（2026-09-02）两代，**Zen 为每一代各发了一个免费 SKU**，所以同时存在两个——不是重复条目。免费池会轮换，以 live `/zen/v1/models` 为准，不要硬编码到文档里。
+Node 全局 fetch → undici → OpenSSL 的握手形状在 fetch 层不可控（扩展顺序等由库决定），插件无法再补齐这道门。保留一个注定 403 的通道只会误导用户，故整体移除。仍想要官方免费档的现实路径：走官方客户端本体（例如把 `opencode serve` 当上游）；付费 Zen（自带 Key）不受此门禁影响，直接在 DSH 配置即可。
 
 ---
 
@@ -89,14 +63,14 @@ Cline 的免费额度是**按 Key + 按模型**的每日上限，撞限流时服
 
 > 额外 Key 的解析**不会一次性上锁**：首次未读到（例如文件稍后才出现）会每 2 秒重试，成功读到后每 5 分钟复扫一次——运行期新增的 ref 也会被发现。另外，插件的**写**路径（面板导入）优先走 DSH 的凭据服务，服务写完之后会发 `credentials/reference-updated`；插件订阅了该事件并立刻强制重扫一次，所以「导入 / 在 DSH 设置页改 ref / 手工编辑凭据文件」都会在下一秒进入池子，不必等那 5 分钟。
 >
-> **为什么读盘仍然直读文件**：凭据服务可能在插件挂载之后才就绪，而读侧不能在服务缺席时失效，所以保留 `.credentials.yaml` 直读作兜底；`ctx.inject(['credentials'], cb)` 只是**可选加速**与写入通道，服务缺席时插件照常工作（导入退化为直写文件）。注意这里用的是子 fiber 的 `ctx.inject`，**不是**模块级 `export const inject = ['credentials']`——后者会把整个插件（含 Zen 头注入）门控在该服务上。
+> **为什么读盘仍然直读文件**：凭据服务可能在插件挂载之后才就绪，而读侧不能在服务缺席时失效，所以保留 `.credentials.yaml` 直读作兜底；`ctx.inject(['credentials'], cb)` 只是**可选加速**与写入通道，服务缺席时插件照常工作（导入退化为直写文件）。注意这里用的是子 fiber 的 `ctx.inject`，**不是**模块级 `export const inject = ['credentials']`——后者会把整个插件（含 Cline 头注入）门控在该服务上。
 >
 > 排查入口：状态文件里带 `diagnostics` 字段（插件版本、`credentialsFileRead`、`poolSize`、`clineRequests`/`rotations`/`failFasts` 计数、`lastDecision`、各 Key 的冷却模型），一眼能看出「为什么没换 Key」。日志里 Key 只以 8 位哈希标签出现。
 
 ```yaml
 # 加在 profile 的 cordis.patch.yml（即 ~/.dsh/profiles/web/cordis.patch.yml）。
 # 注意用 id 定向覆盖，不要用 insert —— 后者会挂载第二个插件实例、把 fetch 包两层。
-- id: opencode-free-bridge
+- id: dsh-cline-bridge
   config:
     clineKeys:
       - !!js process.env.CLINE_API_KEY
@@ -107,7 +81,7 @@ Cline 的免费额度是**按 Key + 按模型**的每日上限，撞限流时服
     # clineCooldownMs: 900000
     # 可选：主 key 已知在冷却时，首发送就改用健康 key（默认 false，保持「先试主 key」的可预测行为）
     # skipCoolingRequestKey: true
-    # 可选：额度状态落盘位置（默认 <DSH_HOME 或 ~/.dsh>/.opencode-free-bridge-cline-quota.json）
+    # 可选：额度状态落盘位置（默认 <DSH_HOME 或 ~/.dsh>/.dsh-cline-bridge-quota.json）
     # quotaStatePath: 'D:/somewhere/quota.json'
     # 可选：全池冷却时是否快速失败（默认 true）
     # allCoolingFailFast: false
@@ -126,7 +100,7 @@ Cline 的免费额度是**按 Key + 按模型**的每日上限，撞限流时服
 
 那份 429 报文里的 `Try again in 22h 47m` 是一个可直接使用的**绝对恢复时刻**，插件把它变成了三件事：
 
-1. **额度状态与用量统计跨进程持久化。** 冷却状态（key 的 8 位哈希标签 + 模型 + 恢复时刻 + 服务端原始报文）与**用量统计**（每把 key 的发送 / 成功 / 限流、输入输出 token、按模型明细、最近使用时刻，以及 `Cline 请求` / `换 Key 恢复` / `快速失败` 三个累计计数与最近决策）每 500ms 去抖后原子落盘到 `.opencode-free-bridge-cline-quota.json`——**文件里没有任何 key 原文，连掩码也没有**。于是 DSH 重启后不必再靠"撞一次才知道"——启动第一次请求就已经知道主 key 被限到几点，直接走健康 key。
+1. **额度状态与用量统计跨进程持久化。** 冷却状态（key 的 8 位哈希标签 + 模型 + 恢复时刻 + 服务端原始报文）与**用量统计**（每把 key 的发送 / 成功 / 限流、输入输出 token、按模型明细、最近使用时刻，以及 `Cline 请求` / `换 Key 恢复` / `快速失败` 三个累计计数与最近决策）每 500ms 去抖后原子落盘到 `.dsh-cline-bridge-quota.json`——**文件里没有任何 key 原文，连掩码也没有**。于是 DSH 重启后不必再靠"撞一次才知道"——启动第一次请求就已经知道主 key 被限到几点，直接走健康 key。
 2. **全池冷却时快速失败。** 若所有已知 key 在该模型上的最早恢复时刻还在 `failFastMinMs`（默认 5 分钟）之外，插件**不发**那个注定失败的请求，直接回放磁盘上缓存的服务端原始 429 并附 `x-should-retry: false`，让上层立即放弃而不是空等退避。若恢复时刻已在阈值内，则照常尝试（避免因服务端倒计时取整而误判）。
 3. **恢复时间可观测。** 日志会打印绝对恢复时间（如"最早 12:40 恢复"），自检快照里也带 `readyInMin`。
 
@@ -223,9 +197,9 @@ refs:
 >
 > | 路由 | 用途 | 闸门 |
 > | --- | --- | --- |
-> | `GET /opencode-free-bridge/cline-keys` | **只读**：把池状态交给浏览器半边渲染 | 同源 `Referer` 校验；只允许 `GET`/`HEAD`。只下发哈希标签、掩码预览、来源标签、冷却时刻与计数——**不回显 `config.clineKeys`**，也不含任何 Key 原文；掩码只在内存里现算，磁盘状态文件里连掩码都没有 |
-> | `POST /opencode-free-bridge/cline-keys/import` | **写**：把面板里粘贴的 Key 写进备用槽位 | 同源 `Referer` 校验；只允许 `POST`；必须 `application/json`（挡住表单/文本这类无需预检的跨站简单请求）；正文上限 64KB；可用 `keyImport: false` 整条关掉。回包只有 ref、哈希标签与掩码 |
-> | `POST /opencode-free-bridge/cline-keys/stats/reset` | **写**：把累计统计归零 | 与导入同一套闸门（`keyImport: false` 一并关掉）。只动统计，不动冷却，也不动凭据 |
+> | `GET /dsh-cline-bridge/keys` | **只读**：把池状态交给浏览器半边渲染 | 同源 `Referer` 校验；只允许 `GET`/`HEAD`。只下发哈希标签、掩码预览、来源标签、冷却时刻与计数——**不回显 `config.clineKeys`**，也不含任何 Key 原文；掩码只在内存里现算，磁盘状态文件里连掩码都没有 |
+> | `POST /dsh-cline-bridge/keys/import` | **写**：把面板里粘贴的 Key 写进备用槽位 | 同源 `Referer` 校验；只允许 `POST`；必须 `application/json`（挡住表单/文本这类无需预检的跨站简单请求）；正文上限 64KB；可用 `keyImport: false` 整条关掉。回包只有 ref、哈希标签与掩码 |
+> | `POST /dsh-cline-bridge/keys/stats/reset` | **写**：把累计统计归零 | 与导入同一套闸门（`keyImport: false` 一并关掉）。只动统计，不动冷却，也不动凭据 |
 >
 > 三条路由都只在 `ctx.inject(['webServer'], …)` 的子 fiber 里注册，headless / acp / desktop 这些没有 `webServer` 的 profile 里它们一起缺席，主链路（fetch 补丁）不受影响。全程用 `node tools/cline-panel-check.mjs` 断言：回包不含 Key 原文、写路由的每道闸门、以及磁盘状态文件里连掩码都没有。
 >
@@ -239,18 +213,18 @@ refs:
 
 | 文件 | 行数 | 职责 |
 | --- | --- | --- |
-| `index.js` | ~613 | 插件入口：装配各模块 + 实现 fetch 层拦截（Zen 头注入 / Cline 换 Key 轮换）+ 面板只读/导入/重置三条路由 |
-| `lib/host/defaults.js` | ~48 | 插件版本、各通道可调常量、DSH 路径解析 |
-| `lib/host/ids.js` | ~116 | opencode 会话/请求 ID 生成；key 的 8 位哈希标签与掩码预览 |
-| `lib/host/quota-state.js` | ~225 | 状态落盘：额度冷却 + **用量统计 / 累计计数**（同一文件、同一去抖写入器）+ 重试窗口解析 |
-| `lib/host/request-shape.js` | ~58 | 读请求形状：body 可否重发、模型名、鉴权头读写 |
-| `lib/host/credentials.js` | ~87 | 兜底读取 `.credentials.yaml` 的 refs 段；凭据服务缺席时的兜底写入（保留其余内容 + 临时文件改名） |
-| `lib/host/key-import.js` | ~106 | 面板导入：粘贴文本解析、空闲 ref 分配、写入编排（不含 Key 原文的返回值） |
-| `lib/host/usage.js` | ~95 | Token 用量采集（tee 出只读分支扫 usage） |
-| `lib/host/key-pool.js` | ~322 | key 池：来源、按 `key+模型` 冷却、粘性选 Key、按模型用量（按 8 位标签跨重启恢复） |
-| `lib/host/status.js` | ~140 | 设置面板的状态载荷（唯一的对外数据出口，字段白名单） |
-| `lib/host/http.js` | ~80 | 路由的 JSON 响应、同源校验、带上限的 JSON 正文读取 |
-| `lib/client.js` | ~1068 | 浏览器半边：设置页分区（含导入按钮与弹窗、重置统计）（**必须单文件**，见下） |
+| `index.js` | ~592 | 插件入口：装配各模块 + 实现 fetch 层拦截（Cline 特征头注入 + 换 Key 轮换）+ 面板只读/导入/重置三条路由 |
+| `lib/host/defaults.js` | ~68 | 插件版本、Cline 通道可调常量、DSH 路径解析、旧状态文件迁移 |
+| `lib/host/labels.js` | ~43 | key 的 8 位哈希标签与首尾掩码预览 |
+| `lib/host/quota-state.js` | ~213 | 状态落盘：额度冷却 + **用量统计 / 累计计数**（同一文件、同一去抖写入器）+ 重试窗口解析 |
+| `lib/host/request-shape.js` | ~55 | 读请求形状：body 可否重发、模型名、鉴权头读写 |
+| `lib/host/credentials.js` | ~81 | 兜底读取 `.credentials.yaml` 的 refs 段；凭据服务缺席时的兜底写入（保留其余内容 + 临时文件改名） |
+| `lib/host/key-import.js` | ~98 | 面板导入：粘贴文本解析、空闲 ref 分配、写入编排（不含 Key 原文的返回值） |
+| `lib/host/usage.js` | ~91 | Token 用量采集（tee 出只读分支扫 usage） |
+| `lib/host/key-pool.js` | ~313 | key 池：来源、按 `key+模型` 冷却、粘性选 Key、按模型用量（按 8 位标签跨重启恢复） |
+| `lib/host/status.js` | ~143 | 设置面板的状态载荷（唯一的对外数据出口，字段白名单） |
+| `lib/host/http.js` | ~78 | 路由的 JSON 响应、同源校验、带上限的 JSON 正文读取 |
+| `lib/client.js` | ~1004 | 浏览器半边：设置页分区（含导入按钮与弹窗、重置统计）（**必须单文件**，见下） |
 
 > **为什么 `lib/client.js` 不能拆分**：DSH 的客户端模块系统是「**一个包 = 一个 bundle**」——`package.json` 的 `exports['./client']` 只能指向单个文件，浏览器侧模块图是 flat 的（每个 bundle 只与平台基线表相连）。bundle 之间互相 `require` 只能通过 `dsh.client.external` 声明，而那要求**另发一个包**。所以除非引入构建步骤（tsdown/esbuild 把多个源文件打成单个 `lib/client.js`，如 `dsh-better-sidebar` 那样），客户端半边只能保持一个手写文件。主机半边没有这个限制，因为 Node ESM 的相对 import 天然支持包内多文件。
 
@@ -264,15 +238,13 @@ refs:
 dsh plugin --profile web add github:huahai0202/opencode-free-bridge
 ```
 
+> 插件在 v2.0.0 更名为 `dsh-cline-bridge`，但**仓库地址沿用旧名** `opencode-free-bridge`——包名与仓库地址解耦，不影响安装与 bundle 识别。日后若把 GitHub 仓库改名，旧地址会自动重定向，届时把这里的命令与 package.json 里的仓库链接换成新名即可。
+
 ---
 
 ## 🚀 使用说明
 
-### 1. OpenCode Zen
-- 重启 DSH：`dsh web`
-- 在模型选择器中直接进入 **`opencode`** 分组，无需填写 Key 即可畅享免费模型。
-
-### 2. Cline 渠道
+### Cline 渠道
 在 DSH 的 `settings.yaml` 中配置 `cline` 提供方（或在 DSH Web 设置中添加自定义提供方）：
 - Base URL: `https://api.cline.bot/api/v1`
 - 协议: `OpenAI Compatible` (`openai-completions`)
@@ -282,23 +254,19 @@ dsh plugin --profile web add github:huahai0202/opencode-free-bridge
 
 ## 🧪 自检
 
-Zen 的放行规则由服务端随时可能调整，更新插件后建议跑一遍自检。**平时只需要这一条命令**（它依次跑完全部分项，最后打印汇总表）：
+Cline 的 429 报文形状与面板契约随服务端 / 宿主调整，更新插件后建议跑一遍自检。**平时只需要这一条命令**（它依次跑完全部分项，最后打印汇总表）：
 
 ```bash
-node tools/self-check.mjs            # 一键跑完全部（zen + cline-key + cline-panel）
-node tools/self-check.mjs cline-key  # 只跑名字匹配的分项
+node tools/self-check.mjs              # 一键跑完全部（cline-key + cline-panel）
+node tools/self-check.mjs cline-panel  # 只跑名字匹配的分项
 ```
 
 分项文件各自也能单独运行（定位失败时更顺手）：
 
 ```bash
-node tools/zen-check.mjs          # 离线断言：头部形状、会话稳定性、渠道隔离、dispose 还原
-node tools/zen-check.mjs --live   # 追加真实网络调用，确认免费通道确实放行
 node tools/cline-key-check.mjs    # Cline 多 Key 轮换：本地 mock 服务器复刻 429，无需真实 Key
 node tools/cline-panel-check.mjs  # 设置页面板：只读/导入/重置路由契约 + 统计持久化 + 浏览器半边真实渲染
 ```
-
-可用 `ZEN_FREE_MODEL=xxx node tools/zen-check.mjs --live` 指定探测用的免费模型。
 
 `cline-key-check.mjs` 覆盖：换 Key 恢复、按模型冷却、**粘性选 Key（先烧完一把再换下一把）**、三种 Key 来源（config / 环境变量 / 凭据仓库）、单 Key 与瞬时限流下的收尾差异、**额度状态跨重启持久化**、**全池冷却快速失败**、**用量统计跨重启持久化（含粘性延续）**。
 
@@ -310,7 +278,7 @@ node tools/cline-panel-check.mjs  # 设置页面板：只读/导入/重置路由
 - **浏览器半边**：在 `node:vm` 沙箱里用迷你 React 真正渲染（有数据 / 空池 / 请求失败三条路径），断言渲染树里不出现 Key 原文；**导入入口**（N 组）则把整条链路走一遍——按钮长在版本卡右边、点开是粘贴框、提交发出一次带 `application/json` 的 POST、结果以摘要收口并列出落到的 ref、成功后自动重拉一次面板数据、`Esc` 能关掉弹窗；**重置入口**则验证统计起点那行小字、两段式确认（第一次点击不发请求）、第二次点击才 POST、以及重置后的提示。
 - **粘性跨重启（cline-key-check 的 P 组）**：故意把插入顺序排成 `k1 → k3 → k2` 并让 `k2` 先用过一次，于是「按 `lastUsedAt` 恢复」与「没恢复、按插入顺序」会挑出**不同**的备用 Key——这条断言才真的在测恢复。
 
-> 自检默认把额度状态写到临时目录，不会碰你真实的 `.opencode-free-bridge-cline-quota.json`。
+> 自检默认把额度状态写到临时目录，不会碰你真实的 `.dsh-cline-bridge-quota.json`。
 
 ---
 

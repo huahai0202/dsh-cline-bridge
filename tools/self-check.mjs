@@ -4,7 +4,6 @@
  *
  *   node tools/self-check.mjs                # 全部
  *   node tools/self-check.mjs cline-panel    # 只跑名字匹配的那几项
- *   node tools/self-check.mjs --live         # 透传给分项（目前只有 zen-check 认 --live）
  *
  * 每个分项都按「自己的进程」跑：输出直接继承到当前终端（不吞进管道，
  * 便于定位失败时逐条看断言），退出码汇总决定本进程的退出码。
@@ -19,7 +18,6 @@ const here = dirname(fileURLToPath(import.meta.url))
 const root = join(here, '..')
 
 const CHECKS = [
-  { name: 'zen-check', file: 'zen-check.mjs', what: 'Zen 头部形状、会话稳定性、渠道隔离' },
   { name: 'cline-key', file: 'cline-key-check.mjs', what: 'Cline 多 Key 轮换、粘性选 Key、冷却与持久化' },
   { name: 'cline-panel', file: 'cline-panel-check.mjs', what: '设置面板：只读/导入/重置路由契约 + 统计持久化 + 浏览器半边渲染' },
 ]

@@ -112,9 +112,9 @@ const keyTag = (key) => {
   return h.toString(16).padStart(8, '0')
 }
 const attemptsText = (attempts) => attempts.map((a) => keyTag(a.key)).join('→')
-const ctxSnapshot = () => lastCtx?.__opencodeFreeBridge?.clineKeys?.() ?? []
-const ctxStatus = (options) => lastCtx?.__opencodeFreeBridge?.status?.(options) ?? null
-const ctxFlush = () => lastCtx?.__opencodeFreeBridge?.flushQuotaState?.()
+const ctxSnapshot = () => lastCtx?.__dshClineBridge?.clineKeys?.() ?? []
+const ctxStatus = (options) => lastCtx?.__dshClineBridge?.status?.(options) ?? null
+const ctxFlush = () => lastCtx?.__dshClineBridge?.flushQuotaState?.()
 
 const call = async (key, model = 'deepseek/deepseek-v4.1-flash') => {
   const res = await globalThis.fetch(ENDPOINT, {
@@ -142,8 +142,8 @@ const since = (n) => seen.slice(n)
   check('A4 两次都带 Cline 指纹头', attempts.every((a) => a.headers['x-client-type'] === 'cline-vscode'))
   check(
     'A5 重试窗口解析正确（22h47m）',
-    ctx.__opencodeFreeBridge.parseRetryWindowMs('Error 429: Daily free limit reached. Try again in 22h 47m') === (22 * 3600 + 47 * 60) * 1000,
-    String(ctx.__opencodeFreeBridge.parseRetryWindowMs('Try again in 22h 47m')),
+    ctx.__dshClineBridge.parseRetryWindowMs('Error 429: Daily free limit reached. Try again in 22h 47m') === (22 * 3600 + 47 * 60) * 1000,
+    String(ctx.__dshClineBridge.parseRetryWindowMs('Try again in 22h 47m')),
   )
 
   // ── B. 冷却中的 key 仍会先试一次（已确认可接受），随后换 key 成功 ──
@@ -163,7 +163,7 @@ const since = (n) => seen.slice(n)
   check('C1 不同模型不受上次冷却影响', r3.status === 200 && attempts3.length === 2 && attempts3[0].key === 'k1', attempts3.map((a) => `${a.key}@${a.model}`).join('→'))
 
   // ── D. 冷却状态可观察 ──
-  const snap = ctx.__opencodeFreeBridge.clineKeys()
+  const snap = ctx.__dshClineBridge.clineKeys()
   const coolingModels = snap.flatMap((e) => e.cooling)
   check('D1 快照显示按模型冷却', coolingModels.includes('deepseek/deepseek-v4.1-flash'), JSON.stringify(snap))
   check('D2 快照不含 key 原文', JSON.stringify(snap).indexOf('k1') === -1 && JSON.stringify(snap).indexOf('k2') === -1)
@@ -442,7 +442,7 @@ const since = (n) => seen.slice(n)
   // 往同一个文件里追加一把新 ref（模拟用户新加了一把 key）
   writeFileSync(growPath, ['version: 1', 'refs:', '  CLINE_API_KEY_2: "k5x"', '  CLINE_API_KEY_5: "z5"'].join('\n'))
   // 用 force 越过 5 分钟节流，走的是与自动复扫完全相同的那条读盘路径
-  await growCtx.__opencodeFreeBridge.ensureExtras({ force: true })
+  await growCtx.__dshClineBridge.ensureExtras({ force: true })
   const poolLabels = ctxStatus().keys.map((k) => k.label)
   check('N3b 已解析状态下新增的 ref 会被复扫发现（池从 2 把变 3 把）',
     ctxStatus().keys.length === 3, `池内 ${poolLabels.length} 把`)
@@ -476,7 +476,7 @@ const since = (n) => seen.slice(n)
   mount(config)
   const r1 = await call('k2')
   ctxFlush()
-  const totals1 = lastCtx.__opencodeFreeBridge.statsTotals()
+  const totals1 = lastCtx.__dshClineBridge.statsTotals()
   const row1 = ctxStatus().keys.find((k) => k.label === label8('k2'))
   check('P1 统计已落盘（累计计数 + 统计起点）', r1.status === 200 && totals1.clineRequests === 1 && totals1.since > 0, JSON.stringify(totals1))
   // 这个 mock 的回包不带 usage，所以 token 在这里恒为 0（token 采集另有专测）；
@@ -485,7 +485,7 @@ const since = (n) => seen.slice(n)
 
   // 模拟插件更新 / DSH 重启：同一份状态文件，全新实例
   mount(config)
-  const totals2 = lastCtx.__opencodeFreeBridge.statsTotals()
+  const totals2 = lastCtx.__dshClineBridge.statsTotals()
   const row2 = ctxStatus().keys.find((k) => k.label === label8('k2'))
   check('P3 重启后累计计数与统计起点沿用', totals2.clineRequests === 1 && totals2.since === totals1.since, JSON.stringify(totals2))
   check('P4 重启后该 key 的计数与 token 仍在',

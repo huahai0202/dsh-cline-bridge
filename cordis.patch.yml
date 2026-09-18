@@ -1,4 +1,4 @@
 - insert:
-    - id: opencode-free-bridge
-      name: 'opencode-free-bridge'
+    - id: dsh-cline-bridge
+      name: 'dsh-cline-bridge'
       config: {}

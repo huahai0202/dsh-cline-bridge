@@ -1,7 +1,8 @@
-export const name = 'opencode-free-bridge'
+export const name = 'dsh-cline-bridge'
 
-// 本文件只做两件事：把各模块装配起来，以及实现 fetch 层拦截。
-// 具体实现按职责拆在 lib/host/ 下：defaults(常量与路径) / ids(ID 与标签) /
+// 本文件只做两件事：把各模块装配起来，以及实现 fetch 层拦截（Cline 渠道：客户端特征头
+// 注入 + 撞限流后换 key 重发）。
+// 具体实现按职责拆在 lib/host/ 下：defaults(常量与路径) / labels(标签与掩码) /
 // quota-state(额度落盘) / request-shape(请求形状) / credentials(凭据文件读+兜底写) /
 // key-import(面板导入) / usage(token 采集) / key-pool(key 池) / status(面板载荷) /
 // http(路由小工具)。
@@ -17,8 +18,9 @@ import {
   TERMINAL_WINDOW_MS,
   resolveCredentialsFilePath,
   resolveQuotaStatePath,
+  migrateLegacyQuotaState,
 } from './lib/host/defaults.js'
-import { OPENCODE_UA, canonicalSession, keyLabel, opencodeId } from './lib/host/ids.js'
+import { keyLabel } from './lib/host/labels.js'
 import { createQuotaStore, parseRetryWindowMs } from './lib/host/quota-state.js'
 import { readAuthTarget, readKeyOf, readModelOf, replayableBody, writeKeyTo } from './lib/host/request-shape.js'
 import { normalizeUsage, tapUsage } from './lib/host/usage.js'
@@ -30,8 +32,6 @@ import { importClineKeys, MAX_IMPORT_KEYS } from './lib/host/key-import.js'
 
 export function apply(ctx, config) {
   const originalFetch = globalThis.fetch
-  let fallbackSession = ''
-  const fallback = () => (fallbackSession ||= opencodeId('ses'))
 
   const clineMatch = typeof config?.clineMatch === 'string' && config.clineMatch ? config.clineMatch : DEFAULT_CLINE_MATCH
   const clineCooldownMs = Number.isFinite(config?.clineCooldownMs)
@@ -56,6 +56,9 @@ export function apply(ctx, config) {
   const wantedKeyRefs = Array.isArray(config?.clineKeyRefs) ? config.clineKeyRefs : DEFAULT_CLINE_KEY_REFS
   // 导入正文字节上限：面板是手工粘贴几十把 Key 的量级，64KB 绰绰有余
   const MAX_IMPORT_BODY = 64 * 1024
+  // 插件更名（opencode-free-bridge → dsh-cline-bridge）后第一次启动：把旧名状态文件搬过来，
+  // 冷却与累计统计才不丢。只搬一次，之后这里什么也不做。
+  const legacyQuotaState = migrateLegacyQuotaState(config)
   const quotaStore = createQuotaStore(resolveQuotaStatePath(config))
   // 诊断信息随状态文件落盘：池规模、额外 key 来源、各类决策计数（便于线上排查“为什么没换 key”）
   const diag = {
@@ -97,11 +100,14 @@ export function apply(ctx, config) {
 
   const log = (message) => {
     try {
-      ctx?.logger?.warn?.(`[opencode-free-bridge] ${message}`)
+      ctx?.logger?.warn?.(`[dsh-cline-bridge] ${message}`)
     } catch {
       // 日志失败绝不影响请求
     }
   }
+
+  // 迁移只发生在「旧文件在、新文件不在」的那一次；此后的启动这里都是空串、不发日志。
+  if (legacyQuotaState) log(`已把旧插件名的状态文件迁移到新名字：${legacyQuotaState} → ${quotaStore.path}`)
 
   // 凭据服务（可选）：导入 Key 的**写**优先走它——带文件锁的原子写 + 变更通知，
   // 与 DSH 设置页写凭据是同一条路径。仍然用非门控的 ctx.inject：服务缺席时插件照常工作，
@@ -173,51 +179,7 @@ export function apply(ctx, config) {
       url = input.url
     }
 
-    // 1. 目标为 OpenCode Zen 的所有请求（包括 /v1/models 和 /v1/chat/completions 等）
-    if (url && url.includes('opencode.ai/zen')) {
-      const headers = new Headers(init?.headers || (input instanceof Request ? input.headers : {}))
-
-      const sessionHint =
-        headers.get('x-opencode-session') ||
-        headers.get('x-session-affinity') ||
-        headers.get('x-session-id')
-      const sessionId = canonicalSession(sessionHint, fallback)
-      const requestId = opencodeId('msg')
-
-      headers.set('user-agent', OPENCODE_UA)
-      headers.set('x-opencode-client', 'cli')
-      // 官方此处为 context.project.id；DSH 无 opencode 项目概念，等价取全局项目：
-      // opencode 自身的全局项目 ID 即 ProjectV2.ID.global === 'global'（服务端不校验该值）
-      headers.set('x-opencode-project', 'global')
-      headers.set('x-opencode-session', sessionId)
-      headers.set('x-opencode-request', requestId)
-      // 对齐官方 opencode 分支：这两个头只用于非 opencode 提供方，故发往 Zen 时剥离
-      // （DSH 底层 pi-ai 会下发它们，且取值并非 opencode 形状）
-      headers.delete('x-session-affinity')
-      headers.delete('x-session-id')
-
-      // 若未设置 API 密钥、密钥为空，或误填成了 URL 地址，则自动切换为官方匿名通道
-      const auth = headers.get('authorization')
-      if (
-        !auth ||
-        auth.trim() === 'Bearer' ||
-        auth.trim() === 'Bearer undefined' ||
-        auth.trim() === 'Bearer null' ||
-        auth.includes('http://') ||
-        auth.includes('https://')
-      ) {
-        headers.set('authorization', 'Bearer public')
-      }
-
-      if (input instanceof Request) {
-        const newRequest = new Request(input, { ...init, headers })
-        return originalFetch.call(this, newRequest)
-      }
-
-      return originalFetch.call(this, input, { ...init, headers })
-    }
-
-    // 2. 目标为 Cline 官方中转 API 的所有请求（含多 key 轮换）
+    // 目标为 Cline 官方中转 API 的所有请求（含多 key 轮换）
     if (url && url.includes(clineMatch)) {
       const headers = new Headers(init?.headers || (input instanceof Request ? input.headers : {}))
 
@@ -438,8 +400,8 @@ export function apply(ctx, config) {
   //   · 同源校验与只读路由完全一致（Referer 必须与 Host 同源）；
   //   · 正文带上限（MAX_IMPORT_BODY），超限立刻断开。
   // 除此之外它只写 refs 段里名单内的 ref，且回包只带 ref / 哈希标签 / 掩码——没有 Key 原文。
-  const importPath = '/opencode-free-bridge/cline-keys/import'
-  const resetPath = '/opencode-free-bridge/cline-keys/stats/reset'
+  const importPath = '/dsh-cline-bridge/keys/import'
+  const resetPath = '/dsh-cline-bridge/keys/stats/reset'
 
   /** ref → 当前值：凭据服务优先（反映 DSH 眼里的真实值），服务缺席或未就绪时直读文件。 */
   const readClineKeyRefs = async () => {
@@ -580,11 +542,11 @@ export function apply(ctx, config) {
   //
   // 关键：这条路由**不能**用模块级 `export const inject = ['webServer']` 来等依赖——
   // 那会把整个插件（包括 fetch 补丁）门控在 webServer 上，headless/acp/desktop
-  // 这些没有 webServer 的 profile 里连 Zen/Cline 桥接都会一起失效。
+  // 这些没有 webServer 的 profile 里连 Cline 渠道桥接都会一起失效。
   // 正确做法是 ctx.inject 开一个子 fiber（DSH 自身大量使用这个模式，例如
   // dsh-client-modules 就是这么挂 /plugins 路由的），只为路由等 webServer。
   const statusRoute = {
-    path: '/opencode-free-bridge/cline-keys',
+    path: '/dsh-cline-bridge/keys',
     build: (options) =>
       buildStatus(
         {
@@ -627,7 +589,7 @@ export function apply(ctx, config) {
               return sendJson(res, 200, payload)
             },
           }),
-        'opencode-free-bridge: cline keys route',
+        'dsh-cline-bridge: cline keys route',
       )
       // 导入路由与只读路由同一个 webServer 门（headless/acp 下两条一起缺席，主链路不受影响）
       webCtx.effect(
@@ -641,7 +603,7 @@ export function apply(ctx, config) {
               })
             },
           }),
-        'opencode-free-bridge: cline key import route',
+        'dsh-cline-bridge: cline key import route',
       )
       webCtx.effect(
         () =>
@@ -654,13 +616,13 @@ export function apply(ctx, config) {
               })
             },
           }),
-        'opencode-free-bridge: cline stats reset route',
+        'dsh-cline-bridge: cline stats reset route',
       )
     })
   }
 
   // 自检工具用的观察入口（不含 key 原文）
-  ctx.__opencodeFreeBridge = {
+  ctx.__dshClineBridge = {
     clineKeys: () => pool.snapshot(),
     /** 累计计数与统计起点（自检用来断言「跨重启没丢」）。 */
     statsTotals: () => quotaStore.totals(),

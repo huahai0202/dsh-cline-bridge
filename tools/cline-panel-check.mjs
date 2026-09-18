@@ -204,9 +204,9 @@ function mount(config = {}) {
   return ctx
 }
 
-const READ_PATH = '/opencode-free-bridge/cline-keys'
-const IMPORT_PATH = '/opencode-free-bridge/cline-keys/import'
-const RESET_PATH = '/opencode-free-bridge/cline-keys/stats/reset'
+const READ_PATH = '/dsh-cline-bridge/keys'
+const IMPORT_PATH = '/dsh-cline-bridge/keys/import'
+const RESET_PATH = '/dsh-cline-bridge/keys/stats/reset'
 
 /** 假请求：带正文的那几条会按真实流式形状分两片投递 data、再 end，
  *  这样「带上限的正文读取」真的走到累加与上限分支。 */
@@ -283,7 +283,7 @@ const importPost = (options = {}) =>
   callRoute({ path: IMPORT_PATH, method: 'POST', contentType: 'application/json', ...options })
 
 /** 最近一次 mount 出来的插件实例的观察入口（不含 key 原文）。 */
-const ctxStatusOf = (options) => lastCtx?.__opencodeFreeBridge?.status?.(options)
+const ctxStatusOf = (options) => lastCtx?.__dshClineBridge?.status?.(options)
 
 // ───────────────────────── 1. 路由注册与契约 ─────────────────────────
 {
@@ -297,7 +297,7 @@ const ctxStatusOf = (options) => lastCtx?.__opencodeFreeBridge?.status?.(options
     routes.map((row) => `${row.kind} ${row.path}`).join(' + '))
 
   const ok = await callRoute()
-  check('H3 同源 GET 返回 200 JSON', ok.status === 200 && ok.json?.plugin === 'opencode-free-bridge', `status=${ok.status}`)
+  check('H3 同源 GET 返回 200 JSON', ok.status === 200 && ok.json?.plugin === 'dsh-cline-bridge', `status=${ok.status}`)
   check('H4 载荷带缓存禁止头', /no-store/.test(ok.headers['cache-control'] ?? ''), String(ok.headers['cache-control']))
   check('H5 响应头是 JSON', /application\/json/.test(ok.headers['content-type'] ?? ''), String(ok.headers['content-type']))
 
@@ -332,7 +332,7 @@ const ctxStatusOf = (options) => lastCtx?.__opencodeFreeBridge?.status?.(options
   check('H16 maskKeyPreview:false 时不下发任何 key 片段', !off.body.includes(SECRET_A) && off.json.keys.every((k) => k.preview === ''), JSON.stringify(off.json.keys.map((k) => k.preview)))
 
   // 状态入口（自检工具）与路由同源
-  check('H17 ctx.__opencodeFreeBridge.status() 与路由载荷一致', ctx.__opencodeFreeBridge.status().plugin === 'opencode-free-bridge')
+  check('H17 ctx.__dshClineBridge.status() 与路由载荷一致', ctx.__dshClineBridge.status().plugin === 'dsh-cline-bridge')
 }
 
 // ───────────────────────── 3. 用量统计与来源标签 ─────────────────────────
@@ -371,7 +371,7 @@ const ctxStatusOf = (options) => lastCtx?.__opencodeFreeBridge?.status?.(options
     headers: { 'content-type': 'application/json', authorization: `Bearer ${SECRET_A}` },
     body: JSON.stringify({ model: 'cline-free/deepseek-v4.1-flash', messages: [] }),
   })).text()
-  ctx.__opencodeFreeBridge.flushQuotaState()
+  ctx.__dshClineBridge.flushQuotaState()
   const disk = readFileSync(statePath, 'utf8')
   check('H25 磁盘状态文件不含 key 原文', !disk.includes(SECRET_A) && !disk.includes(SECRET_B))
   check('H26 磁盘状态文件连掩码片段也不含', !disk.includes(SECRET_A.slice(0, 4) + '…') && !disk.includes(MASK_A), disk.slice(0, 60))
@@ -515,7 +515,7 @@ const ctxStatusOf = (options) => lastCtx?.__opencodeFreeBridge?.status?.(options
 
   // 采集是异步的（顺带读一遍流），给它一拍
   await new Promise((r) => setTimeout(r, 50))
-  const keys = ctx.__opencodeFreeBridge.status().keys
+  const keys = ctx.__dshClineBridge.status().keys
   const row = keys.find((k) => k.label === label8(SECRET_B))
   check('J4 token 用量按 key+模型 累加（非流式 + 两次流式）',
     row?.models?.[model]?.tokens?.input === 6000 && row?.models?.[model]?.tokens?.output === 900,
@@ -533,7 +533,7 @@ const ctxStatusOf = (options) => lastCtx?.__opencodeFreeBridge?.status?.(options
     body: JSON.stringify({ model, messages: [] }),
   })).text()
   await new Promise((r) => setTimeout(r, 30))
-  const afterKeys = ctx.__opencodeFreeBridge.status().keys
+  const afterKeys = ctx.__dshClineBridge.status().keys
   const limited = afterKeys.find((k) => k.label === label8(SECRET_A))
   const healthy = afterKeys.find((k) => k.label === label8(SECRET_B))
   check('J8 撞限流的响应不给被限的那把 key 记 token（轮换成功的那把照常记）',
@@ -675,7 +675,7 @@ const ctxStatusOf = (options) => lastCtx?.__opencodeFreeBridge?.status?.(options
   const before = await callRoute()
   const beforeA = (before.json.keys ?? []).find((k) => k.label === label8(SECRET_A))
   const beforeB = (before.json.keys ?? []).find((k) => k.label === label8(SECRET_B))
-  lastCtx?.__opencodeFreeBridge?.flushQuotaState?.()
+  lastCtx?.__dshClineBridge?.flushQuotaState?.()
 
   const rawDisk = readFileSync(statePath, 'utf8')
   const disk = JSON.parse(rawDisk)
@@ -721,7 +721,7 @@ const ctxStatusOf = (options) => lastCtx?.__opencodeFreeBridge?.status?.(options
   check('P18 重置后「最近决策」清空', (afterReset.json.recent ?? []).length === 0, `recent=${(afterReset.json.recent ?? []).length}`)
 
   // 重置也落盘：再来一次「重启」，确认磁盘上确实归零了
-  lastCtx?.__opencodeFreeBridge?.flushQuotaState?.()
+  lastCtx?.__dshClineBridge?.flushQuotaState?.()
   const afterResetDisk = JSON.parse(readFileSync(statePath, 'utf8'))
   check('P19 重置结果落盘（磁盘上的计数与 token 也归零）',
     afterResetDisk.totals?.clineRequests === 0 && Number(afterResetDisk.usage?.[label8(SECRET_B)]?.stats?.tokens?.input) === 0,
@@ -886,10 +886,10 @@ function table_headers(tree) {
 }
 
 const CLIENT_SOURCE = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
-const MODULE_ID = 'opencode-free-bridge'
-const ROUTE = '/opencode-free-bridge/cline-keys'
-const CLIENT_IMPORT_ROUTE = '/opencode-free-bridge/cline-keys/import'
-const CLIENT_RESET_ROUTE = '/opencode-free-bridge/cline-keys/stats/reset'
+const MODULE_ID = 'dsh-cline-bridge'
+const ROUTE = '/dsh-cline-bridge/keys'
+const CLIENT_IMPORT_ROUTE = '/dsh-cline-bridge/keys/import'
+const CLIENT_RESET_ROUTE = '/dsh-cline-bridge/keys/stats/reset'
 
 /** 把客户端半边装进 vm 沙箱，返回它的模块导出。 */
 function loadClientBundle() {
@@ -1003,7 +1003,7 @@ async function renderPanel(payload, { fetchError = null } = {}) {
   check('C1 bundle id 与 package.json name 一致', bundle.id === MODULE_ID, bundle.id)
   check('C2 声明了 slots 依赖', Array.isArray(bundle.exports.inject) && bundle.exports.inject.includes('slots'), JSON.stringify(bundle.exports.inject))
   check('C3 注册进 settings.section 座位', registered.length === 1 && registered[0].options.name === 'settings.section', JSON.stringify(registered.map((r) => r.options?.name)))
-  check('C4 座位 id/order/locale 齐备', registered[0].options.id === MODULE_ID && typeof registered[0].options.order === 'number' && registered[0].options.locale === 'opencodeFreeBridge', JSON.stringify(registered[0].options))
+  check('C4 座位 id/order/locale 齐备', registered[0].options.id === MODULE_ID && typeof registered[0].options.order === 'number' && registered[0].options.locale === 'dshClineBridge', JSON.stringify(registered[0].options))
   check('C5 座位标签是可调用 thunk（切换语言无需重注册）', typeof registered[0].options.label === 'function' && registered[0].options.label() === 'Cline Key', String(registered[0].options.label?.()))
   check('C6 zh/en 两套字典都注册进 DSH locale', dictionaries.length === 2 && dictionaries.some((d) => d[1] === 'zh') && dictionaries.some((d) => d[1] === 'en'), JSON.stringify(dictionaries.map((d) => d[1])))
   // 漏译不会报错，只会让界面回退成键名，所以这里必须自己盯住两套字典的键集合一致
