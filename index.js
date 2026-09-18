@@ -21,6 +21,7 @@ import {
   migrateLegacyQuotaState,
 } from './lib/host/defaults.js'
 import { keyLabel } from './lib/host/labels.js'
+import { isPlausibleModelId } from './lib/host/model-id.js'
 import { cooldownMsFromResponse, createQuotaStore, parseRetryWindowMs } from './lib/host/quota-state.js'
 import { readAuthTarget, readKeyOf, readModelOf, replayableBody, writeKeyTo } from './lib/host/request-shape.js'
 import { normalizeUsage, tapUsage } from './lib/host/usage.js'
@@ -311,11 +312,11 @@ export function apply(ctx, config) {
       }
 
       // 首发送默认沿用请求自带的 key（即 DSH 里配置的那个），轮换只作为撞限流后的兜底。
-      // 面板里选定了「使用中」的 key 时它优先：首发送改用选定那把（请求没带 key 时也由它补上）。
-      // 选定只决定「从哪把开始」——撞限流后的轮换、快速失败等一概不变；选定的 key
-      // 已不在池中（凭据被删 / ref 改过）时 selected() 返回 undefined，静默退回原行为。
+      // 面板为**当前模型**选定了「使用中」的 key 时它优先：首发送改用选定那把（请求没带 key
+      // 时也由它补上）。选定只决定「从哪把开始」——撞限流后的轮换、快速失败等一概不变；
+      // 该模型没有选定、或选定的 key 已不在池中时 selected() 返回 undefined，静默退回原行为。
       let currentKey = requestKey
-      const selected = pool.selected()
+      const selected = pool.selected(model)
       if (selected) {
         currentKey = selected.key
         writeKeyTo(headers, currentKey, authTarget)
@@ -413,6 +414,9 @@ export function apply(ctx, config) {
             diag.rotations += 1
             decide(`rotated ${keyLabel(currentKey)}→${next.label} model=${model}`)
             log(`Cline 限流已换 key 恢复（${keyLabel(currentKey)} → ${next.label}, model=${model}）`)
+            // 这个模型在面板上若有「使用中」的选定，让它跟着挪到真正跑通的这把：否则面板会
+            // 一直标着一把已经限流的 key，而实际在用的是另一把。没选定的模型不受影响。
+            if (pool.followRotation(model, next.key)) log(`已把 ${model} 的「使用中」改为 ${next.label}（原选定已限流）`)
           } else {
             // 换 key 后拿到的是 4xx/5xx：这次轮换并没有「恢复」，别把它计成成功，
             // 也别把冷却清掉——留着继续试池里下一把。
@@ -606,9 +610,10 @@ export function apply(ctx, config) {
     })
   }
 
-  /** 选定 / 取消「使用中」的 Key：只认池内已知的 8 位标签，空值＝取消（幂等）。
+  /** 为**某个模型**选定 / 取消「使用中」的 Key：只认池内已知的 8 位标签，空值＝取消（幂等）。
+   *  模型与标签两维都必填——选定是「这个模型上用这把」，缺模型就没法对号入座。
    *  它不改凭据——只决定插件发请求时从哪把开始（撞限流后照常轮换），所以闸门与
-   *  另两条写路由完全一致，回包也只有标签，没有任何 Key 材料。 */
+   *  另两条写路由完全一致，回包也只有模型名与标签，没有任何 Key 材料。 */
   const handleKeySelect = async (req, res) => {
     if (!passWriteGuard(req, res)) return
     if (!isJsonRequest(req)) return sendJson(res, 415, { error: 'content-type must be application/json' })
@@ -619,19 +624,22 @@ export function apply(ctx, config) {
       const tooLarge = error?.code === 'PAYLOAD_TOO_LARGE'
       return sendJson(res, tooLarge ? 413 : 400, { error: String(error?.message ?? error) })
     }
+    const rawModel = payload?.model
     const raw = payload?.label
     // 类型不对时明确报错，而不是静默当成「取消」——面板永远发字符串，这里是防手改请求
-    if (raw !== undefined && raw !== null && typeof raw !== 'string') {
-      return sendJson(res, 400, { error: 'label must be a string' })
+    if ((rawModel !== undefined && typeof rawModel !== 'string') || (raw !== undefined && raw !== null && typeof raw !== 'string')) {
+      return sendJson(res, 400, { error: 'model and label must be strings' })
     }
+    const model = typeof rawModel === 'string' ? rawModel.trim() : ''
     const label = typeof raw === 'string' ? raw.trim() : ''
-    if (!pool.setSelection(label)) return sendJson(res, 400, { error: 'unknown key label' })
-    const applied = pool.selected()
-    log(applied ? `已选定使用 key ${applied.label}` : '已取消选定的 key')
+    if (!isPlausibleModelId(model)) return sendJson(res, 400, { error: 'model is required' })
+    if (!pool.setSelection(model, label)) return sendJson(res, 400, { error: 'unknown key label' })
+    const applied = pool.selected(model)
+    log(applied ? `已为 ${model} 选定使用 key ${applied.label}` : `已取消 ${model} 上的选定`)
     return sendJson(res, 200, {
       ok: true,
+      model,
       selection: applied ? { label: applied.label } : null,
-      poolSize: pool.size,
     })
   }
 
@@ -742,9 +750,9 @@ export function apply(ctx, config) {
     /** 累计计数与统计起点（自检用来断言「跨重启没丢」）。 */
     statsTotals: () => quotaStore.totals(),
     resetStats: () => pool.resetStats(),
-    /** 面板选定的「使用中」Key（自检用；只有 8 位标签，不含 key 原文）。 */
-    selectedLabel: () => pool.selected()?.label ?? '',
-    setSelection: (label) => pool.setSelection(label),
+    /** 某个模型上选定的「使用中」Key（自检用；只有 8 位标签，不含 key 原文）。 */
+    selectedLabel: (model) => pool.selected(model)?.label ?? '',
+    setSelection: (model, label) => pool.setSelection(model, label),
     status: (options) => statusRoute.build(options),
     routePath: statusRoute.path,
     // 强制立刻重扫一次额外 key 来源（自检用；运行期新增 ref 的正式路径是 5 分钟自动复扫）

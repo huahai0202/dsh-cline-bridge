@@ -757,15 +757,20 @@ const ctxStatusOf = (options) => lastCtx?.__dshClineBridge?.status?.(options)
     parsed.values.join('|'))
 }
 
-// ───────────────── 4f-2. 选定「使用中」的 Key（第三条写路由）─────────────────
-// 语义：选定只决定「首发送从哪把开始」——不改凭据、不写 key 原文、撞限流照常轮换。
-// 这一组钉：写路由的三道闸、标签校验、取消是幂等清空、载荷同步、落盘与跨重启保留。
+// ───────────────── 4f-2. 选定「使用中」的 Key（第三条写路由，按模型独立）─────────────────
+// 语义：选定只决定「**这个模型**的首发送从哪把开始」——不改凭据、不写 key 原文、撞限流
+// 照常轮换，而且给一个模型选定不影响其它模型。这一组钉：写路由的三道闸、模型与标签两维的
+// 校验、取消是幂等清空、载荷同步、落盘、跨重启与模型间互不影响。
 {
   const statePath = join(TEST_STATE_DIR, `select-${++stateSeq}.json`)
   rmSync(statePath, { force: true })
+  const MODEL_CLINE = 'cline-free/deepseek-v4.1-flash'
+  const MODEL_GLM = 'z-ai/glm-5.3-flash'
   mount({ clineKeys: [SECRET_A, SECRET_B], quotaStatePath: statePath })
   const selectPost = (options = {}) => callRoute({ path: SELECT_PATH, method: 'POST', contentType: 'application/json', ...options })
   const labelA = label8(SECRET_A)
+  const labelB = label8(SECRET_B)
+  const selectionOf = () => ctxStatusOf().selection ?? {}
 
   const notPost = await callRoute({ path: SELECT_PATH, method: 'GET' })
   check('W1 选定路由只收 POST（GET → 405）', notPost.status === 405, String(notPost.status))
@@ -775,36 +780,48 @@ const ctxStatusOf = (options) => lastCtx?.__dshClineBridge?.status?.(options)
   check('W3 非 application/json → 415', wrongType.status === 415, String(wrongType.status))
   const badJson = await selectPost({ body: '{oops' })
   check('W4 坏 JSON → 400', badJson.status === 400, String(badJson.status))
-  const notString = await selectPost({ body: JSON.stringify({ label: 42 }) })
-  check('W5 label 不是字符串 → 400（不静默当成取消）', notString.status === 400, String(notString.status))
-  const unknown = await selectPost({ body: JSON.stringify({ label: 'deadbeef' }) })
+  const noModel = await selectPost({ body: JSON.stringify({ label: 'deadbeef' }) })
+  check('W5 缺模型 → 400（选定必须落在某个模型上，否则无从对号入座）', noModel.status === 400, String(noModel.status))
+  const junkModel = await selectPost({ body: JSON.stringify({ model: '???', label: labelA }) })
+  const starModel = await selectPost({ body: JSON.stringify({ model: '*', label: labelA }) })
+  check('W5b 不像模型的模型名（??? / *）→ 400', junkModel.status === 400 && starModel.status === 400, `${junkModel.status} ${starModel.status}`)
+  const notString = await selectPost({ body: JSON.stringify({ model: MODEL_CLINE, label: 42 }) })
+  check('W5c label 不是字符串 → 400（不静默当成取消）', notString.status === 400, String(notString.status))
+  const unknown = await selectPost({ body: JSON.stringify({ model: MODEL_CLINE, label: 'deadbeef' }) })
   check('W6 池内没有的标签 → 400，且选定保持为空',
-    unknown.status === 400 && ctxStatusOf().selection === null, `${unknown.status} ${JSON.stringify(ctxStatusOf().selection)}`)
-  const chosen = await selectPost({ body: JSON.stringify({ label: labelA }) })
-  check('W7 选定池内已知标签 → 200，只读载荷同步可见',
-    chosen.status === 200 && chosen.json?.selection?.label === labelA && ctxStatusOf().selection?.label === labelA,
-    `${chosen.status} ${JSON.stringify(chosen.json?.selection ?? null)}`)
+    unknown.status === 400 && Object.keys(selectionOf()).length === 0, `${unknown.status} ${JSON.stringify(selectionOf())}`)
+  const chosen = await selectPost({ body: JSON.stringify({ model: MODEL_CLINE, label: labelA }) })
+  check('W7 为某个模型选定池内已知标签 → 200，只读载荷按模型同步可见（另一个模型仍为空）',
+    chosen.status === 200 && chosen.json?.model === MODEL_CLINE && chosen.json?.selection?.label === labelA &&
+      selectionOf()[MODEL_CLINE] === labelA && selectionOf()[MODEL_GLM] === undefined,
+    `${chosen.status} ${JSON.stringify(chosen.json ?? null)}`)
   lastCtx.__dshClineBridge.flushQuotaState()
   const fileText = readFileSync(statePath, 'utf8')
   check('W8 选定落盘只有 8 位标签，没有 key 原文',
     fileText.includes(labelA) && !fileText.includes(SECRET_A) && !fileText.includes(SECRET_B),
     `hasLabel=${fileText.includes(labelA)} hasRaw=${fileText.includes(SECRET_A)}`)
-  const cleared = await selectPost({ body: JSON.stringify({ label: '' }) })
-  check('W9 空标签 → 200 且清空（幂等）',
-    cleared.status === 200 && cleared.json?.selection === null && ctxStatusOf().selection === null,
-    JSON.stringify(cleared.json?.selection ?? null))
-  const clearedAgain = await selectPost({ body: '{}' })
-  check('W9b 缺省 label 同样是清空（幂等）', clearedAgain.status === 200 && clearedAgain.json?.selection === null, String(clearedAgain.status))
+  // W9：两个模型各选一把，取消其中一个不动另一个——选定是「模型 + 标签」两维的
+  const forGlm = await selectPost({ body: JSON.stringify({ model: MODEL_GLM, label: labelB }) })
+  const cleared = await selectPost({ body: JSON.stringify({ model: MODEL_CLINE, label: '' }) })
+  check('W9 取消某个模型的选定是幂等清空，另一个模型的选定原封不动',
+    forGlm.status === 200 && cleared.status === 200 && cleared.json?.selection === null &&
+      selectionOf()[MODEL_CLINE] === undefined && selectionOf()[MODEL_GLM] === labelB,
+    `${cleared.status} selection=${JSON.stringify(selectionOf())}`)
+  const clearedAgain = await selectPost({ body: JSON.stringify({ model: MODEL_GLM, label: '' }) })
+  check('W9b 再清一次同样 200（幂等），选定回到空表',
+    clearedAgain.status === 200 && Object.keys(selectionOf()).length === 0, JSON.stringify(selectionOf()))
   mount({ clineKeys: [SECRET_A], keyImport: false })
-  const disabled = await selectPost({ body: JSON.stringify({ label: 'deadbeef' }) })
+  const disabled = await selectPost({ body: JSON.stringify({ model: MODEL_CLINE, label: 'deadbeef' }) })
   check('W10 keyImport:false 时选定路由一并 403（与另两条写路由同一开关）', disabled.status === 403, String(disabled.status))
-  // 跨重启：选一次 → 落盘 → 换全新实例读同一份文件
+  // 跨重启：两个模型各选一把 → 落盘 → 换全新实例读同一份文件
   mount({ clineKeys: [SECRET_A, SECRET_B], quotaStatePath: statePath })
-  const restored = await selectPost({ body: JSON.stringify({ label: labelA }) })
+  const restoredA = await selectPost({ body: JSON.stringify({ model: MODEL_CLINE, label: labelA }) })
+  await selectPost({ body: JSON.stringify({ model: MODEL_GLM, label: labelB }) })
   lastCtx.__dshClineBridge.flushQuotaState()
   mount({ clineKeys: [SECRET_A, SECRET_B], quotaStatePath: statePath })
-  check('W11 选定跨重启保留（新实例读同一状态文件后仍在）',
-    restored.status === 200 && ctxStatusOf().selection?.label === labelA, JSON.stringify(ctxStatusOf().selection ?? null))
+  check('W11 按模型的选定跨重启保留（两个模型各读回自己那条）',
+    restoredA.status === 200 && selectionOf()[MODEL_CLINE] === labelA && selectionOf()[MODEL_GLM] === labelB,
+    JSON.stringify(selectionOf()))
 }
 
 // ───────────────── 4g. 统计跨重启持久化 + 重置统计 ─────────────────
@@ -1227,6 +1244,15 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
   check('C27 列宽百分比之和正好 100%（不会几列互相挤压）',
     Math.abs(widths.reduce((sum, w) => sum + Number.parseFloat(w), 0) - 100) < 0.001, String(widths.reduce((s, w) => s + Number.parseFloat(w), 0)))
 
+  // 用户反馈：加上「使用」列后，窄侧栏里要横向拖滚动条才看得到它，而 Key 与「状态」之间
+  // 还空着一大片。两条锁——表格 min-width 不高于 520px（七列在一屏里放得下）＋ Key 列不
+  // 超过 17%（它只放 9 个字符的掩码，给多了就是那片空白）。
+  const tableRule = /_dsh_ofb_table \{([^}]*)\}/.exec(bundle.styleTags[0]?.textContent ?? '')?.[1] ?? ''
+  const minWidth = Number.parseInt(/min-width:\s*(\d+)px/.exec(tableRule)?.[1] ?? '0', 10)
+  const keyShare = Number.parseFloat(widths[1] ?? '0')
+  check('C27d 表格 min-width ≤ 520px 且 Key 列 ≤ 17%（七列一屏放得下，Key↔状态之间不留空白）',
+    minWidth > 0 && minWidth <= 520 && keyShare <= 17, `min-width=${minWidth}px key=${keyShare}%`)
+
   // 表头必须自带裁剪：只看 nowrap 的话，列一窄标题就会压到隔壁列头上（用户截图里的现象）
   const css = bundle.styleTags[0]?.textContent ?? ''
   const thRule = /_dsh_ofb_table th \{([^}]*)\}/.exec(css)?.[1] ?? ''
@@ -1590,24 +1616,27 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
   bundle.mini.dispose()
 }
 
-// ──────────────── 5d. 选定「使用中」的 Key：按钮 → POST → 徽标切换 ────────────────
-// 表格最后一列「使用」：点一下就把这把设为「使用中」（首发送优先用它），再点一次取消。
-// 这一组把整条链路走一遍——按钮存在、点击发出一次 JSON POST、成功后重拉、徽标跟着切换。
+// ──────────────── 5d. 选定「使用中」的 Key：按模型独立，按钮 → POST → 徽标切换 ────────────────
+// 表格最后一列「使用」：点一下就把这把设为**当前模型**上「使用中」的那把（该模型的首发送
+// 优先用它），再点一次取消。这一组把整条链路走一遍——按钮存在、点击发出一次 JSON POST
+// （带上模型名）、成功后重拉、徽标跟着当前模型切换。
 {
+  const MODEL_A = 'cline-free/deepseek-v4.1-flash'
+  const MODEL_B = 'z-ai/glm-5.3-flash'
   const bundle = loadClientBundle()
   const calls = []
   const payload = {
     plugin: MODULE_ID,
     version: PLUGIN_VERSION,
-    models: [{ id: 'cline-free/deepseek-v4.1-flash', lastUsedAt: 0 }],
-    currentModel: 'cline-free/deepseek-v4.1-flash',
+    models: [{ id: MODEL_A, lastUsedAt: 0 }, { id: MODEL_B, lastUsedAt: 0 }],
+    currentModel: MODEL_A,
     totals: { poolSize: 2, clineRequests: 3, rotations: 1, failFasts: 0, since: Date.now() - 3600_000 },
     keys: [
       { index: 1, label: 'db694bbf', preview: 'sk_c…ead1', source: 'request', cooling: [], stats: { sent: 0, ok: 0, failed: 0, limited: 0, lastUsedAt: 0, tokens: {} }, models: {} },
       { index: 2, label: '761f9875', preview: 'sk_t…8888', source: '.credentials.yaml: CLINE_API_KEY_2', cooling: [], stats: { sent: 0, ok: 0, failed: 0, limited: 0, lastUsedAt: 0, tokens: {} }, models: {} },
     ],
-    // 第 2 把是当前「使用中」的：面板应当把它那行的按钮点亮
-    selection: { label: '761f9875' },
+    // 两个模型各选一把：面板只该点亮**当前模型**（MODEL_A）选中的那把
+    selection: { [MODEL_A]: '761f9875', [MODEL_B]: 'db694bbf' },
     recent: [],
   }
   const jsonResponse = (body) => ({
@@ -1616,7 +1645,7 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
     headers: { get: (name) => (String(name).toLowerCase() === 'etag' ? '"select-etag"' : null) },
     json: async () => body,
   })
-  const selectReply = { ok: true, selection: { label: 'db694bbf' }, poolSize: 2 }
+  const selectReply = { ok: true, model: MODEL_A, selection: { label: 'db694bbf' } }
   bundle.sandbox.fetch = async (url, init) => {
     const method = (init && init.method) || 'GET'
     calls.push({ url, method, headers: (init && init.headers) || {}, body: init && init.body })
@@ -1648,36 +1677,69 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
     headers.join('|') === '#|Key|状态|冷却 / 恢复|请求 / Token|最近使用|使用' && useButtons.length === 2,
     `${headers.join('|')} buttons=${useButtons.length}`)
   const activeButton = useButtons.find((n) => String(n.props.className).includes('_on'))
-  check('X2 选定的那把显示「使用中」并带 aria-pressed（其余显示「使用」）',
+  check('X2 当前模型选中的那把显示「使用中」并带 aria-pressed（其余显示「使用」）',
     Boolean(activeButton) && textOf(activeButton).join('') === '使用中' && activeButton.props['aria-pressed'] === 'true' &&
       useButtons.some((n) => textOf(n).join('') === '使用'),
     useButtons.map((n) => textOf(n).join('')).join(' | '))
 
-  // 点未选中的那把 → POST 它的标签
+  // 点当前模型视图里未选中的那把 → POST 它的标签（带上模型名）
   const passive = useButtons.find((n) => !String(n.props.className).includes('_on'))
   const pending = passive.props.onClick()
   await new Promise((r) => setTimeout(r, 20))
   if (pending && typeof pending.then === 'function') await pending
   tree = await bundle.mini.render(Component, {})
   const post = calls.find((c) => c.method === 'POST')
-  check('X3 点击发出一次 JSON POST（body 是这把的 8 位标签）',
-    post?.url === CLIENT_SELECT_ROUTE && post?.headers['content-type'] === 'application/json' && JSON.parse(post.body).label === 'db694bbf',
+  check('X3 点击发出一次 JSON POST（模型名 + 这把的 8 位标签）',
+    post?.url === CLIENT_SELECT_ROUTE && post?.headers['content-type'] === 'application/json' &&
+      JSON.parse(post.body).model === MODEL_A && JSON.parse(post.body).label === 'db694bbf',
     post ? `${post.url} ${post.body}` : 'no POST')
   check('X4 成功后自动重拉面板数据（不必等 5 秒轮询）',
     calls.filter((c) => c.method === 'GET').length >= 2, `GET=${calls.filter((c) => c.method === 'GET').length}`)
 
-  // 再点「使用中」那把 → 发空标签（取消）
+  // 再点「使用中」那把 → 发空标签（取消该模型的选定）
   useButtons = collectUseButtons(tree)
   const activeAgain = useButtons.find((n) => String(n.props.className).includes('_on'))
   const clearPending = activeAgain ? activeAgain.props.onClick() : undefined
   await new Promise((r) => setTimeout(r, 20))
   if (clearPending && typeof clearPending.then === 'function') await clearPending
   const posts = calls.filter((c) => c.method === 'POST')
-  check('X5 再点「使用中」发出空标签（取消选定）',
-    posts.length === 2 && JSON.parse(posts[1].body).label === '',
+  check('X5 再点「使用中」发出空标签（取消当前模型的选定）',
+    posts.length === 2 && JSON.parse(posts[1].body).model === MODEL_A && JSON.parse(posts[1].body).label === '',
     posts.map((c) => String(c.body)).join(' ; '))
   check('X6 渲染树里不出现 Key 原文', !JSON.stringify(tree).includes(SECRET_A) && !JSON.stringify(tree).includes(SECRET_B))
+
+  // 切到另一个模型的芯片：徽标跟着当前模型走（选定按模型独立）
+  const chip = findNode(tree, (n) => n.type === 'button' && textOf(n).join('') === 'glm-5.3-flash')
+  if (chip) chip.props.onClick()
+  tree = await bundle.mini.render(Component, {})
+  const switchedButtons = collectUseButtons(tree)
+  const switchedActive = switchedButtons.find((n) => String(n.props.className).includes('_on'))
+  check('X7 切到另一个模型后，点亮的是它自己选中的那把（第 1 行 db694bbf）',
+    Boolean(chip) && Boolean(switchedActive) &&
+      textOf(switchedActive).join('') === '使用中' &&
+      switchedButtons.indexOf(switchedActive) === 0,
+    switchedButtons.map((n) => textOf(n).join('')).join(' | '))
   bundle.mini.dispose()
+}
+
+{
+  // 面板还不知道有哪些模型（配置读到之前就打开了设置页）：按钮禁用并说明原因，
+  // 而不是发出一次注定 400 的请求（选定必须落在某个模型上）。
+  const noModel = await renderPanel({
+    plugin: MODULE_ID,
+    version: PLUGIN_VERSION,
+    models: [],
+    currentModel: '',
+    totals: { poolSize: 1, clineRequests: 0, rotations: 0, failFasts: 0, since: Date.now() },
+    keys: [{ index: 1, label: 'db694bbf', preview: 'sk_c…ead1', source: 'request', cooling: [], stats: { sent: 0, ok: 0, failed: 0, limited: 0, lastUsedAt: 0, tokens: {} }, models: {} }],
+    selection: {},
+    recent: [],
+  })
+  const button = findNode(noModel.tree, (n) => String(n.props?.className ?? '').includes('_dsh_ofb_usebtn'))
+  check('X8 还不知道有哪些模型时「使用」按钮禁用并说明原因',
+    Boolean(button) && button.props.disabled === true && String(button.props.title).includes('模型'),
+    button ? `disabled=${button.props.disabled} title=${button.props.title}` : 'no button')
+  noModel.bundle.mini.dispose()
 }
 
 {
@@ -1689,12 +1751,12 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
     currentModel: 'cline-free/deepseek-v4.1-flash',
     totals: { poolSize: 1, clineRequests: 0, rotations: 0, failFasts: 0, since: Date.now() },
     keys: [{ index: 1, label: 'db694bbf', preview: 'sk_c…ead1', source: 'request', cooling: [], stats: { sent: 0, ok: 0, failed: 0, limited: 0, lastUsedAt: 0, tokens: {} }, models: {} }],
-    selection: { label: 'aaaaaaaa' },
+    selection: { 'cline-free/deepseek-v4.1-flash': 'aaaaaaaa' },
     recent: [],
   })
   const missingText = textOf(missing.tree).join('\n')
-  check('X7 选定的 Key 已不在池中时给出提示（且没有任何行被点亮）',
-    missingText.includes('选定的 Key 已不在池中') &&
+  check('X9 本模型选定的 Key 已不在池中时给出提示（且没有任何行被点亮）',
+    missingText.includes('本模型选定的 Key 已不在池中') &&
       !findNode(missing.tree, (n) => String(n.props?.className ?? '').includes('_dsh_ofb_usebtn_on')),
     missingText.split('\n').filter((s) => s.includes('不在池中')).join(''))
   missing.bundle.mini.dispose()
@@ -1754,7 +1816,7 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
         },
       },
     ],
-    selection: { label: 'db694bbf' },
+    selection: { 'cline-free/deepseek-v4.1-flash': 'db694bbf' },
     recent: [{ at: new Date().toISOString(), model: 'cline-free/deepseek-v4.1-flash', decision: 'pass-through status=200' }],
   }
 
