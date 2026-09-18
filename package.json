@@ -12,12 +12,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/huahai0202/opencode-free-bridge.git"
+    "url": "git+https://github.com/huahai0202/dsh-cline-bridge.git"
   },
   "bugs": {
-    "url": "https://github.com/huahai0202/opencode-free-bridge/issues"
+    "url": "https://github.com/huahai0202/dsh-cline-bridge/issues"
   },
-  "homepage": "https://github.com/huahai0202/opencode-free-bridge#readme",
+  "homepage": "https://github.com/huahai0202/dsh-cline-bridge#readme",
   "license": "MIT",
   "dsh": {
     "bundle": {

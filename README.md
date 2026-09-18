@@ -7,7 +7,9 @@
 > **v2.0.0 破坏性变更**：本插件由 `opencode-free-bridge` 更名而来，并**移除了 OpenCode Zen 渠道**（原因见下节）。从旧版升级需要两件事：
 >
 > 1. profile 的 `cordis.patch.yml` 里把条目 id 从 `opencode-free-bridge` 改成 `dsh-cline-bridge`（配置键不变）；
-> 2. 重新安装插件（包名已变，仓库地址不变）：`dsh plugin --profile web remove opencode-free-bridge && dsh plugin --profile web add github:huahai0202/opencode-free-bridge`。
+> 2. 重新安装插件（包名与仓库均已改名）：`dsh plugin --profile web remove opencode-free-bridge && dsh plugin --profile web add github:huahai0202/dsh-cline-bridge`。
+>
+> （GitHub 仓库已由 `opencode-free-bridge` 改名为 `dsh-cline-bridge`，旧地址自动重定向，但包名变了、必须重装一次。）
 >
 > 旧状态文件 `.opencode-free-bridge-cline-quota.json` 会在首次启动时自动迁移为 `.dsh-cline-bridge-quota.json`，冷却与累计统计不丢。
 
@@ -235,10 +237,10 @@ refs:
 在终端运行以下命令，将插件安装到 DSH 的 `web` Profile：
 
 ```bash
-dsh plugin --profile web add github:huahai0202/opencode-free-bridge
+dsh plugin --profile web add github:huahai0202/dsh-cline-bridge
 ```
 
-> 插件在 v2.0.0 更名为 `dsh-cline-bridge`，但**仓库地址沿用旧名** `opencode-free-bridge`——包名与仓库地址解耦，不影响安装与 bundle 识别。日后若把 GitHub 仓库改名，旧地址会自动重定向，届时把这里的命令与 package.json 里的仓库链接换成新名即可。
+> 仓库已由 `opencode-free-bridge` 更名为 `dsh-cline-bridge`（与包名同名）；旧地址 GitHub 会自动重定向，但从旧版本（v1）升级请走顶部「v2.0.0 破坏性变更」的完整步骤。
 
 ---
 
