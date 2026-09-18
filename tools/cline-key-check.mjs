@@ -33,6 +33,10 @@ const tag = (key) => {
 }
 const LIMITED_PREFIXES = ['k1', 'k5', 'e1', 'c1'] // 这些 key 一律撞「每日免费额度」上限
 const TRANSIENT_PREFIXES = ['r1'] // 这些 key 返回瞬时限流（无每日上限字样）
+// 这些 key 只给标准 `Retry-After` 头，报文里**没有**任何可解析的窗口文本：
+// h1 走「纯秒数」形态，h2 走「HTTP-date」形态（两种都是 HTTP 规范允许的写法）；
+// h3 两个来源同时在（报文 5 分钟、头 1 小时），用来钉「报文文本优先」。
+const HEADER_PREFIXES = ['h1', 'h2', 'h3']
 
 const server = createServer((req, res) => {
   let body = ''
@@ -47,6 +51,30 @@ const server = createServer((req, res) => {
 
     if (TRANSIENT_PREFIXES.some((p) => key === p || key.startsWith(p))) {
       res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '3' })
+      res.end(JSON.stringify({ code: 'RATE_LIMITED', message: 'Too many requests, please slow down.' }))
+      return
+    }
+
+    if (HEADER_PREFIXES.some((p) => key === p || key.startsWith(p))) {
+      const isPrecedenceProbe = key.startsWith('h3')
+      const retryAfter = key.startsWith('h2')
+        ? new Date(Date.now() + 2 * 3600_000).toUTCString() // HTTP-date 形态（2 小时后）
+        : '3600' // 纯秒数形态（h1；h3 也带头，但报文里另有一个更小的窗口）
+      res.writeHead(429, { 'content-type': 'application/json', 'retry-after': retryAfter })
+      res.end(
+        JSON.stringify(
+          isPrecedenceProbe
+            ? { code: 'INFERENCE_CAP_ERROR', message: 'Error 429: Daily free limit reached. Try again in 5m' }
+            : { code: 'RATE_LIMITED', message: 'Too many requests, please slow down.' },
+        ),
+      )
+      return
+    }
+
+    if (key.startsWith('n1')) {
+      // 只回「被限流了」这一件事：报文里没有可解析的窗口，也没有 Retry-After 头。
+      // 插件据此只应该记住「限流发生过」，**不该**自己编一个恢复时刻。
+      res.writeHead(429, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ code: 'RATE_LIMITED', message: 'Too many requests, please slow down.' }))
       return
     }
@@ -577,6 +605,13 @@ const since = (n) => seen.slice(n)
   check('R1 单 key 池下 Request 形态的请求体不丢（逐字节一致）',
     a.length === 1 && a[0].body === payload, `len=${a[0]?.body?.length ?? -1}/${payload.length}`)
 
+  // R6：Request 形态下「最近决策」的那条轨迹也要带上真实模型。轨迹是在 model 解析之前
+  // 建立的（那时只看得见 init?.body，Request 形态下恒为 '*'），解析出模型后必须写回，
+  // 否则面板的「最近决策」对生产主路径永远显示 '*'。
+  const trace = ctxDiag().lastRequests?.at(-1)
+  check('R6 Request 形态的轨迹记录真实模型（不再是 *）',
+    trace?.model === 'deepseek/deepseek-v4.1-flash', String(trace?.model))
+
   // R2：流式 body 同样要保住（旧代码对未消费的流 clone() 会抛，被 catch 吞成「无 body」）
   const stream = new ReadableStream({
     start(controller) {
@@ -816,6 +851,70 @@ const since = (n) => seen.slice(n)
   check('T5b 裁剪保留最近使用的模型行、丢掉最早的',
     manyModels.includes('model-059') && !manyModels.includes('model-000'),
     `has-059=${manyModels.includes('model-059')} has-000=${manyModels.includes('model-000')} first=${manyModels[0]}`)
+}
+
+// ─ U. 冷却窗口只认服务端给的事实：报文的窗口文本 → 标准的 Retry-After 头 ──
+// 两处来源都在服务端手里，插件只负责读：读不出来就不记冷却（U5/U6），绝不自己编一个
+// 恢复时刻——编出来的不只会让面板显示假倒计时，还会让「全池冷却快速失败」把本可以试的
+// key 判成注定失败。少了 Retry-After 这一档，`retry-after: 3` 这类瞬时限流会因为
+// 「两处都没有窗口」而被当成无可奉告，冷却与倒计时一起丢失。
+// 这里六个用例分别钉：纯秒数、HTTP-date、头驱动的小时级收尾、报文优先、不编造、轮换不依赖冷却。
+{
+  /** 该 key 在当前模型上的冷却还剩多少毫秒；没有冷却记录（或已过期）返回 0。
+   *  取的是**面板载荷**（describe → cooling），不是自检快照（snapshot → quota）——
+   *  两个视图字段名不同，写错只会静默拿到 0。 */
+  const coolingMsLeft = (rawKey) => {
+    const row = ctxStatus().keys.find((entry) => entry.label === keyTag(rawKey))
+    const rowQuota = row?.cooling?.[0]
+    return rowQuota ? Math.max(0, rowQuota.readyAt - Date.now()) : 0
+  }
+
+  // U1/U2：报文里没有任何可解析窗口，只有 `retry-after: 3600`。
+  mount({ clineKeys: [], clineMatch: match })
+  const u1n = mark()
+  const u1Key = 'h1-retry-after-seconds'
+  const u1 = await call(u1Key)
+  const u1attempts = since(u1n)
+  const u1left = coolingMsLeft(u1Key)
+  check('U1 retry-after 的纯秒数形态被解析成 1 小时冷却（服务端说了才算）',
+    u1attempts.length === 1 && u1left > 55 * 60_000 && u1left <= 60 * 60_000,
+    `冷却 ${Math.round(u1left / 60_000)} 分钟`)
+  check('U2 由头给出的小时级窗口同样按「额度耗尽」收尾（x-should-retry:false）',
+    u1.noRetry === 'false', String(u1.noRetry))
+
+  // U3：HTTP-date 形态（`Retry-After` 规范允许的另一种写法）。
+  mount({ clineKeys: [], clineMatch: match })
+  const u2Key = 'h2-http-date-shape'
+  await call(u2Key)
+  const u2left = coolingMsLeft(u2Key)
+  check('U3 retry-after 的 HTTP-date 形态同样被解析',
+    u2left > 115 * 60_000 && u2left <= 120 * 60_000, `冷却 ${Math.round(u2left / 60_000)} 分钟`)
+
+  // U4：两个来源同时在（报文 5 分钟、头 1 小时）时，报文文本优先——它才是服务端按这把
+  // key 的额度算出来的窗口，头只是个更粗的兜底。
+  mount({ clineKeys: [], clineMatch: match })
+  const u3Key = 'h3-both-sources'
+  await call(u3Key)
+  const u3left = coolingMsLeft(u3Key)
+  check('U4 报文文本优先于 Retry-After 头（5m 而不是 60m）',
+    u3left > 4 * 60_000 && u3left <= 5 * 60_000, `冷却 ${Math.round(u3left / 60_000)} 分钟`)
+
+  // U5/U6：服务端既不给报文窗口、也不给 Retry-After 头时，插件**不编造**恢复时刻：
+  // 限流照样计数（事实要留住），但面板上没有假倒计时；同时换 key 重发必须照常工作——
+  // 这条路径不再依赖「先记冷却」，靠的是「本次请求试过的 key 不再挑」。
+  const noWindowKey = 'n1-no-window-limit'
+  const backupKey = 'n2-healthy-backup'
+  mount({ clineKeys: [backupKey], clineMatch: match })
+  const u5n = mark()
+  const u5 = await call(noWindowKey)
+  const u5attempts = since(u5n)
+  const u5row = ctxStatus().keys.find((entry) => entry.label === keyTag(noWindowKey))
+  check('U5 没有恢复时刻就不编造冷却（面板上没有假倒计时）',
+    (u5row?.cooling ?? []).length === 0, JSON.stringify(u5row?.cooling ?? []))
+  check('U6 限流仍然计数，且换 key 重发照常成功（不靠自造冷却）',
+    u5.status === 200 && u5attempts.length === 2 && u5attempts[1]?.key === backupKey &&
+      u5row?.models?.['deepseek/deepseek-v4.1-flash']?.limited === 1,
+    `${u5.status} ${attemptsText(u5attempts)} limited=${u5row?.models?.['deepseek/deepseek-v4.1-flash']?.limited}`)
 }
 
 dispose()

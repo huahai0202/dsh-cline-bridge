@@ -21,7 +21,7 @@ import {
   migrateLegacyQuotaState,
 } from './lib/host/defaults.js'
 import { keyLabel } from './lib/host/labels.js'
-import { createQuotaStore, parseRetryWindowMs } from './lib/host/quota-state.js'
+import { cooldownMsFromResponse, createQuotaStore, parseRetryWindowMs } from './lib/host/quota-state.js'
 import { readAuthTarget, readKeyOf, readModelOf, replayableBody, writeKeyTo } from './lib/host/request-shape.js'
 import { normalizeUsage, tapUsage } from './lib/host/usage.js'
 import { createKeyPool } from './lib/host/key-pool.js'
@@ -46,6 +46,10 @@ export function apply(ctx, config) {
   }
 
   const clineMatch = typeof config?.clineMatch === 'string' && config.clineMatch ? config.clineMatch : DEFAULT_CLINE_MATCH
+  // 兜底冷却：默认 0 = 不补。冷却窗口只认服务端给的两处（报文的 Try again in … →
+  // Retry-After 头，见 cooldownMsFromResponse）；两者都拿不到就**不编造**恢复时刻——
+  // 限流是「这把 key 在这个模型上」的事实，什么时候恢复只有服务端知道。显式配置 > 0
+  // 才会在此兜底（那是用户自己的策略，不是插件的默认策略）。
   const clineCooldownMs = Number.isFinite(config?.clineCooldownMs)
     ? Math.max(0, config.clineCooldownMs)
     : DEFAULT_CLINE_COOLDOWN_MS
@@ -277,6 +281,13 @@ export function apply(ctx, config) {
           ? readModelOf(bufferedBody ? new TextDecoder().decode(bufferedBody) : undefined)
           : readModelOf(init?.body)
 
+      // 上面那条轨迹是在 model 解析**之前**建的（那时只看得见 init?.body，Request 形态
+      // 下恒为 '*'）。把真实解析出的模型写回，面板的「最近决策」才不会对 Request 形态
+      // 流量一直显示 '*'；bodyLen 同理，从占位的 -1 改成真实字节数（只进 diagnostics，
+      // 不进面板载荷）。
+      trace.model = model
+      if (input instanceof Request) trace.bodyLen = bufferedBody?.byteLength ?? -1
+
       // 全池冷却的快速失败：报文里的恢复时刻还在阈值之外时，不再发注定失败的请求，
       // 直接回放服务端原始 429（磁盘上有报文就用原始的，没有则合成一条诚实说明）。
       if (allCoolingFailFast && pool.allCooling(model)) {
@@ -364,12 +375,18 @@ export function apply(ctx, config) {
       }
 
       let lastText = await response.clone().text()
-      pool.markCooling(currentKey, model, parseRetryWindowMs(lastText) || clineCooldownMs, lastText)
+      // 冷却窗口只认服务端给的：报文窗口 → Retry-After 头；两者都没有时用 clineCooldownMs
+      // 兜底，而它默认是 0 = 不补（见 defaults.js：不自己编恢复时刻）。
+      pool.markCooling(currentKey, model, cooldownMsFromResponse(response, lastText) || clineCooldownMs, lastText)
       await ensureExtrasQuiet()
 
+      // 本次请求已经试过的 key：换 key 重发时绝不挑回同一把。服务端没给恢复时刻时
+      // 冷却记录为空、冷却跳过不生效，只有这个显式排除能拦住 MRU 把失败那把又挑回来。
+      const tried = new Set([keyLabel(currentKey)])
       for (let attempt = 0; attempt < MAX_ROTATE_ATTEMPTS; attempt++) {
-        const next = pool.pick(model)
-        if (!next || next.key === currentKey) break
+        const next = pool.pick(model, tried)
+        if (!next) break
+        tried.add(next.label)
         const nextHeaders = new Headers(headers)
         writeKeyTo(nextHeaders, next.key, authTarget)
 
@@ -398,7 +415,7 @@ export function apply(ctx, config) {
         }
 
         lastText = await retried.clone().text()
-        pool.markCooling(next.key, model, parseRetryWindowMs(lastText) || clineCooldownMs, lastText)
+        pool.markCooling(next.key, model, cooldownMsFromResponse(retried, lastText) || clineCooldownMs, lastText)
         currentKey = next.key
         response = retried
       }
@@ -407,7 +424,9 @@ export function apply(ctx, config) {
       //   - 额度耗尽（每日上限之类，重试窗口以小时计）：显式标记 x-should-retry:false，
       //     pi-ai 的 provider-retry 会读取该头并立即放弃，省掉无意义的退避等待；
       //   - 瞬时限流：原样返回，交给 pi-ai 按 retry-after / 指数退避重试。
-      const windowMs = parseRetryWindowMs(lastText)
+      // 窗口同样取「报文文本 → Retry-After 头」两个来源：只认报文的话，一个带
+      // `retry-after: 3600` 却没有可解析文本的 429 会被当成瞬时限流放行给 pi-ai 空等。
+      const windowMs = cooldownMsFromResponse(response, lastText)
       if (!TERMINAL_CAP_RE.test(lastText) && windowMs < TERMINAL_WINDOW_MS) {
         log(`Cline 备用 key 均未通过（model=${model}），保留 429 交由上层退避重试`)
         return response

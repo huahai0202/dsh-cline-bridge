@@ -512,6 +512,20 @@ const ctxStatusOf = (options) => lastCtx?.__dshClineBridge?.status?.(options)
   check('H42 面板载荷不再下发 extras / updatedAt（客户端从未读取）',
     !('extras' in probe) && !('updatedAt' in probe),
     Object.keys(probe).join(','))
+
+  // H43：「最近决策」里的模型名必须是真的。轨迹是在 model 解析之前建立的（那时只看得见
+  // init?.body，Request 形态下恒为 '*'），解析出模型后要写回——否则面板上就是一行 '*'
+  // ——R 组在自检入口钉了同一件事，这里钉的是**载荷**（面板真正读的那份）。
+  const requestForm = new Request(ENDPOINT, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${SECRET_B}` },
+    body: JSON.stringify({ model: 'z-ai/glm-5.3-flash', messages: [] }),
+  })
+  await globalThis.fetch(requestForm).then((res) => res.text()).catch(() => {})
+  const probeForm = lastCtx.__dshClineBridge.status()
+  const lastTrace = (probeForm.recent ?? []).at(-1)
+  check('H43 Request 形态的「最近决策」带真实模型（不是 *）',
+    lastTrace?.model === 'z-ai/glm-5.3-flash', String(lastTrace?.model))
 }
 
 // ───────────────────────── 4c. 模型清单来自配置，而不是只靠流量 ─────────────────────────
@@ -962,6 +976,23 @@ function findNode(node, predicate) {
   return undefined
 }
 
+/** 渲染树里所有「人类可读」的字符串：文本子节点 + 字符串型 props（title / placeholder 等）。
+ *  只查文本会漏掉属性——「英文界面无中文残留」恰恰在 title 上漏过一次，
+ *  所以这条断言必须连属性一起看。 */
+function visibleStringsOf(node, out = []) {
+  if (node === null || node === undefined || node === false) return out
+  if (typeof node === 'string' || typeof node === 'number') { out.push(String(node)); return out }
+  if (Array.isArray(node)) {
+    for (const child of node) visibleStringsOf(child, out)
+    return out
+  }
+  for (const value of Object.values(node.props || {})) {
+    if (typeof value === 'string' && value) out.push(value)
+  }
+  for (const child of node.children || []) visibleStringsOf(child, out)
+  return out
+}
+
 /** 表格表头文本，用于断言列集合（列数是接口的一部分，增删列必须同步改断言）。 */
 function table_headers(tree) {
   const head = findNode(tree, (n) => n.type === 'thead')
@@ -1024,7 +1055,7 @@ function loadClientBundle() {
 }
 
 /** 用给定的路由载荷渲染一次面板，返回渲染树与插槽注册信息。 */
-async function renderPanel(payload, { fetchError = null } = {}) {
+async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}) {
   const bundle = loadClientBundle()
   const registered = []
   const dictionaries = []
@@ -1052,8 +1083,8 @@ async function renderPanel(payload, { fetchError = null } = {}) {
       if (!Array.isArray(deps) || !deps.includes('locale')) return undefined
       return callback({
         get: () => ({
-          register: (ns, locale, dict) => { dictionaries.push([ns, locale, dict]); return () => {} },
-          getSnapshot: () => ({ active: 'zh-CN' }),
+          register: (ns, lang, dict) => { dictionaries.push([ns, lang, dict]); return () => {} },
+          getSnapshot: () => ({ active: locale }),
         }),
         effect: (factory) => factory(),
       })
@@ -1531,6 +1562,86 @@ async function renderPanel(payload, { fetchError = null } = {}) {
   })
   check('C25 locale 缺席时面板仍然注册（非门控）', registered.length === 1 && registered[0].id === MODULE_ID)
   bundle.mini.dispose()
+}
+
+// ───────────────────── 6b. 英文界面无中文残留 ──────────────────────
+// 面板跟随 DSH 的语言设置，但渲染代码里**绕过词典**的中文字面量很容易漏网：
+// token 占比条的悬停提示、导入摘要里 ref 之间的连接符都这么漏过——它们不在文本节点上
+// 或只在某个弹窗里，靠「看一眼中文面板」永远发现不了。这里用 en-US 渲染一遍**带数据**的
+// 面板，并在导入弹窗里真的走一次提交，断言整棵树（文本 + 属性）里没有 CJK 字符。
+{
+  const enPayload = {
+    plugin: MODULE_ID,
+    version: PLUGIN_VERSION,
+    models: [{ id: 'cline-free/deepseek-v4.1-flash', lastUsedAt: Date.now() }],
+    currentModel: 'cline-free/deepseek-v4.1-flash',
+    totals: { poolSize: 1, clineRequests: 12, rotations: 3, failFasts: 1, since: Date.now() - 86400_000 },
+    keys: [
+      {
+        index: 1,
+        label: 'db694bbf',
+        preview: 'sk_c…ead1',
+        source: 'request',
+        cooling: [{ model: 'cline-free/deepseek-v4.1-flash', readyAt: Date.now() + 3600_000, readyInMin: 60 }],
+        stats: { sent: 3, ok: 2, failed: 1, limited: 1, lastModel: 'cline-free/deepseek-v4.1-flash', lastUsedAt: Date.now() - 5000, tokens: { input: 1200, output: 340 } },
+        models: {
+          'cline-free/deepseek-v4.1-flash': { sent: 3, ok: 2, failed: 1, limited: 1, lastUsedAt: Date.now() - 5000, tokens: { input: 1200, output: 340 } },
+        },
+      },
+    ],
+    recent: [{ at: new Date().toISOString(), model: 'cline-free/deepseek-v4.1-flash', decision: 'pass-through status=200' }],
+  }
+
+  const panel = await renderPanel(enPayload, { locale: 'en-US' })
+  let tree = panel.tree
+  const cjk = visibleStringsOf(tree).filter((text) => /[\u4e00-\u9fff]/.test(text))
+  check('Z1 英文界面整棵树（含 title 等属性）里没有中文字面量', cjk.length === 0, cjk.join(' | ').slice(0, 140))
+
+  // 摘要里的 ref 连接符也要跟着语言走（中文用「、」、英文用逗号），且原因码文案是英文。
+  const importReply = {
+    ok: true,
+    writeMode: 'credentials',
+    imported: [
+      { ref: 'CLINE_API_KEY_2', label: '1c4dd756', preview: 'sk-i…4444' },
+      { ref: 'CLINE_API_KEY_3', label: '9f2c1ab0', preview: 'sk-t…8888' },
+    ],
+    duplicates: [],
+    rejected: [{ preview: 'ab…cd', reason: 'too-short' }],
+    failed: [],
+    refsFree: 5,
+    poolSize: 3,
+    maxKeys: 20,
+  }
+  panel.bundle.sandbox.fetch = async (url, init) => {
+    const body = (init && init.method) === 'POST' ? importReply : enPayload
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: (name) => (String(name).toLowerCase() === 'etag' ? '"en-etag"' : null) },
+      json: async () => body,
+    }
+  }
+
+  const Component = panel.registered[0].Component
+  const importButton = findNode(tree, (n) => n.type === 'button' && textOf(n).join('') === 'Import keys')
+  importButton.props.onClick()
+  tree = await panel.bundle.mini.render(Component, {})
+  const textarea = findNode(tree, (n) => n.type === 'textarea')
+  textarea.props.onChange({ target: { value: 'sk-en-locale-check-123456' } })
+  tree = await panel.bundle.mini.render(Component, {})
+  const confirm = findNode(tree, (n) => n.type === 'button' && textOf(n).join('') === 'Import')
+  const pending = confirm.props.onClick()
+  await new Promise((r) => setTimeout(r, 20))
+  if (pending && typeof pending.then === 'function') await pending
+  tree = await panel.bundle.mini.render(Component, {})
+
+  const summary = findNode(tree, (n) => n.props && n.props.className === '_dsh_ofb_import_summary')
+  const summaryText = textOf(summary ?? {}).join(' | ')
+  check('Z2 英文界面导入摘要：ref 用逗号连接、原因码也是英文，且无中文残留',
+    Boolean(summary) && summaryText.includes('CLINE_API_KEY_2, CLINE_API_KEY_3') && summaryText.includes('too short') &&
+      !/[\u4e00-\u9fff]/.test(JSON.stringify(summary)),
+    summaryText.slice(0, 140))
+  panel.bundle.mini.dispose()
 }
 
 // ───────────────────────── 7. 清单与 bundle 的契约 ─────────────────────────
