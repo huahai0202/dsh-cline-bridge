@@ -1115,7 +1115,8 @@ async function renderPanel(payload, { fetchError = null } = {}) {
   check('C8 渲染出标题', text.includes('Cline Key 使用情况'), text.split('\n').slice(0, 3).join(' / '))
   check('C9 渲染出两把 key 的掩码预览', text.includes(MASK_A) && text.includes(MASK_B))
   check('C10 渲染树里不含任何 key 原文', !serialized.includes(SECRET_A) && !serialized.includes(SECRET_B))
-  check('C11 渲染出哈希标签', text.includes('db694bbf') && text.includes('761f9875'))
+  check('C11 面板不再渲染 8 位哈希标签（它是内部标识，不是给人认的）',
+    !text.includes('db694bbf') && !text.includes('761f9875'), text.split('\n').filter((s) => /^[0-9a-f]{8}$/.test(s.trim())).join(',') || '（无）')
   check('C12 渲染出模型筛选条、恢复倒计时与该模型的用量明细', /2[01]h\d\dm/.test(text) && text.includes('deepseek-v4.1-flash') && text.includes('16.8k'), (/[0-9]+h[0-9]{2}m/.exec(text) ?? ['none'])[0])
   check('C13 渲染出状态药丸（可用/冷却中）', text.includes('冷却中') && text.includes('可用'))
   check('C14 表格里没有「来源」这一列', !table_headers(tree).some((h) => /来源|source/i.test(h)) && !text.includes('.credentials.yaml: CLINE_API_KEY_2') && !text.includes('DSH 请求头'), table_headers(tree).join(' | '))
@@ -1163,10 +1164,12 @@ async function renderPanel(payload, { fetchError = null } = {}) {
     textOf(coolingCell).join(' ').includes('h') && findNode(coolingCell, (n) => String(n.props?.className ?? '') === '_dsh_ofb_cooling_line') !== undefined,
     textOf(coolingCell).join(' | '))
 
-  // Key 单元格：预览与哈希标签各占一行，且都带裁剪类（不换行）
+  // Key 单元格：只有掩码预览一行，且带裁剪类（长 key 不会换行撑高）
   const keyCellItems = rowCells[1]?.children?.[0]?.children ?? []
   const clipped = (node) => String(node?.props?.className ?? '').includes('_dsh_ofb_clip')
-  check('C30 Key 单元格两行都带裁剪类（预览/标签都不会换行）', clipped(keyCellItems[0]) && String(keyCellItems[1]?.props?.className ?? '').includes('_dsh_ofb_key_meta'),
+  check('C30 Key 单元格只剩预览一行且带裁剪类（哈希标签已移除）',
+    keyCellItems.length === 1 && clipped(keyCellItems[0]) &&
+      !serialized.includes('_dsh_ofb_key_meta'),
     keyCellItems.map((c) => c.props?.className).join(' | '))
   check('C31 表内所有可能变长的文本节点都带裁剪类', (() => {
     const offenders = []
@@ -1185,6 +1188,25 @@ async function renderPanel(payload, { fetchError = null } = {}) {
   check('C32 面板里不再出现「主 Key」标记（池内 key 一律同级）',
     !text.includes('主 Key') && !serialized.includes('isRequestKey') && !serialized.includes('_dsh_ofb_badge'),
     textOf(tree).filter((s) => s.includes('主 Key')).join(' / ') || '（无）')
+
+  // 哈希标签已从面板移除；maskKeyPreview:false（preview 为空串）时也不能拿它兜底，
+  // 否则「关掉掩码」反而把标签露出来——正是移除它的理由。
+  const noPreview = await renderPanel({
+    plugin: MODULE_ID, version: PLUGIN_VERSION, updatedAt: Date.now(),
+    models: [{ id: 'cline-free/deepseek-v4.1-flash', lastUsedAt: Date.now() }],
+    currentModel: 'cline-free/deepseek-v4.1-flash',
+    totals: { poolSize: 2, clineRequests: 0, rotations: 0, failFasts: 0 },
+    keys: [
+      { index: 1, label: 'db694bbf', preview: '', source: 'request', cooling: [], stats: { sent: 0, ok: 0, failed: 0, limited: 0, lastUsedAt: 0, tokens: {} }, models: {} },
+      { index: 2, label: '761f9875', preview: '', source: 'request', cooling: [], stats: { sent: 0, ok: 0, failed: 0, limited: 0, lastUsedAt: 0, tokens: {} }, models: {} },
+    ],
+    recent: [],
+  })
+  const noPreviewText = textOf(noPreview.tree).join('\n')
+  check('C33 maskKeyPreview:false 时面板既不显示预览、也不拿哈希标签兜底',
+    !noPreviewText.includes('db694bbf') && !noPreviewText.includes('761f9875') && noPreviewText.includes('—'),
+    noPreviewText.split('\n').filter((s) => s.trim()).slice(0, 12).join(' | '))
+  noPreview.bundle.mini.dispose()
 
   bundle.mini.dispose()
 }
@@ -1251,11 +1273,12 @@ async function renderPanel(payload, { fetchError = null } = {}) {
     return textOf(row).join('\n')
   }
 
-  const rowA = rowText(tree, 'db694bbf')
+  // 行定位改用掩码预览：8 位哈希标签已从面板移除，不再能当锚点。
+  const rowA = rowText(tree, MASK_A)
   check('F1 deepseek 上被限的 key 在 glm 视图下显示「可用」', rowA.includes('可用') && !rowA.includes('冷却中'), rowA.replace(/\n/g, ' | '))
   check('F2 glm 视图下不出现 deepseek 的冷却记录', !tableText(tree).includes('deepseek'), tableText(tree).replace(/\n/g, ' | ').slice(0, 120))
   check('F3 用量按模型分开：glm 视图显示 glm 的计数', rowA.includes('3/3/0'), rowA.replace(/\n/g, ' | '))
-  check('F4 另一把 key 显示自己的 glm 计数', rowText(tree, '761f9875').includes('21/21/0'), rowText(tree, '761f9875').replace(/\n/g, ' | '))
+  check('F4 另一把 key 显示自己的 glm 计数', rowText(tree, MASK_B).includes('21/21/0'), rowText(tree, MASK_B).replace(/\n/g, ' | '))
   check('F5 概览卡随筛选变化（该模型可用 / 该模型冷却）', renderedText().includes('该模型可用') && renderedText().includes('该模型冷却'), textOf(tree).filter((s) => s.includes('该模型')).join(' | '))
 
   const chips = chipsOf(tree).map((c) => textOf(c).join(''))
@@ -1267,16 +1290,16 @@ async function renderPanel(payload, { fetchError = null } = {}) {
 
   // 切到 deepseek：只剩 deepseek 的数据（面板没有「跨模型汇总」这种视图）
   const dsView = await clickChip('deepseek-v4.1-flash')
-  const dsRow = rowText(dsView, 'db694bbf')
+  const dsRow = rowText(dsView, MASK_A)
   check('F8 切到 deepseek 后该 key 显示冷却中并给出恢复倒计时', dsRow.includes('冷却中') && /2[01]h\d\dm/.test(dsRow), dsRow.replace(/\n/g, ' | '))
   check('F9 切到 deepseek 后用量是 deepseek 的计数', dsRow.includes('16/15/2/1'), dsRow.replace(/\n/g, ' | '))
-  check('F10 切回 glm 后该 key 恢复「可用」', rowText(tree, 'db694bbf').includes('可用'), rowText(tree, 'db694bbf').replace(/\n/g, ' | '))
-  const dsOther = rowText(dsView, '761f9875')
+  check('F10 切回 glm 后该 key 恢复「可用」', rowText(tree, MASK_A).includes('可用'), rowText(tree, MASK_A).replace(/\n/g, ' | '))
+  const dsOther = rowText(dsView, MASK_B)
   check('F11 另一把在 deepseek 上没跑过：0/0/0 且无冷却，最近使用显示「从未」', dsOther.includes('0/0/0') && dsOther.includes('可用') && dsOther.includes('从未'), dsOther.replace(/\n/g, ' | '))
 
   // ── 按模型用量明细卡（用户要求：显示每个 key 的每个模型的用量）──
-  // 面板恒定在某个模型的筛选下，所以这张卡每把 key 就一行：key 预览 + 哈希标签 + 数字，
-  // 模型名不重复出现（它写在筛选芯片上）。
+  // 面板恒定在某个模型的筛选下，所以这张卡每把 key 就一行：key 预览 + 数字，
+  // 模型名不重复出现（它写在筛选芯片上），哈希标签也不再出现（内部标识）。
   const usageCardOf = (node) => findNode(node, (n) => String(n.props?.className ?? '') === '_dsh_ofb_usage')
   const usageOf = (node, label) => {
     const card = usageCardOf(node)
@@ -1285,12 +1308,12 @@ async function renderPanel(payload, { fetchError = null } = {}) {
     return row ? textOf(row).join(' ') : ''
   }
 
-  const usageDsRow = usageOf(dsView, 'db694bbf')
-  // 每个数值各占一列（发送|成功|限流、输入|输出），所以 textOf 用空格连接
+  const usageDsRow = usageOf(dsView, MASK_A)
+  // 每个数值各占一列（发送|成功|失败|限流、输入|输出），所以 textOf 用空格连接
   check('I1 明细卡按当前模型逐行列出用量（deepseek 视图）',
-    usageDsRow.includes('1 sk-l…4444 db694bbf 16 15 2 1 12.3k 1.2k'), usageDsRow)
+    usageDsRow.includes('1 sk-l…4444 16 15 2 1 12.3k 1.2k'), usageDsRow)
   check('I2 另一把 key 在 glm 视图下有自己的一行',
-    usageOf(tree, '761f9875').includes('2 sk-t…8888 761f9875 21 21 0 0 21k 2.1k'), usageOf(tree, '761f9875'))
+    usageOf(tree, MASK_B).includes('2 sk-t…8888 21 21 0 0 21k 2.1k'), usageOf(tree, MASK_B))
   const usageHeadOf = (node) => findNode(usageCardOf(node), (n) => String(n.props?.className ?? '') === '_dsh_ofb_usage_head')
   const usageHeadSpans = usageHeadOf(tree)?.children ?? []
   // 表头与数据行同构：每列一个标签，含义直接可见（不靠悬停），且短标签不会折行
@@ -1305,15 +1328,15 @@ async function renderPanel(payload, { fetchError = null } = {}) {
     !usageCardOf(tree) || !JSON.stringify(usageCardOf(tree)).includes('z-ai/glm-5.3-flash'),
     JSON.stringify(usageCardOf(tree) ?? {}).slice(0, 200))
 
-  const usageGlm = usageOf(tree, 'db694bbf')
+  const usageGlm = usageOf(tree, MASK_A)
   check('I4 glm 视图下明细不含 deepseek 的行', usageGlm.includes('3 3 0 0 4.5k') && !usageGlm.includes('deepseek'), usageGlm)
 
   // 该模型上没用过的 key 不再各占一块，而是折叠成一行提示（否则半张卡都是「没用过」）
   const cardText = (node) => textOf(usageCardOf(node)).join('\n')
   check('I5 该模型上未使用的 key 折叠成一行提示',
-    cardText(dsView).includes('其余 1 把在该模型上没用过') && !cardText(dsView).includes('761f9875'),
+    cardText(dsView).includes('其余 1 把在该模型上没用过') && !cardText(dsView).includes(MASK_B),
     cardText(dsView).replace(/\n/g, ' | '))
-  check('I6 切到 glm 时同一把 key 显示 glm 的计数', usageGlm.includes('1 sk-l…4444 db694bbf 3 3 0 0 4.5k 300'), usageGlm)
+  check('I6 切到 glm 时同一把 key 显示 glm 的计数', usageGlm.includes('1 sk-l…4444 3 3 0 0 4.5k 300'), usageGlm)
 
   // ── Token 用量（用户真正要的是这个）──
   const tokenRowOf = (node, label) => {
@@ -1325,11 +1348,11 @@ async function renderPanel(payload, { fetchError = null } = {}) {
   check('I7 明细卡显示该模型的输入/输出 token',
     usageDsRow.includes('12.3k 1.2k'), usageDsRow)
   check('I8 表格用量列第二行是该模型的 token（glm 视图）',
-    tokenRowOf(tree, 'db694bbf').includes('4.5k/300'), tokenRowOf(tree, 'db694bbf'))
+    tokenRowOf(tree, MASK_A).includes('4.5k/300'), tokenRowOf(tree, MASK_A))
   check('I9 切到 deepseek 后表格 token 跟着换成 deepseek 的',
-    tokenRowOf(dsView, 'db694bbf').includes('12.3k/1.2k'), tokenRowOf(dsView, 'db694bbf'))
+    tokenRowOf(dsView, MASK_A).includes('12.3k/1.2k'), tokenRowOf(dsView, MASK_A))
   check('I10 该模型上没用过的 key：token 显示 0/0，不能退回全局总计',
-    tokenRowOf(dsView, '761f9875') === '0/0/0/0 | 0/0', tokenRowOf(dsView, '761f9875'))
+    tokenRowOf(dsView, MASK_B) === '0/0/0/0 | 0/0', tokenRowOf(dsView, MASK_B))
 
   // ── 可视化：占比条与合计 ──
   const barsOf = (node) => {
