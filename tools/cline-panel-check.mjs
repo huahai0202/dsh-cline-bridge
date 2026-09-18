@@ -210,11 +210,11 @@ const RESET_PATH = '/dsh-cline-bridge/keys/stats/reset'
 
 /** 假请求：带正文的那几条会按真实流式形状分两片投递 data、再 end，
  *  这样「带上限的正文读取」真的走到累加与上限分支。 */
-const fakeReq = ({ method = 'GET', referer = 'http://127.0.0.1:3080/settings', host = '127.0.0.1:3080', contentType, body } = {}) => {
+const fakeReq = ({ method = 'GET', referer = 'http://127.0.0.1:3080/settings', host = '127.0.0.1:3080', contentType, body, headers } = {}) => {
   const handlers = new Map()
   const req = {
     method,
-    headers: { host, referer, ...(contentType === undefined ? {} : { 'content-type': contentType }) },
+    headers: { host, referer, ...(contentType === undefined ? {} : { 'content-type': contentType }), ...(headers ?? {}) },
     on(event, fn) {
       const list = handlers.get(event) ?? []
       list.push(fn)
@@ -428,6 +428,90 @@ const ctxStatusOf = (options) => lastCtx?.__dshClineBridge?.status?.(options)
   check('H33 载荷带模型清单与「当前模型」', Array.isArray(r.json.models) && r.json.models.some((m) => m.id === modelB) && r.json.models.some((m) => m.id === modelA) && r.json.currentModel === modelB,
     `${JSON.stringify(r.json.models)} current=${r.json.currentModel}`)
   check('H34 模型清单按最近活跃排序（当前模型在最前）', r.json.models[0]?.id === modelB, r.json.models.map((m) => m.id).join(' > '))
+}
+
+// ───────────────────────── 4b-2. 条件请求（ETag / 304） ─────────────────────────
+// 面板每 5 秒轮询一次，而绝大多数轮次载荷完全没变。这里验证：同一份载荷第二次带
+// If-None-Match 来取时会回 304（省掉整份 JSON），内容一变就回 200 并给出新的 ETag。
+{
+  mount({ skipCoolingRequestKey: true })
+  const first = await callRoute()
+  check('H35 只读路由回带 ETag', first.status === 200 && typeof first.headers?.etag === 'string' && first.headers.etag.length > 2,
+    String(first.headers?.etag))
+  const etag = first.headers.etag
+
+  // 立刻用同一个 ETag 再取一次：载荷里的 readyInMin 按分钟取整，同一分钟内必然一致
+  const second = await callRoute({ headers: { 'if-none-match': etag } })
+  check('H36 载荷未变时回 304（不重传整份 JSON）', second.status === 304 && second.body === '',
+    `status=${second.status} bodyLen=${second.body.length}`)
+
+  // ETag 必须由内容决定：换一个不同的 ETag 就该拿到 200
+  const third = await callRoute({ headers: { 'if-none-match': '"stale-etag"' } })
+  check('H37 ETag 不匹配时照常回 200 全量', third.status === 200 && third.body.length > 0,
+    `status=${third.status}`)
+
+  // 内容真的变了之后，同一个 ETag 必须失效——否则面板会永远停在旧数据上。
+  // 这里制造一次真实的载荷变化：发一条请求，让 clineRequests 计数 +1。
+  await globalThis.fetch(ENDPOINT, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer k2' },
+    body: JSON.stringify({ model: 'deepseek/deepseek-v4.1-flash', messages: [] }),
+  }).then((res) => res.text()).catch(() => {})
+  const fourth = await callRoute({ headers: { 'if-none-match': etag } })
+  check('H38 载荷内容变化后旧 ETag 失效（不会让面板停在旧数据上）',
+    fourth.status === 200 && fourth.headers.etag !== etag,
+    `status=${fourth.status} etag=${fourth.headers.etag}`)
+}
+
+// ───────────────────────── 4b-3. 脏模型名不该变成筛选芯片 ─────────────────────────
+// 观察到的模型来自「请求体里的 model 字段」与冷却记录，可能是手改配置、探针或错误回显
+// 带来的垃圾值。它一旦进了模型清单就会变成一个芯片，还会经 bumpModelStat 落进状态文件。
+{
+  const DIRTY = ['???', '   ', '*', '---', 'x'.repeat(200), 'ok\nbad']
+  // 让 DSH 设置里 Cline 名下只有这一个正经模型，其余全是脏值——
+  // 脏值要么来自配置（这里），要么来自实际流量（下面再补一条真实请求）
+  const ctx = mount({
+    skipCoolingRequestKey: true,
+    __settingsValues: {
+      'llm-pi-ai': {
+        providers: {
+          cline: { baseURL: `http://${match}/api/v1`, models: [{ id: 'deepseek/deepseek-v4.1-flash' }, ...DIRTY.map((id) => ({ id }))] },
+        },
+      },
+    },
+  })
+  // 再发一条 model 为脏值的真实请求：它会进 lastRequests，也会进 byModel
+  await globalThis.fetch(ENDPOINT, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer k2' },
+    body: JSON.stringify({ model: '???', messages: [] }),
+  }).then((res) => res.text()).catch(() => {})
+
+  const probe = ctx.__dshClineBridge.status()
+  const ids = probe.models.map((m) => m.id)
+  check('H39 脏模型名不会变成筛选芯片（配置里塞脏值 + 真实脏流量都不行）',
+    ids.includes('deepseek/deepseek-v4.1-flash') && DIRTY.every((id) => !ids.includes(id)) && !ids.includes('*'),
+    JSON.stringify(ids))
+  check('H40 载荷里不出现 readModelOf 的占位符 * 作为当前模型',
+    probe.currentModel !== '*', String(probe.currentModel))
+}
+
+// ───────────────────────── 4b-4. 载荷里不再有只写不读的字段 ─────────────────────────
+// 这些字段客户端半边一次都没读过（已逐字段核对过 client.js），下发它们纯属白占带宽。
+{
+  mount({ skipCoolingRequestKey: true })
+  await globalThis.fetch(ENDPOINT, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer k2' },
+    body: JSON.stringify({ model: 'deepseek/deepseek-v4.1-flash', messages: [] }),
+  }).then((res) => res.text()).catch(() => {})
+  const probe = lastCtx.__dshClineBridge.status()
+  check('H41 面板载荷不再下发 bodyLen / poolSize（客户端从未读取）',
+    (probe.recent ?? []).length > 0 && probe.recent.every((row) => !('bodyLen' in row) && !('poolSize' in row)),
+    JSON.stringify(probe.recent?.[0] ?? {}))
+  check('H42 面板载荷不再下发 extras / updatedAt（客户端从未读取）',
+    !('extras' in probe) && !('updatedAt' in probe),
+    Object.keys(probe).join(','))
 }
 
 // ───────────────────────── 4c. 模型清单来自配置，而不是只靠流量 ─────────────────────────
@@ -945,10 +1029,17 @@ async function renderPanel(payload, { fetchError = null } = {}) {
   const registered = []
   const dictionaries = []
 
-  // 每次渲染前替换 sandbox 的 fetch
+  // 每次渲染前替换 sandbox 的 fetch。
+  // 桩要**忠实**于真实 Response：headers 必须存在（面板会读 etag 做条件请求），
+  // 否则测出来的失败是桩的问题、不是代码的问题。测试也可以主动回 304（见 withEtag 用例）。
   bundle.sandbox.fetch = async () => {
     if (fetchError) throw new Error(fetchError)
-    return { ok: true, status: 200, json: async () => payload }
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: (name) => (String(name).toLowerCase() === 'etag' ? '"test-etag"' : null) },
+      json: async () => payload,
+    }
   }
 
   const slots = {
@@ -987,8 +1078,8 @@ async function renderPanel(payload, { fetchError = null } = {}) {
     keys: [
       { index: 1, label: 'db694bbf', preview: MASK_A, source: 'request',
         cooling: [{ model: 'cline-free/deepseek-v4.1-flash', readyAt: Date.now() + 21 * 3600 * 1000, readyInMin: 1300 }],
-        stats: { sent: 12, ok: 11, limited: 1, lastModel: 'cline-free/deepseek-v4.1-flash', lastUsedAt: Date.now() - 5000, tokens: { input: 16800, output: 1500, total: 18300, cached: 900 } },
-        models: { 'cline-free/deepseek-v4.1-flash': { sent: 12, ok: 11, limited: 1, lastUsedAt: Date.now() - 5000, tokens: { input: 16800, output: 1500, total: 18300, cached: 900 } } } },
+        stats: { sent: 12, ok: 11, failed: 2, limited: 1, lastModel: 'cline-free/deepseek-v4.1-flash', lastUsedAt: Date.now() - 5000, tokens: { input: 16800, output: 1500, total: 18300, cached: 900 } },
+        models: { 'cline-free/deepseek-v4.1-flash': { sent: 12, ok: 11, failed: 2, limited: 1, lastUsedAt: Date.now() - 5000, tokens: { input: 16800, output: 1500, total: 18300, cached: 900 } } } },
       { index: 2, label: '761f9875', preview: MASK_B, source: '.credentials.yaml: CLINE_API_KEY_2',
         cooling: [], stats: { sent: 4, ok: 4, limited: 0, lastModel: 'cline-free/deepseek-v4.1-flash', lastUsedAt: Date.now() - 61000 },
         models: { 'cline-free/deepseek-v4.1-flash': { sent: 4, ok: 4, limited: 0, lastUsedAt: Date.now() - 61000, tokens: { input: 0, output: 0, total: 0, cached: 0 } } } },
@@ -1028,7 +1119,7 @@ async function renderPanel(payload, { fetchError = null } = {}) {
   check('C12 渲染出模型筛选条、恢复倒计时与该模型的用量明细', /2[01]h\d\dm/.test(text) && text.includes('deepseek-v4.1-flash') && text.includes('16.8k'), (/[0-9]+h[0-9]{2}m/.exec(text) ?? ['none'])[0])
   check('C13 渲染出状态药丸（可用/冷却中）', text.includes('冷却中') && text.includes('可用'))
   check('C14 表格里没有「来源」这一列', !table_headers(tree).some((h) => /来源|source/i.test(h)) && !text.includes('.credentials.yaml: CLINE_API_KEY_2') && !text.includes('DSH 请求头'), table_headers(tree).join(' | '))
-  check('C15 渲染出用量计数 发送/成功/限流', text.includes('12/11/1') && text.includes('4/4/0'))
+  check('C15 渲染出用量计数 发送/成功/失败/限流', text.includes('12/11/2/1') && text.includes('4/4/0/0'))
   check('C16 渲染出统计卡数值', text.includes('61') && text.includes(PLUGIN_VERSION), PLUGIN_VERSION)
   check('C17 渲染出最近决策', text.includes('最近决策') && text.includes('rotated a→b'))
   check('C18 面板里没有「运行参数」卡片', !text.includes('运行参数') && !text.includes('凭据文件') && !text.includes('15分钟') && !text.includes('Runtime parameters'))
@@ -1119,7 +1210,7 @@ async function renderPanel(payload, { fetchError = null } = {}) {
         cooling: [{ model: DEEPSEEK, readyAt: Date.now() + 21 * 3600 * 1000, readyInMin: 1260 }],
         stats: { sent: 19, ok: 18, limited: 1, lastModel: GLM, lastUsedAt: Date.now() - 4000, tokens: { input: 16800, output: 1500, total: 18300, cached: 900 } },
         models: {
-          [DEEPSEEK]: { sent: 16, ok: 15, limited: 1, lastUsedAt: Date.now() - 3600_000, tokens: { input: 12300, output: 1200, total: 13500, cached: 800 } },
+          [DEEPSEEK]: { sent: 16, ok: 15, failed: 2, limited: 1, lastUsedAt: Date.now() - 3600_000, tokens: { input: 12300, output: 1200, total: 13500, cached: 800 } },
           [GLM]: { sent: 3, ok: 3, limited: 0, lastUsedAt: Date.now() - 4000, tokens: { input: 4500, output: 300, total: 4800, cached: 100 } },
         },
       },
@@ -1178,7 +1269,7 @@ async function renderPanel(payload, { fetchError = null } = {}) {
   const dsView = await clickChip('deepseek-v4.1-flash')
   const dsRow = rowText(dsView, 'db694bbf')
   check('F8 切到 deepseek 后该 key 显示冷却中并给出恢复倒计时', dsRow.includes('冷却中') && /2[01]h\d\dm/.test(dsRow), dsRow.replace(/\n/g, ' | '))
-  check('F9 切到 deepseek 后用量是 deepseek 的计数', dsRow.includes('16/15/1'), dsRow.replace(/\n/g, ' | '))
+  check('F9 切到 deepseek 后用量是 deepseek 的计数', dsRow.includes('16/15/2/1'), dsRow.replace(/\n/g, ' | '))
   check('F10 切回 glm 后该 key 恢复「可用」', rowText(tree, 'db694bbf').includes('可用'), rowText(tree, 'db694bbf').replace(/\n/g, ' | '))
   const dsOther = rowText(dsView, '761f9875')
   check('F11 另一把在 deepseek 上没跑过：0/0/0 且无冷却，最近使用显示「从未」', dsOther.includes('0/0/0') && dsOther.includes('可用') && dsOther.includes('从未'), dsOther.replace(/\n/g, ' | '))
@@ -1197,15 +1288,15 @@ async function renderPanel(payload, { fetchError = null } = {}) {
   const usageDsRow = usageOf(dsView, 'db694bbf')
   // 每个数值各占一列（发送|成功|限流、输入|输出），所以 textOf 用空格连接
   check('I1 明细卡按当前模型逐行列出用量（deepseek 视图）',
-    usageDsRow.includes('1 sk-l…4444 db694bbf 16 15 1 12.3k 1.2k'), usageDsRow)
+    usageDsRow.includes('1 sk-l…4444 db694bbf 16 15 2 1 12.3k 1.2k'), usageDsRow)
   check('I2 另一把 key 在 glm 视图下有自己的一行',
-    usageOf(tree, '761f9875').includes('2 sk-t…8888 761f9875 21 21 0 21k 2.1k'), usageOf(tree, '761f9875'))
+    usageOf(tree, '761f9875').includes('2 sk-t…8888 761f9875 21 21 0 0 21k 2.1k'), usageOf(tree, '761f9875'))
   const usageHeadOf = (node) => findNode(usageCardOf(node), (n) => String(n.props?.className ?? '') === '_dsh_ofb_usage_head')
   const usageHeadSpans = usageHeadOf(tree)?.children ?? []
   // 表头与数据行同构：每列一个标签，含义直接可见（不靠悬停），且短标签不会折行
   const usageHeadFlat = usageHeadSpans.map((s) => textOf(s).join('')).join('|')
-  check('I3 明细卡表头逐列标注（Key、发送/成功/限流、输入/输出），与数据列一一对应',
-    usageHeadFlat === 'Key|发送成功限流|输入输出|最近使用' &&
+  check('I3 明细卡表头逐列标注（Key、发送/成功/失败/限流、输入/输出），与数据列一一对应',
+    usageHeadFlat === 'Key|发送成功失败限流|输入输出|最近使用' &&
       String(usageHeadSpans[0]?.props?.className ?? '') === '_dsh_ofb_usage_lead' &&
       String(usageHeadSpans[1]?.props?.className ?? '') === '_dsh_ofb_usage_req' &&
       String(usageHeadSpans[2]?.props?.className ?? '') === '_dsh_ofb_tokencell',
@@ -1215,14 +1306,14 @@ async function renderPanel(payload, { fetchError = null } = {}) {
     JSON.stringify(usageCardOf(tree) ?? {}).slice(0, 200))
 
   const usageGlm = usageOf(tree, 'db694bbf')
-  check('I4 glm 视图下明细不含 deepseek 的行', usageGlm.includes('3 3 0 4.5k') && !usageGlm.includes('deepseek'), usageGlm)
+  check('I4 glm 视图下明细不含 deepseek 的行', usageGlm.includes('3 3 0 0 4.5k') && !usageGlm.includes('deepseek'), usageGlm)
 
   // 该模型上没用过的 key 不再各占一块，而是折叠成一行提示（否则半张卡都是「没用过」）
   const cardText = (node) => textOf(usageCardOf(node)).join('\n')
   check('I5 该模型上未使用的 key 折叠成一行提示',
     cardText(dsView).includes('其余 1 把在该模型上没用过') && !cardText(dsView).includes('761f9875'),
     cardText(dsView).replace(/\n/g, ' | '))
-  check('I6 切到 glm 时同一把 key 显示 glm 的计数', usageGlm.includes('1 sk-l…4444 db694bbf 3 3 0 4.5k 300'), usageGlm)
+  check('I6 切到 glm 时同一把 key 显示 glm 的计数', usageGlm.includes('1 sk-l…4444 db694bbf 3 3 0 0 4.5k 300'), usageGlm)
 
   // ── Token 用量（用户真正要的是这个）──
   const tokenRowOf = (node, label) => {
@@ -1238,7 +1329,7 @@ async function renderPanel(payload, { fetchError = null } = {}) {
   check('I9 切到 deepseek 后表格 token 跟着换成 deepseek 的',
     tokenRowOf(dsView, 'db694bbf').includes('12.3k/1.2k'), tokenRowOf(dsView, 'db694bbf'))
   check('I10 该模型上没用过的 key：token 显示 0/0，不能退回全局总计',
-    tokenRowOf(dsView, '761f9875') === '0/0/0 | 0/0', tokenRowOf(dsView, '761f9875'))
+    tokenRowOf(dsView, '761f9875') === '0/0/0/0 | 0/0', tokenRowOf(dsView, '761f9875'))
 
   // ── 可视化：占比条与合计 ──
   const barsOf = (node) => {
@@ -1304,12 +1395,19 @@ async function renderPanel(payload, { fetchError = null } = {}) {
     duplicates: [], rejected: [], failed: [], refsFree: 7, poolSize: 2, maxKeys: 20,
   }
   const resetReply = { ok: true, since: Date.now(), totals: { since: Date.now(), clineRequests: 0, rotations: 0, failFasts: 0 }, poolSize: 1 }
+  // 桩要忠实于真实 Response：headers.get 必须可用（面板会读 etag 做条件请求）
+  const jsonResponse = (body) => ({
+    ok: true,
+    status: 200,
+    headers: { get: (name) => (String(name).toLowerCase() === 'etag' ? '"test-etag"' : null) },
+    json: async () => body,
+  })
   bundle.sandbox.fetch = async (url, init) => {
     const method = (init && init.method) || 'GET'
     calls.push({ url, method, headers: (init && init.headers) || {}, body: init && init.body })
-    if (url === CLIENT_RESET_ROUTE) return { ok: true, status: 200, json: async () => resetReply }
-    if (method === 'POST') return { ok: true, status: 200, json: async () => importReply }
-    return { ok: true, status: 200, json: async () => payload }
+    if (url === CLIENT_RESET_ROUTE) return jsonResponse(resetReply)
+    if (method === 'POST') return jsonResponse(importReply)
+    return jsonResponse(payload)
   }
 
   const registered = []

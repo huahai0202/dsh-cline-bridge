@@ -26,12 +26,24 @@ import { readAuthTarget, readKeyOf, readModelOf, replayableBody, writeKeyTo } fr
 import { normalizeUsage, tapUsage } from './lib/host/usage.js'
 import { createKeyPool } from './lib/host/key-pool.js'
 import { buildStatus, clineApiKeyEnvOf } from './lib/host/status.js'
-import { isTrustedRequest, readJsonBody, sendJson } from './lib/host/http.js'
+import { isTrustedRequest, readJsonBody, sendJson, sendJsonConditional } from './lib/host/http.js'
 import { readCredentialRefsFromFile, writeCredentialRefToFile } from './lib/host/credentials.js'
 import { importClineKeys, MAX_IMPORT_KEYS } from './lib/host/key-import.js'
 
 export function apply(ctx, config) {
   const originalFetch = globalThis.fetch
+
+  // 日志工具必须最先定义：下面的 pool.ensureExtras(...) 会在 apply() 同步返回前就调它，
+  // 而它内部用到的 log 若声明在更后面，那次调用会命中 const 的 TDZ 抛 ReferenceError，
+  // 再被调用点的 .catch(() => {}) 静默吞掉——表现为「冷启动少一条 key 池日志，毫无迹象」。
+  // 日志失败本身绝不影响请求，所以这里仍然整体包一层。
+  const log = (message) => {
+    try {
+      ctx?.logger?.warn?.(`[dsh-cline-bridge] ${message}`)
+    } catch {
+      // 日志失败绝不影响请求
+    }
+  }
 
   const clineMatch = typeof config?.clineMatch === 'string' && config.clineMatch ? config.clineMatch : DEFAULT_CLINE_MATCH
   const clineCooldownMs = Number.isFinite(config?.clineCooldownMs)
@@ -59,7 +71,14 @@ export function apply(ctx, config) {
   // 插件更名（opencode-free-bridge → dsh-cline-bridge）后第一次启动：把旧名状态文件搬过来，
   // 冷却与累计统计才不丢。只搬一次，之后这里什么也不做。
   const legacyQuotaState = migrateLegacyQuotaState(config)
-  const quotaStore = createQuotaStore(resolveQuotaStatePath(config))
+  // 读盘 / 落盘失败不再静默：把 store 的错误交回日志（它自己不认识日志实现，见 quota-state.js）。
+  // 「冷却与统计明明在丢、却没有任何迹象」就是这么来的。
+  const quotaStore = createQuotaStore(resolveQuotaStatePath(config), {
+    onError: (kind, error) => {
+      const detail = error?.message ?? error
+      log(kind === 'load' ? `额度状态文件读取失败，已按空状态启动（${detail}）` : `额度状态落盘失败（${detail}）`)
+    },
+  })
   // 诊断信息随状态文件落盘：池规模、额外 key 来源、各类决策计数（便于线上排查“为什么没换 key”）
   const diag = {
     pluginVersion: PLUGIN_VERSION,
@@ -84,27 +103,26 @@ export function apply(ctx, config) {
   diag.failFasts = restoredTotals.failFasts
   diag.lastRequests = Array.isArray(restoredDiag.lastRequests) ? restoredDiag.lastRequests.slice(-3) : []
   const pool = createKeyPool(quotaStore, diag, (message) => log(message))
-  // 额外 key 与请求无关，尽早加载；失败也不影响主链路
-  void pool.ensureExtras(ctx, config).catch(() => {})
+  // 额外 key 扫描失败不拖垮主链路，但**不再静默**：曾经这里 (以及下面几处) 是
+  // .catch(() => {})，把 ensureExtras 内任何异常（config 访问器抛错、注册过程出错……）
+  // 都吞得无影无踪——表现为「池子莫名其妙是空的，日志里什么也没有」。
+  const ensureExtrasQuiet = (options) =>
+    pool.ensureExtras(ctx, config, options).catch((error) => {
+      log(`Cline 额外 key 扫描失败：${error?.message ?? error}`)
+    })
+  // 额外 key 与请求无关，尽早加载
+  void ensureExtrasQuiet()
 
   // DSH 设置服务的只读引用：面板靠它列出「Cline 名下配置了哪些模型」，
   // 这样刚重启、一次 Cline 请求都还没发生时也能显示 glm 等模型。
-  // 用**非门控**的 ctx.inject：settings 缺席时插件照常工作，面板退化成只列观察到的模型。
+  // 注意用**非门控**的 ctx.inject（而不是模块级 export const inject = ['settings']）：
+  // 后者会把整个插件门控在 settings 上，headless/acp 等没有该服务的 profile 里连 fetch 补丁
+  // 都会一起失效。ctx.inject 本身是 cordis Context 的原型方法，恒存在，无需 typeof 守卫。
   let settingsService
-  if (typeof ctx.inject === 'function') {
-    ctx.inject(['settings'], (settingsCtx) => {
-      settingsService = settingsCtx.get('settings') ?? settingsCtx.settings
-      scheduleMainKeyRegistration()
-    })
-  }
-
-  const log = (message) => {
-    try {
-      ctx?.logger?.warn?.(`[dsh-cline-bridge] ${message}`)
-    } catch {
-      // 日志失败绝不影响请求
-    }
-  }
+  ctx.inject(['settings'], (settingsCtx) => {
+    settingsService = settingsCtx.get('settings') ?? settingsCtx.settings
+    scheduleMainKeyRegistration()
+  })
 
   // 迁移只发生在「旧文件在、新文件不在」的那一次；此后的启动这里都是空串、不发日志。
   if (legacyQuotaState) log(`已把旧插件名的状态文件迁移到新名字：${legacyQuotaState} → ${quotaStore.path}`)
@@ -113,18 +131,16 @@ export function apply(ctx, config) {
   // 与 DSH 设置页写凭据是同一条路径。仍然用非门控的 ctx.inject：服务缺席时插件照常工作，
   // 导入退化为直写凭据文件（读侧本来就有这条兜底）。
   let credentialsService
-  if (typeof ctx.inject === 'function') {
-    ctx.inject(['credentials'], (credentialsCtx) => {
-      credentialsService = credentialsCtx.get('credentials') ?? credentialsCtx.credentials
-      // 凭据一变（面板导入、DSH 设置里改 ref、乃至手工编辑文件被服务观察到）立刻重扫 key 池，
-      // 不必等 EXTRAS_TTL_MS 那 5 分钟节流——「刚加进去的 key 为什么不在池子里」就是这么来的。
-      credentialsCtx.on?.('credentials/reference-updated', () => {
-        void pool.ensureExtras(ctx, config, { force: true }).catch(() => {})
-        scheduleMainKeyRegistration()
-      })
+  ctx.inject(['credentials'], (credentialsCtx) => {
+    credentialsService = credentialsCtx.get('credentials') ?? credentialsCtx.credentials
+    // 凭据一变（面板导入、DSH 设置里改 ref、乃至手工编辑文件被服务观察到）立刻重扫 key 池，
+    // 不必等 EXTRAS_TTL_MS 那 5 分钟节流——「刚加进去的 key 为什么不在池子里」就是这么来的。
+    credentialsCtx.on?.('credentials/reference-updated', () => {
+      void ensureExtrasQuiet({ force: true })
       scheduleMainKeyRegistration()
     })
-  }
+    scheduleMainKeyRegistration()
+  })
 
   // 主 Key（提供方 apiKeyEnv 指向的那把）挂载即入池：不然 DSH 重启后面板只有备用 key，
   // 要等第一条请求把它带上来才补齐，看着像少了一把。它本来就是 DSH 会随请求头携带的
@@ -139,13 +155,18 @@ export function apply(ctx, config) {
       try {
         value = (await service.resolve(ref))?.value
       } catch {
-        value = undefined // 解析失败当作没有，凭据变更事件会再触发一次
+        // 刻意静默：凭据服务解析失败等价于「这把主 Key 暂时解析不到」，
+        // 既不影响请求（DSH 自己会带 key），也不影响池子（备用 key 照常工作），
+        // 而且凭据一变就会再触发一次。这里记日志只会刷屏。
+        value = undefined
       }
     }
     if (!value && config?.readCredentialsFile !== false) {
       try {
         value = readCredentialRefsFromFile(resolveCredentialsFilePath(config), [ref]).get(ref)
       } catch {
+        // 同上：凭据文件不存在/不可读时按「主 Key 未配置」处理，由 ensureExtras 那条
+        // 日志承担可观测性（它读的是同一份文件，失败会打日志），这里不重复报。
         value = undefined
       }
     }
@@ -156,11 +177,13 @@ export function apply(ctx, config) {
   /** 挂到微任务上执行：inject 回调可能在 apply() 半路同步触发，那时下面的 let 还没初始化。 */
   function scheduleMainKeyRegistration() {
     queueMicrotask(() => {
-      registerMainKey().catch(() => {})
+      registerMainKey().catch((error) => {
+        log(`主 Key 解析失败：${error?.message ?? error}`)
+      })
     })
   }
 
-  /** settings 快照只读一次（与面板同款的防抛错包装）。 */
+  /** settings 快照只读一次；服务缺席或命名空间未注册时返回 undefined，绝不抛错。 */
   function safeSettingsTable() {
     try {
       return settingsService?.get?.('llm-pi-ai')
@@ -201,7 +224,7 @@ export function apply(ctx, config) {
       const hasApiKey = Boolean(headers.get('x-api-key'))
       if (requestKey) pool.register(requestKey, 'request')
       // 额外 key 必须在首次判定前就位，否则「全池冷却」与「挑备用 key」都会失真
-      await pool.ensureExtras(ctx, config).catch(() => {})
+      await ensureExtrasQuiet()
       diag.clineRequests += 1
 
       // 记录请求形状（只记头名与长度，绝不记 key 原文），便于线上定位「为什么没换 key」
@@ -222,7 +245,7 @@ export function apply(ctx, config) {
         trace.decision = reason
         diag.poolSize = pool.size // 每轮决策时刷新，避免沿用 ensureExtras 里被 TTL 节流前的旧值
         diag.lastDecision = reason
-        quotaStore.setDiagnostics({ ...diag, pool: pool.snapshot().map((e) => ({ label: e.label, cooling: e.cooling })) })
+        quotaStore.setDiagnostics({ ...diag })
         // 计数与「最近决策」一并落到 totals / diagnostics：三个决策点（正常发、换 key、快速失败）
         // 都会经过这里，所以不需要在每处 += 1 之后各自补一次写盘
         diag.statsSince = statsSince
@@ -235,13 +258,17 @@ export function apply(ctx, config) {
       }
       decide('inspecting')
 
-      // Request 形态下 body 只能消费一次：若存在多个 key（可能轮换），先缓冲一份可重发副本
+      // Request 形态下 body 只能消费一次：sendWith 重建 Request 时需要一份可重发副本。
+      // 这里**不能**再用 `pool.size > 1` 当条件——池里只有一把 key 时同样会走 sendWith
+      // 重建这条路，旧条件会让 bufferedBody 保持 undefined，请求体随之被清空。
+      // 缓冲失败也**不能**静默当成「没有 body」：宁可显式放弃轮换，也不能改变请求内容。
       let bufferedBody
-      if (input instanceof Request && pool.size > 1 && rotateStatuses.length > 0) {
+      let bodyBufferFailed = false
+      if (input instanceof Request) {
         try {
           bufferedBody = await input.clone().arrayBuffer()
         } catch {
-          bufferedBody = undefined
+          bodyBufferFailed = true
         }
       }
 
@@ -299,12 +326,15 @@ export function apply(ctx, config) {
 
       const sendWith = (sendHeaders, body) => {
         if (input instanceof Request) {
-          const rebuilt = new Request(input.url, {
+          // 用 `new Request(input, …)` 而不是 `new Request(input.url, …)`：前者继承原请求的
+          // signal / credentials / redirect / mode 等字段，后者会把这些全部丢掉——实测 abort
+          // 信号因此失效，客户端取消再也传不到上游。
+          // body 只在拿到可重发副本时才覆盖；拿不到就**省略**，让构造器继承 input 自己的 body。
+          // 绝不能传 `body: undefined`——那等于把请求体清空（实测服务端收到 0 字节）。
+          const rebuilt = new Request(input, {
             method: input.method,
             headers: sendHeaders,
-            body,
-            // 流式 body 需要 half duplex；字符串 body 下该字段被忽略
-            ...(body instanceof ReadableStream ? { duplex: 'half' } : {}),
+            ...(body !== undefined ? { body } : input.body ? { duplex: 'half' } : {}),
           })
           return originalFetch.call(this, rebuilt)
         }
@@ -314,14 +344,20 @@ export function apply(ctx, config) {
       let response = await sendWith(headers, bufferedBody)
       if (currentKey) pool.markSent(currentKey, model)
       if (!rotateStatuses.includes(response.status)) {
-        if (currentKey) pool.markHealthy(currentKey, model)
+        // 只有 2xx 才算「这把 key 成功了」：markHealthy 会清掉冷却记录并把 ok 计数 +1。
+        // 5xx / 4xx 走到这里时上游其实拒绝了这次请求，若也按成功记，面板的「成功」列会系统性
+        // 高估（实测 500 被记成 ok=1），而它正是用户判断「这把 key 还能不能用」的依据。
+        if (currentKey && response.ok) pool.markHealthy(currentKey, model)
+        else if (currentKey) pool.markFailed(currentKey, model)
         decide(`pass-through status=${response.status}`)
         // 顺手把这轮响应的 token 用量记到「key + 模型」上（失败静默，不影响请求）
         return currentKey ? tapUsage(response, (usage) => pool.markTokens(currentKey, model, normalizeUsage(usage))) : response
       }
 
       // 重发要求 body 可原样重建（字符串 / 字节），流式 body 只能原样返回
-      const replayable = input instanceof Request ? bufferedBody !== undefined : replayableBody(init?.body)
+      const replayable = input instanceof Request
+        ? !bodyBufferFailed && (bufferedBody !== undefined || !input.body)
+        : replayableBody(init?.body)
       if (!replayable || !currentKey) {
         decide(`cannot-rotate replayable=${replayable} keyPresent=${Boolean(currentKey)} status=${response.status}`)
         return response
@@ -329,7 +365,7 @@ export function apply(ctx, config) {
 
       let lastText = await response.clone().text()
       pool.markCooling(currentKey, model, parseRetryWindowMs(lastText) || clineCooldownMs, lastText)
-      await pool.ensureExtras(ctx, config).catch(() => {})
+      await ensureExtrasQuiet()
 
       for (let attempt = 0; attempt < MAX_ROTATE_ATTEMPTS; attempt++) {
         const next = pool.pick(model)
@@ -347,10 +383,17 @@ export function apply(ctx, config) {
         }
 
         if (!rotateStatuses.includes(retried.status)) {
-          pool.markHealthy(next.key, model)
-          diag.rotations += 1
-          decide(`rotated ${keyLabel(currentKey)}→${next.label} model=${model}`)
-          log(`Cline 限流已换 key 恢复（${keyLabel(currentKey)} → ${next.label}, model=${model}）`)
+          if (retried.ok) {
+            pool.markHealthy(next.key, model)
+            diag.rotations += 1
+            decide(`rotated ${keyLabel(currentKey)}→${next.label} model=${model}`)
+            log(`Cline 限流已换 key 恢复（${keyLabel(currentKey)} → ${next.label}, model=${model}）`)
+          } else {
+            // 换 key 后拿到的是 4xx/5xx：这次轮换并没有「恢复」，别把它计成成功，
+            // 也别把冷却清掉——留着继续试池里下一把。
+            pool.markFailed(next.key, model)
+            decide(`rotate-failed ${keyLabel(currentKey)}→${next.label} status=${retried.status} model=${model}`)
+          }
           return tapUsage(retried, (usage) => pool.markTokens(next.key, model, normalizeUsage(usage)))
         }
 
@@ -482,7 +525,7 @@ export function apply(ctx, config) {
     statsSince = Date.now()
     diag.statsSince = statsSince
     quotaStore.setTotals({ since: statsSince, clineRequests: 0, rotations: 0, failFasts: 0 })
-    quotaStore.setDiagnostics({ ...diag, pool: pool.snapshot().map((e) => ({ label: e.label, cooling: e.cooling })) })
+    quotaStore.setDiagnostics({ ...diag })
     quotaStore.flush()
     log('统计已重置（计数、token、最近决策归零；冷却与额度未动）')
     return sendJson(res, 200, { ok: true, since: statsSince, totals: quotaStore.totals(), poolSize: pool.size })
@@ -515,7 +558,7 @@ export function apply(ctx, config) {
 
     // 只有真写进去了才重扫：把新 ref 立刻收进池子（顺带刷新来源标签与池大小）
     if (report.imported.length > 0) {
-      await pool.ensureExtras(ctx, config, { force: true }).catch(() => {})
+      await ensureExtrasQuiet({ force: true })
     }
     // 日志只有计数，没有 Key 材料
     log(
@@ -563,7 +606,7 @@ export function apply(ctx, config) {
       ),
   }
 
-  if (typeof ctx.inject === 'function') {
+  {
     ctx.inject(['webServer'], (webCtx) => {
       webCtx.effect(
         () =>
@@ -586,7 +629,8 @@ export function apply(ctx, config) {
                 res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
                 return res.end()
               }
-              return sendJson(res, 200, payload)
+              // 条件请求：载荷没变就回 304（面板每 5 秒轮询一次，绝大多数轮次内容相同）
+              return sendJsonConditional(req, res, payload)
             },
           }),
         'dsh-cline-bridge: cline keys route',
@@ -634,5 +678,13 @@ export function apply(ctx, config) {
     parseRetryWindowMs,
     quotaStatePath: quotaStore.path,
     flushQuotaState: () => quotaStore.flush(),
+    /** 额外 key 来源的解析状态（原本随面板载荷下发，现已从载荷移除，仅自检使用）。 */
+    extras: () => ({
+      credentialsFileRead: Boolean(diag.credentialsFileRead),
+      extrasResolved: Boolean(diag.extrasResolved),
+      lastExtrasAt: diag.lastExtrasAt ?? '',
+    }),
+    /** 诊断快照（跨重启保留的那份）。 */
+    diagnostics: () => quotaStore.diagnostics(),
   }
 }

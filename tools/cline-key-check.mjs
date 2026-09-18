@@ -62,8 +62,13 @@ const server = createServer((req, res) => {
       return
     }
     res.writeHead(200, { 'content-type': 'application/json' })
+    // big* 前缀的 key 回一个**异常巨大**的 usage：用来验证插件会把单次上报夹在上限内，
+    // 不让一个坏数字污染「这把 key 用了多少」的统计（走的是真实的 tapUsage → markTokens 链路）。
+    const usage = key.startsWith('big')
+      ? { prompt_tokens: 1e12, completion_tokens: 10, total_tokens: 1e12 }
+      : undefined
     // 回包同样只回哈希标签，避免 key 原文出现在测试输出里
-    res.end(JSON.stringify({ ok: true, servedByTag: tag(key), model }))
+    res.end(JSON.stringify({ ok: true, servedByTag: tag(key), model, ...(usage ? { usage } : {}) }))
   })
 })
 
@@ -115,6 +120,8 @@ const attemptsText = (attempts) => attempts.map((a) => keyTag(a.key)).join('→'
 const ctxSnapshot = () => lastCtx?.__dshClineBridge?.clineKeys?.() ?? []
 const ctxStatus = (options) => lastCtx?.__dshClineBridge?.status?.(options) ?? null
 const ctxFlush = () => lastCtx?.__dshClineBridge?.flushQuotaState?.()
+const ctxExtras = () => lastCtx?.__dshClineBridge?.extras?.() ?? {}
+const ctxDiag = () => lastCtx?.__dshClineBridge?.diagnostics?.() ?? {}
 
 const call = async (key, model = 'deepseek/deepseek-v4.1-flash') => {
   const res = await globalThis.fetch(ENDPOINT, {
@@ -436,7 +443,7 @@ const since = (n) => seen.slice(n)
   const rg1 = await call('k1')
   const ag1 = since(g1)
   check('N3a 首次读到额外 key 后进入已解析状态，且当时池内只有两把',
-    rg1.status === 429 && ctxStatus().extras.extrasResolved === true && ctxStatus().keys.length === 2,
+    rg1.status === 429 && ctxExtras().extrasResolved === true && ctxStatus().keys.length === 2,
     `${attemptsText(ag1)} 池=${ctxStatus().keys.length}`)
 
   // 往同一个文件里追加一把新 ref（模拟用户新加了一把 key）
@@ -543,6 +550,272 @@ const since = (n) => seen.slice(n)
   await res4.text()
   const a4 = since(n4)
   check('Q4 池子为空时不注入（行为与从前一致）', a4.length === 1 && a4[0].key === '', attemptsText(a4))
+}
+
+// ─ R. 回归锁：Request 形态的 body 保真、abort 传播、非 2xx 计数、冷启动日志 ──
+// 这四条都曾经真实存在过缺陷，且此前没有任何用例覆盖（测试全走 (url, init) 形态）：
+//   R1/R2  Request 形态在**池里只有一把 key** 时请求体被静默清空（旧代码只在 pool.size>1
+//          时才缓冲 body，重建 Request 时传了 body: undefined）；
+//   R3      重建 Request 时丢掉 signal，客户端取消传不到上游；
+//   R4      非 2xx（例如 500）被计入「成功」，面板成功率系统性高估；
+//   R5      冷启动那次 key 池扫描的日志命中 const 的 TDZ，被 .catch 静默吞掉。
+{
+  // R1/R2 刻意用一个**不在 mock 限流名单里**的 key（k1/k5/e1/c1 一律回 429）：
+  // 否则第一条请求就会把这把 key 打进冷却，第二条会被「全池冷却快速失败」直接拦下，
+  // 那样测到的是快速失败、不是 body 保真（这个坑本身也值得记下来）。
+  const HEALTHY = 'ok1'
+  mount({ clineKeys: [], clineMatch: match })
+  const payload = JSON.stringify({ model: 'deepseek/deepseek-v4.1-flash', messages: [{ role: 'user', content: 'hi' }] })
+  const n = mark()
+  const req = new Request(ENDPOINT, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${HEALTHY}` },
+    body: payload,
+  })
+  await (await globalThis.fetch(req)).text()
+  const a = since(n)
+  check('R1 单 key 池下 Request 形态的请求体不丢（逐字节一致）',
+    a.length === 1 && a[0].body === payload, `len=${a[0]?.body?.length ?? -1}/${payload.length}`)
+
+  // R2：流式 body 同样要保住（旧代码对未消费的流 clone() 会抛，被 catch 吞成「无 body」）
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(payload))
+      controller.close()
+    },
+  })
+  const n2 = mark()
+  const req2 = new Request(ENDPOINT, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${HEALTHY}` },
+    body: stream,
+    duplex: 'half',
+  })
+  await (await globalThis.fetch(req2)).text()
+  const a2 = since(n2)
+  check('R2 流式 Request 的请求体也不丢', a2.length === 1 && a2[0].body === payload, `len=${a2[0]?.body?.length ?? -1}/${payload.length}`)
+}
+
+// R3：abort 必须传到上游（旧代码重建 Request 时丢掉了 signal，取消永远不生效）
+{
+  const slow = createServer((req, res) => {
+    req.on('data', () => {})
+    req.on('end', () => {}) // 永不响应
+  })
+  await new Promise((resolve) => slow.listen(0, '127.0.0.1', resolve))
+  const slowMatch = `127.0.0.1:${slow.address().port}`
+  mount({ clineKeys: [], clineMatch: slowMatch })
+  const controller = new AbortController()
+  const req = new Request(`http://${slowMatch}/api/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer k1' },
+    body: '{}',
+    signal: controller.signal,
+  })
+  setTimeout(() => controller.abort(new Error('cancelled by caller')), 200)
+  const outcome = await Promise.race([
+    globalThis.fetch(req).then(() => 'resolved').catch((error) => `rejected:${error?.name}`),
+    new Promise((resolve) => setTimeout(() => resolve('timeout'), 2000)),
+  ])
+  check('R3 abort 信号能传到上游（客户端取消不再失效）', outcome.startsWith('rejected'), outcome)
+  slow.closeAllConnections?.()
+  await new Promise((resolve) => slow.close(resolve))
+}
+
+// R4：非 2xx 不能计成「成功」
+{
+  const boom = createServer((req, res) => {
+    req.on('data', () => {})
+    req.on('end', () => {
+      res.writeHead(500, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ error: 'internal' }))
+    })
+  })
+  await new Promise((resolve) => boom.listen(0, '127.0.0.1', resolve))
+  const boomMatch = `127.0.0.1:${boom.address().port}`
+  const boomCtx = mount({ clineKeys: ['k1', 'k2'], clineMatch: boomMatch })
+  const res = await globalThis.fetch(`http://${boomMatch}/api/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer k1' },
+    body: JSON.stringify({ model: 'deepseek/deepseek-v4.1-flash' }),
+  })
+  await res.text()
+  const rows = boomCtx.__dshClineBridge.status().keys
+  check('R4 500 不计入「成功」，单独记 failed',
+    res.status === 500 && rows.every((row) => row.stats.ok === 0) && rows.some((row) => row.stats.failed === 1),
+    JSON.stringify(rows.map((row) => ({ ok: row.stats.ok, failed: row.stats.failed }))))
+  boom.closeAllConnections?.()
+  await new Promise((resolve) => boom.close(resolve))
+}
+
+// R5：冷启动的 key 池日志必须真的发出来（曾经被 TDZ + .catch 静默吞掉）
+{
+  const lines = []
+  dispose()
+  const ctx = {
+    on: (event, fn) => {
+      if (event === 'dispose') dispose = fn
+    },
+    logger: { warn: (message) => lines.push(String(message)) },
+    get: () => undefined,
+    inject: () => undefined,
+  }
+  apply(ctx, {
+    clineKeys: ['k1', 'k2'],
+    clineMatch: match,
+    quotaStatePath: join(TEST_STATE_DIR, `state-${++stateSeq}.json`),
+    credentialsFile: join(TEST_STATE_DIR, 'no-such-credentials.yaml'),
+  })
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  check('R5 冷启动就能打出 key 池日志（不再被 TDZ 吞掉）',
+    lines.some((line) => line.includes('key 池')), `lines=${lines.length}`)
+}
+
+// ─ S. 回归锁：兜底不再静默吞错 ──
+// 这一组针对的是「同一类问题的机制」而非某一个点：曾经 index.js 有 6 处
+// .catch(() => {}) 与 quota-state 的空 catch，会把额外 key 扫描失败、状态落盘失败
+// 全部吞得无影无踪——用户只会看到「池子莫名是空的 / 重启后冷却和统计全丢了」，
+// 日志里却什么线索都没有。修好单个 TDZ 点并不能防止同类问题再次发生。
+{
+  // S1：ensureExtras 内部抛错必须留下日志（用会抛错的 config 访问器触发）
+  const lines = []
+  dispose()
+  const ctx = {
+    on: (event, fn) => {
+      if (event === 'dispose') dispose = fn
+    },
+    logger: { warn: (message) => lines.push(String(message)) },
+    get: () => undefined,
+    inject: () => undefined,
+  }
+  apply(ctx, {
+    clineMatch: match,
+    quotaStatePath: join(TEST_STATE_DIR, `state-${++stateSeq}.json`),
+    credentialsFile: join(TEST_STATE_DIR, 'no-such-credentials.yaml'),
+    get clineKeys() {
+      throw new Error('config exploded')
+    },
+  })
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  check('S1 额外 key 扫描失败会打日志（不再被 .catch(() => {}) 吞掉）',
+    lines.some((line) => line.includes('额外 key 扫描失败')), `lines=${lines.length}`)
+
+  // S2：状态文件落盘失败必须留下日志（把状态路径的父级做成普通文件，mkdir 必然失败）
+  const blockedDir = join(TEST_STATE_DIR, `blocker-${++stateSeq}`)
+  writeFileSync(blockedDir, 'not a directory')
+  const writeLines = []
+  dispose()
+  const writeCtx = {
+    on: (event, fn) => {
+      if (event === 'dispose') dispose = fn
+    },
+    logger: { warn: (message) => writeLines.push(String(message)) },
+    get: () => undefined,
+    inject: () => undefined,
+  }
+  apply(writeCtx, {
+    clineKeys: ['k1'],
+    clineMatch: match,
+    quotaStatePath: join(blockedDir, 'sub', 'state.json'),
+    credentialsFile: join(TEST_STATE_DIR, 'no-such-credentials.yaml'),
+  })
+  writeCtx.__dshClineBridge.flushQuotaState()
+  check('S2 状态落盘失败会打日志（不再完全静默）',
+    writeLines.some((line) => line.includes('落盘失败')), `lines=${writeLines.length}`)
+
+  // S3：落盘失败只报一次，不能每 500ms 刷屏
+  writeCtx.__dshClineBridge.flushQuotaState()
+  writeCtx.__dshClineBridge.flushQuotaState()
+  check('S3 连续落盘失败只报一次（不刷屏）',
+    writeLines.filter((line) => line.includes('落盘失败')).length === 1,
+    `count=${writeLines.filter((line) => line.includes('落盘失败')).length}`)
+}
+
+// ─ T. 数据与资源：诊断字段白名单、轨迹截断、token 上限 ──
+// 防的都是「长期使用后文件无限涨」与「一个坏数字污染统计」。
+// 全部走真实链路，不引入任何只为测试存在的生产钩子。
+{
+  // T1/T2：diagnostics 过白名单——v1 遗留字段与未知字段都不该落盘
+  const statePath = join(TEST_STATE_DIR, `state-${++stateSeq}.json`)
+  // 先造一个带 v1 遗留字段的状态文件，模拟从旧版本升级上来
+  writeFileSync(
+    statePath,
+    JSON.stringify({
+      version: 2,
+      entries: {},
+      usage: {},
+      totals: { since: 1, clineRequests: 0, rotations: 0, failFasts: 0 },
+      diagnostics: {
+        pluginVersion: '1.0.0',
+        credentialsFound: true,
+        credentialsVia: 'file',
+        credentialsProbeError: 'boom',
+        injectApi: false,
+        injectCallback: false,
+        injectError: 'nope',
+        someUnknownField: { nested: 'junk' },
+        lastRequests: [{ at: 'x', model: 'm', decision: 'd', extra: 'drop-me' }],
+      },
+    }),
+  )
+  mount({ clineKeys: ['k1'], clineMatch: match, quotaStatePath: statePath, allCoolingFailFast: false })
+  await call('k1')
+  ctxFlush()
+  const disk = JSON.parse(readFileSync(statePath, 'utf8'))
+  const legacyKeys = ['credentialsFound', 'credentialsVia', 'credentialsProbeError', 'injectApi', 'injectCallback', 'injectError']
+  check('T1 读盘时清掉 v1 遗留诊断字段（它们早已没有写入者）',
+    legacyKeys.every((name) => !(name in disk.diagnostics)), Object.keys(disk.diagnostics).join(','))
+  check('T2 未知诊断字段也不落盘（白名单生效）',
+    !('someUnknownField' in disk.diagnostics), Object.keys(disk.diagnostics).join(','))
+
+  // T3：轨迹条数与单条长度都有上限。发多条请求（每条都会写一次 lastRequests），
+  // 再检查落盘的条数与字段长度——这走的是 decide() → setDiagnostics 的真实路径。
+  const diagPath = join(TEST_STATE_DIR, `state-${++stateSeq}.json`)
+  mount({ clineKeys: ['k2'], clineMatch: match, quotaStatePath: diagPath })
+  const longModel = 'm'.repeat(400)
+  for (let i = 0; i < 5; i++) await call('k2', longModel)
+  ctxFlush()
+  const d3 = JSON.parse(readFileSync(diagPath, 'utf8')).diagnostics
+  check('T3 最近决策轨迹被截断（条数 ≤ 3，且单条字段有长度上限）',
+    Array.isArray(d3.lastRequests) && d3.lastRequests.length <= 3 &&
+      d3.lastRequests.every((row) => Object.values(row).every((v) => typeof v !== 'string' || v.length <= 200)),
+    `count=${d3.lastRequests?.length} maxLen=${Math.max(...(d3.lastRequests ?? []).flatMap((r) => Object.values(r).filter((v) => typeof v === 'string').map((v) => v.length)))} `)
+
+  // T4：token 上限——mock 对 big* 前缀的 key 回一个 1e12 的 input token，
+  // 插件应把它夹在 1e9 以内，而不是原样累加。
+  const bigPath = join(TEST_STATE_DIR, `state-${++stateSeq}.json`)
+  mount({ clineKeys: ['k2'], clineMatch: match, quotaStatePath: bigPath })
+  const bigRes = await globalThis.fetch(ENDPOINT, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer bigkey-long-enough' },
+    body: JSON.stringify({ model: 'deepseek/deepseek-v4.1-flash', messages: [] }),
+  })
+  await bigRes.text()
+  // tapUsage 是异步扫流，给它一拍
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  const bigLabel = keyTag('bigkey-long-enough')
+  const bigRow = ctxStatus().keys.find((row) => row.label === bigLabel)
+  const bigTok = bigRow?.models?.['deepseek/deepseek-v4.1-flash']?.tokens
+  check('T4 异常大的单次 token 上报被夹在上限内（不污染统计）',
+    Boolean(bigTok) && bigTok.input > 0 && bigTok.input <= 1e9 && bigTok.output === 10,
+    JSON.stringify(bigTok))
+
+  // T5：一把 key 见过的模型行数有上限（长跑进程里模型名会被不断带进来）。
+  // 用长 key：keyTag 对 ≤8 字符的 key 原样返回，而池内的 label 是哈希，短 key 定位不到。
+  const MANY_KEY = 'many-models-key'
+  const manyPath = join(TEST_STATE_DIR, `state-${++stateSeq}.json`)
+  mount({ clineKeys: [MANY_KEY], clineMatch: match, quotaStatePath: manyPath })
+  for (let i = 0; i < 60; i++) await call(MANY_KEY, `model-${String(i).padStart(3, '0')}`)
+  const manyRow = ctxStatus().keys.find((row) => row.label === keyTag(MANY_KEY))
+  const manyModels = Object.keys(manyRow?.models ?? {})
+  check('T5 单把 key 的模型行数被裁剪（不超过上限）',
+    manyModels.length > 0 && manyModels.length <= 40, `models=${manyModels.length}`)
+
+  // 裁剪必须丢「最久没用过」的：最新的那个模型要在，最早的那些该被丢掉。
+  // （这条曾经真的错过：新行的 lastUsedAt 初始为 0，会先把自己裁掉，结果留下的是最早的 40 个。）
+  check('T5b 裁剪保留最近使用的模型行、丢掉最早的',
+    manyModels.includes('model-059') && !manyModels.includes('model-000'),
+    `has-059=${manyModels.includes('model-059')} has-000=${manyModels.includes('model-000')} first=${manyModels[0]}`)
 }
 
 dispose()
