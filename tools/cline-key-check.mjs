@@ -989,6 +989,20 @@ const since = (n) => seen.slice(n)
     v5c.status === 200 && v5cattempts.length === 2 && Object.keys(ctxStatus().selection ?? {}).length === 0,
     `${v5c.status} ${attemptsText(v5cattempts)} selection=${JSON.stringify(ctxStatus().selection)}`)
 
+  // V5d：skipCoolingRequestKey 打开时，冷却中的选定会被**直接跳过**（没有 429、没有轮换），
+  // 这时「使用中」同样要跟着挪到实际跑通的那把——用户看到的「实际请求的是另一把、标记还停在
+  // 旧的那把」正是这条（另一条是 2.4.1 修的轮换跟随）。
+  mount({ clineKeys: [limitedKey, backupKey], clineMatch: match, skipCoolingRequestKey: true })
+  await call(limitedKey, modelA) // 先把这把打成冷却（429 → 记冷却）
+  lastCtx.__dshClineBridge.setSelection(modelA, limitedLabel)
+  const v5dn = mark()
+  const v5d = await call(requestKey, modelA)
+  const v5dattempts = since(v5dn)
+  check('V5d 选定冷却且开了 skipCoolingRequestKey：首发送直接改用健康 key，「使用中」跟着换',
+    v5d.status === 200 && v5dattempts.length === 1 && v5dattempts[0].key === backupKey &&
+      ctxStatus().selection?.[modelA] === backupLabel,
+    `${v5d.status} ${attemptsText(v5dattempts)} selection=${JSON.stringify(ctxStatus().selection)}`)
+
   // V6：取消 modelA 的选定不影响 modelB——两边各自独立
   mount({ clineKeys: [pickedKey, backupKey], clineMatch: match })
   lastCtx.__dshClineBridge.setSelection(modelA, pickedLabel)

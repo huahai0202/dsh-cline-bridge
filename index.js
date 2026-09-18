@@ -367,8 +367,13 @@ export function apply(ctx, config) {
         // 只有 2xx 才算「这把 key 成功了」：markHealthy 会清掉冷却记录并把 ok 计数 +1。
         // 5xx / 4xx 走到这里时上游其实拒绝了这次请求，若也按成功记，面板的「成功」列会系统性
         // 高估（实测 500 被记成 ok=1），而它正是用户判断「这把 key 还能不能用」的依据。
-        if (currentKey && response.ok) pool.markHealthy(currentKey, model)
-        else if (currentKey) pool.markFailed(currentKey, model)
+        if (currentKey && response.ok) {
+          pool.markHealthy(currentKey, model)
+          // 这个模型有选定、但实际跑通的是另一把（典型：选定的那把已冷却、被
+          // skipCoolingRequestKey 直接跳过），让「使用中」跟着挪到真正在用的这把——
+          // 否则面板会指着一把没在用的 Key（用户报的「标记没跟着换」就是这条）。
+          if (pool.followRotation(model, currentKey)) log(`已把 ${model} 的「使用中」改为 ${keyLabel(currentKey)}（实际在用）`)
+        } else if (currentKey) pool.markFailed(currentKey, model)
         decide(`pass-through status=${response.status}`)
         // 顺手把这轮响应的 token 用量记到「key + 模型」上（失败静默，不影响请求）
         return currentKey ? tapUsage(response, (usage) => pool.markTokens(currentKey, model, normalizeUsage(usage))) : response
