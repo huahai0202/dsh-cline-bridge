@@ -23,7 +23,7 @@ import {
 import { keyLabel } from './lib/host/labels.js'
 import { isPlausibleModelId } from './lib/host/model-id.js'
 import { cooldownMsFromResponse, createQuotaStore, parseRetryWindowMs } from './lib/host/quota-state.js'
-import { readAuthTarget, readKeyOf, readModelOf, replayableBody, writeKeyTo } from './lib/host/request-shape.js'
+import { matchesClineTarget, readAuthTarget, readKeyOf, readModelOf, replayableBody, writeKeyTo } from './lib/host/request-shape.js'
 import { normalizeUsage, tapUsage } from './lib/host/usage.js'
 import { createKeyPool } from './lib/host/key-pool.js'
 import { buildStatus, clineApiKeyEnvOf } from './lib/host/status.js'
@@ -207,8 +207,10 @@ export function apply(ctx, config) {
       url = input.url
     }
 
-    // 目标为 Cline 官方中转 API 的所有请求（含多 key 轮换）
-    if (url && url.includes(clineMatch)) {
+    // 目标为 Cline 官方中转 API 的所有请求（含多 key 轮换）。
+    // 按主机名匹配而不是整条 URL 的子串：子串会把仿冒主机（api.cline.bot.attacker.example）
+    // 和只在路径/查询串里提到 cline.bot 的 URL 都算命中，池里的 Key 会随之发向错误的对象。
+    if (url && matchesClineTarget(url, clineMatch)) {
       const headers = new Headers(init?.headers || (input instanceof Request ? input.headers : {}))
 
       // 仅注入 Cline 官方客户端协议特征头；鉴权默认完全遵循用户在 DSH 的设置
@@ -223,8 +225,9 @@ export function apply(ctx, config) {
 
       const authTarget = readAuthTarget(headers)
       const rawRequestKey = readKeyOf(headers, authTarget)
-      // pi-ai 在没有凭据时可能发出「Bearer undefined / Bearer null」这类占位头：一律按「没带 key」处理
-      const requestKey = /^(undefined|null)$/i.test(rawRequestKey) ? '' : rawRequestKey
+      // pi-ai 在没有凭据时可能发出「Bearer undefined / Bearer null」乃至裸「Bearer」这类
+      // 占位头：一律按「没带 key」处理（与 key-pool.register 的拒收口径保持一致）
+      const requestKey = /^(undefined|null|bearer)$/i.test(rawRequestKey) ? '' : rawRequestKey
       const hasAuthorization = Boolean(headers.get('authorization'))
       const hasApiKey = Boolean(headers.get('x-api-key'))
       if (requestKey) pool.register(requestKey, 'request')
@@ -361,7 +364,15 @@ export function apply(ctx, config) {
         return originalFetch.call(this, input, { ...init, headers: sendHeaders })
       }
 
-      let response = await sendWith(headers, bufferedBody)
+      let response
+      try {
+        response = await sendWith(headers, bufferedBody)
+      } catch (error) {
+        // 传输层异常（abort / DNS / TLS）：与其余路径一样留下决策与日志，不让轨迹停在 inspecting
+        decide(`transport-error ${String(error?.message ?? error).slice(0, 80)}`)
+        log(`Cline 首发送失败（model=${model}）：${error?.message ?? error}`)
+        throw error
+      }
       if (currentKey) pool.markSent(currentKey, model)
       if (!rotateStatuses.includes(response.status)) {
         // 只有 2xx 才算「这把 key 成功了」：markHealthy 会清掉冷却记录并把 ok 计数 +1。
@@ -483,9 +494,14 @@ export function apply(ctx, config) {
   const resetPath = '/dsh-cline-bridge/keys/stats/reset'
   const selectPath = '/dsh-cline-bridge/keys/select'
 
-  /** ref → 当前值：凭据服务优先（反映 DSH 眼里的真实值），服务缺席或未就绪时直读文件。 */
+  /** ref → 当前值：凭据服务优先（反映 DSH 眼里的真实值），服务缺席或未就绪时直读文件。
+   *  关键约束：**解析失败 ≠ 空闲**。服务 resolve 抛错（钥匙串锁住、文件正被占用……）时
+   *  那把 ref 的状态是「不明」，不是「没人用」——若当成空闲，导入就会用 set() 把用户
+   *  正在用的 Key 静默覆盖掉（回包还显示「导入成功」）。不明的槽位先退文件直读兜底
+   *  确认一次，仍不明就记入 unknown，本次导入一个都不用。 */
   const readClineKeyRefs = async () => {
     const values = new Map(wantedKeyRefs.map((ref) => [ref, undefined]))
+    const unknown = new Set()
     const service = credentialsService
     if (service && typeof service.resolve === 'function') {
       await Promise.all(
@@ -494,20 +510,34 @@ export function apply(ctx, config) {
             const found = await service.resolve(ref)
             if (found && typeof found.value === 'string' && found.value) values.set(ref, found.value)
           } catch {
-            // 单个 ref 解析失败只影响它自己：按「未占用」处理，导入时再用写路径的报错说话
+            unknown.add(ref)
           }
         }),
       )
-      return { values, source: 'credentials' }
+      // 服务说不清的槽位，退回文件直读确认一次（读侧本来就有这条兜底）
+      if (unknown.size > 0 && config?.readCredentialsFile !== false) {
+        try {
+          for (const [ref, value] of readCredentialRefsFromFile(resolveCredentialsFilePath(config), [...unknown])) {
+            values.set(ref, value)
+          }
+          // 文件读到了：在里面的按占用、不在里面的真空闲；文件不存在也按全部空闲。
+          // 只有「读到了但解析/权限失败」才保持状态不明（importClineKeys 会跳过这些槽位）。
+          unknown.clear()
+        } catch (error) {
+          if (error?.code === 'ENOENT') unknown.clear()
+        }
+      }
+      return { values, unknown, source: 'credentials' }
     }
     try {
       for (const [ref, value] of readCredentialRefsFromFile(resolveCredentialsFilePath(config), wantedKeyRefs)) {
         values.set(ref, value)
       }
-    } catch {
-      // 文件不存在/不可读：当作全都空着，写的时候再报错
+    } catch (error) {
+      // 文件不存在 = 全部真空闲；读到了但解析/权限失败 = 全部状态不明（宁可这次导不进去）
+      if (error?.code !== 'ENOENT') wantedKeyRefs.forEach((ref) => unknown.add(ref))
     }
-    return { values, source: 'file' }
+    return { values, unknown, source: 'file' }
   }
 
   /** 凭据服务缺席时的兜底写：直写凭据文件的 refs 段。 */
@@ -588,6 +618,8 @@ export function apply(ctx, config) {
       text,
       refs: wantedKeyRefs,
       existing: current.values,
+      // 状态不明的槽位（服务解析失败、文件也确认不了）：绝不往里写
+      unknownRefs: current.unknown,
       writeRef: writeClineKeyRef,
       // 池内已知标签：粘一把已经在用的 Key 会被判为重复，而不是又写一份
       poolLabels: new Set(pool.snapshot().map((entry) => entry.label)),
@@ -600,7 +632,9 @@ export function apply(ctx, config) {
     // 日志只有计数，没有 Key 材料
     log(
       '导入 Key：新增 ' + report.imported.length + '，重复 ' + report.duplicates.length +
-        '，拒绝 ' + report.rejected.length + '，失败 ' + report.failed.length + '（来源：' + current.source + '）',
+        '，拒绝 ' + report.rejected.length + '，失败 ' + report.failed.length +
+        (report.refsUnknown.length > 0 ? '，槽位状态不明 ' + report.refsUnknown.length + ' 个（已跳过）' : '') +
+        '（来源：' + current.source + '）',
     )
     return sendJson(res, 200, {
       ok: true,
@@ -610,6 +644,7 @@ export function apply(ctx, config) {
       rejected: report.rejected,
       failed: report.failed,
       refsFree: report.refsFree,
+      refsUnknown: report.refsUnknown,
       poolSize: pool.size,
       maxKeys: MAX_IMPORT_KEYS,
     })

@@ -14,6 +14,8 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply } from '../index.js'
+import { matchesClineTarget } from '../lib/host/request-shape.js'
+import { MAX_POOL_KEYS, MAX_STORED_ERROR_BODY } from '../lib/host/defaults.js'
 
 // 额度状态默认落在 DSH home；自检必须隔离到临时目录，绝不碰用户真实状态文件
 const TEST_STATE_DIR = join(tmpdir(), `ofb-cline-state-${process.pid}`)
@@ -76,6 +78,20 @@ const server = createServer((req, res) => {
       // 插件据此只应该记住「限流发生过」，**不该**自己编一个恢复时刻。
       res.writeHead(429, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ code: 'RATE_LIMITED', message: 'Too many requests, please slow down.' }))
+      return
+    }
+
+    if (key.startsWith('huge')) {
+      // 异常巨大的 429 报文：插件只能把窗口与错误码那几行落盘（上限 4KB），
+      // 不能把这种报错页原样吞进内存与状态文件。
+      res.writeHead(429, { 'content-type': 'application/json' })
+      res.end(
+        JSON.stringify({
+          code: 'INFERENCE_CAP_ERROR',
+          message: `Error 429: Daily free limit reached on model ${model}. Try again in 22h 47m`,
+          padding: 'x'.repeat(120 * 1024),
+        }),
+      )
       return
     }
 
@@ -1036,6 +1052,100 @@ const since = (n) => seen.slice(n)
     stateText.includes(pickedLabel) && stateText.includes(backupLabel) &&
       !stateText.includes(pickedKey) && !stateText.includes(backupKey),
     `hasA=${stateText.includes(pickedLabel)} hasRaw=${stateText.includes(pickedKey)}`)
+}
+
+// ─ Y. 安全与资源边界：URL 主机名匹配、裸 Bearer、传输异常决策、失效选定不跟随、
+//      模型名归一、429 报文落盘上限、池规模上限 ──
+{
+  // Y1：介入范围按主机名匹配，不再看整条 URL 的子串——子串会把仿冒主机
+  //（api.cline.bot.attacker.example）和只在路径/查询串里提到 cline.bot 的 URL 算命中，
+  // 池里的 Key 会随之发向错误的对象（凭据外泄）。
+  check('Y1a 默认 cline.bot 命中 api.cline.bot', matchesClineTarget('https://api.cline.bot/v1/chat', 'cline.bot') === true)
+  check('Y1b 仿冒主机不命中', matchesClineTarget('https://api.cline.bot.attacker.example/v1', 'cline.bot') === false)
+  check('Y1c 只在路径/查询串里提到 cline.bot 不命中',
+    matchesClineTarget('https://evil.example/?next=https://api.cline.bot', 'cline.bot') === false &&
+      matchesClineTarget('https://evil.example/cline.bot/', 'cline.bot') === false)
+  check('Y1d notcline.bot 这类拼接前缀不命中', matchesClineTarget('https://notcline.bot/v1', 'cline.bot') === false)
+  check('Y1e host:port 形态照常命中（本自检的 mock 靠它）', matchesClineTarget(ENDPOINT, match) === true)
+  check('Y1f 完整 URL 形态要求 protocol+host 全等（路径随意）',
+    matchesClineTarget('https://api.cline.bot/api/v1/chat', 'https://api.cline.bot/api') === true &&
+      matchesClineTarget('http://api.cline.bot/api', 'https://api.cline.bot') === false)
+  check('Y1g 端口不同不命中', matchesClineTarget('http://127.0.0.1:1/x', '127.0.0.1:9999') === false)
+
+  // Y2：裸「Bearer」（没有 token 的授权头）与「Bearer undefined」一样按没带 key 处理——
+  // 否则会把字符串 'Bearer' 当 key 发给上游，fillMissingRequestKey 也轮不到上场。
+  mount({ clineKeys: ['k2'], clineMatch: match })
+  const y2n = mark()
+  const y2res = await globalThis.fetch(ENDPOINT, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer' },
+    body: JSON.stringify({ model: 'deepseek/deepseek-v4.1-flash', messages: [] }),
+  })
+  await y2res.text()
+  const y2a = since(y2n)
+  check('Y2 裸 Bearer 占位头按没带 key 处理（从池里兜底，不把 Bearer 当 key 发出去）',
+    y2res.status === 200 && y2a.length === 1 && y2a[0].key === 'k2', attemptsText(y2a))
+
+  // Y3：首发送传输层异常（连接被拒）也要留下决策，轨迹不能停在 inspecting。
+  mount({ clineKeys: ['k2'], clineMatch: '127.0.0.1:1' })
+  const y3err = await globalThis.fetch('http://127.0.0.1:1/api/v1/chat', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer k2' },
+    body: JSON.stringify({ model: 'deepseek/deepseek-v4.1-flash', messages: [] }),
+  }).catch((error) => error)
+  check('Y3 首发送传输异常记为 transport-error（不停在 inspecting）',
+    y3err instanceof Error && String(ctxDiag().lastDecision).startsWith('transport-error'),
+    String(ctxDiag().lastDecision))
+
+  // Y4：选定指向的 key 已不在池中（凭据被删/没读到）时，成功请求**不**跟随改写选定——
+  // 否则用户「别烧主 Key」的选定会被一次成功请求悄悄挪到主 Key 上，
+  // 面板的「已不在池中」提示也永远来不及显示。
+  const staleModel = 'deepseek/deepseek-v4.1-flash'
+  const stalePath = join(TEST_STATE_DIR, `state-${++stateSeq}.json`)
+  writeFileSync(stalePath, JSON.stringify({
+    version: 2, entries: {}, usage: {},
+    selection: { [staleModel]: { label: 'deadbeef', at: 1 } },
+    totals: {}, diagnostics: {},
+  }))
+  mount({ clineKeys: ['k2'], clineMatch: match, quotaStatePath: stalePath })
+  const y4 = await call('k2')
+  check('Y4 选定指向已不在池中的 key 时不跟随（成功请求不改写落盘的选定）',
+    y4.status === 200 && ctxStatus().selection?.[staleModel] === 'deadbeef',
+    `落盘选定=${ctxStatus().selection?.[staleModel]}`)
+
+  // Y5：请求体里的模型名带首尾空格时按 trim 后的归一名字记账——
+  // 否则选定路由（会 trim）写下的选定永远对不上运行期用的键。
+  mount({ clineKeys: ['k2'], clineMatch: match })
+  const y5 = await call('k2', ' padded/model-x ')
+  const y5models = (ctxStatus().models ?? []).map((row) => row.id)
+  check('Y5 模型名归一化（首尾空格不进入模型清单）',
+    y5.status === 200 && y5models.includes('padded/model-x') && y5models.every((id) => id === id.trim()),
+    y5models.join(','))
+
+  // Y6：429 报文落盘有上限：120KB 的报错页只能截到 4KB（窗口文本仍在）。
+  const hash8 = (value) => {
+    let h = 0x811c9dc5
+    for (let i = 0; i < value.length; i++) {
+      h ^= value.charCodeAt(i)
+      h = Math.imul(h, 0x01000193) >>> 0
+    }
+    return h.toString(16).padStart(8, '0')
+  }
+  const hugePath = join(TEST_STATE_DIR, `state-${++stateSeq}.json`)
+  mount({ clineKeys: ['huge1'], clineMatch: match, quotaStatePath: hugePath })
+  const y6 = await call('huge1')
+  ctxFlush()
+  const hugeState = JSON.parse(readFileSync(hugePath, 'utf8'))
+  const hugeBody = hugeState?.entries?.[hash8('huge1')]?.['deepseek/deepseek-v4.1-flash']?.body ?? ''
+  check('Y6 巨大 429 报文按上限截断落盘（窗口文本仍在）',
+    y6.status === 429 && hugeBody.length > 0 && hugeBody.length <= MAX_STORED_ERROR_BODY && hugeBody.includes('Try again in'),
+    `body=${hugeBody.length}B status=${y6.status}`)
+
+  // Y7：内存池有上限（MRU 裁剪）：config/请求头带来的 key 再多也不会无限涨。
+  const many = Array.from({ length: MAX_POOL_KEYS + 50 }, (_, i) => `pk${i}pad`)
+  mount({ clineKeys: many, clineMatch: match })
+  await lastCtx.__dshClineBridge.ensureExtras({ force: true })
+  check('Y7 池规模按 MRU 夹在上限内', ctxSnapshot().length === MAX_POOL_KEYS, `池=${ctxSnapshot().length}`)
 }
 
 dispose()

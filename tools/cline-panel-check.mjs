@@ -155,7 +155,9 @@ function mount(config = {}) {
   const settingsValues = { 'llm-pi-ai': SETTINGS_TABLE, 'agent-default-model': AGENT_DEFAULT, ...(config.__settingsValues ?? {}) }
   // 每次挂载一个全新的凭据文件：导入测试之间不互相污染（config 里显式给了就用它的）
   const credentialsFile = config.credentialsFile ?? join(TEST_STATE_DIR, `creds-${++credsSeq}.yaml`)
-  const credentials = makeCredentialsService(credentialsFile)
+  // __credentials 允许测试注入「会出故障」的凭据服务（比如 resolve 全部抛错），
+  // 用来验证导入在「槽位状态不明」时宁可不导，也不往可能已被占用的 ref 上盖。
+  const credentials = config.__credentials ?? makeCredentialsService(credentialsFile)
   const ctx = {
     on: (event, fn) => { if (event === 'dispose') dispose = fn },
     logger: { warn: () => {} },
@@ -755,6 +757,46 @@ const ctxStatusOf = (options) => lastCtx?.__dshClineBridge?.status?.(options)
   check('L26 解析容忍引号 / Bearer 前缀 / 逗号分号分隔',
     parsed.values.length === 5 && parsed.values[0] === 'sk-quoted1111' && parsed.values[1] === 'sk-bearer2222' && parsed.rejected.length === 0,
     parsed.values.join('|'))
+}
+
+// 凭据服务「读不出」槽位时：宁可一个不导，也绝不往可能已被占用的 ref 上盖。
+// 这正是 N1 的回归测试——一次服务抖动不该把用户正在用的 Key 覆盖掉。
+{
+  const credsFile = join(TEST_STATE_DIR, `import-unknown-${++credsSeq}.yaml`)
+  let setCalls = 0
+  const broken = {
+    async resolve() { throw new Error('vault locked') },
+    async set() { setCalls += 1 },
+  }
+  mount({ clineKeys: [], credentialsFile: credsFile, readCredentialsFile: false, __credentials: broken })
+  const blind = await importPost({ body: JSON.stringify({ keys: SECRET_C }) })
+  check('L27 全部槽位状态不明时一把都不导入',
+    blind.status === 200 && blind.json?.imported?.length === 0 && blind.json?.rejected?.[0]?.reason === 'no-free-ref',
+    JSON.stringify(blind.json ?? {}).slice(0, 120))
+  check('L28 回包如实列出状态不明的槽位（9 个）',
+    blind.json?.refsUnknown?.length === 9 && blind.json.refsUnknown.every((ref) => /^CLINE_API_KEY_\d+$/.test(ref)),
+    JSON.stringify(blind.json?.refsUnknown))
+  check('L29 一个槽位都没写（文件根本没被创建）', setCalls === 0 && !existsSync(credsFile), `setCalls=${setCalls}`)
+  check('L30 回包依然不含 Key 原文', !blind.body.includes(SECRET_C))
+}
+
+// 服务读不出、但文件兜底读得到：以文件为准——占用归占用、空闲归空闲，导入照常落最小的空闲槽位。
+{
+  const credsFile = join(TEST_STATE_DIR, `import-fileback-${++credsSeq}.yaml`)
+  writeCredentialRefToFile(credsFile, 'CLINE_API_KEY_2', 'sk-occupied-00000000')
+  const broken = {
+    async resolve() { throw new Error('vault locked') },
+    async set(ref, value) { writeCredentialRefToFile(credsFile, ref, value) },
+  }
+  mount({ clineKeys: [], credentialsFile: credsFile, __credentials: broken })
+  const viaFile = await importPost({ body: JSON.stringify({ keys: SECRET_C }) })
+  check('L31 文件兜底确认占用后，导入落在下一个空闲槽位 _3',
+    viaFile.json?.imported?.[0]?.ref === 'CLINE_API_KEY_3' && viaFile.json?.refsUnknown?.length === 0,
+    JSON.stringify(viaFile.json?.imported))
+  check('L32 已被占用的 _2 原值原样保留',
+    readCredentialRefsFromFile(credsFile, ['CLINE_API_KEY_2']).get('CLINE_API_KEY_2') === 'sk-occupied-00000000')
+  check('L33 新 Key 真的写进了 _3',
+    readCredentialRefsFromFile(credsFile, ['CLINE_API_KEY_3']).get('CLINE_API_KEY_3') === SECRET_C)
 }
 
 // ───────────────── 4f-2. 选定「使用中」的 Key（第三条写路由，按模型独立）─────────────────
@@ -1837,6 +1879,7 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
     rejected: [{ preview: 'ab…cd', reason: 'too-short' }],
     failed: [],
     refsFree: 5,
+    refsUnknown: ['CLINE_API_KEY_4'],
     poolSize: 3,
     maxKeys: 20,
   }
@@ -1869,6 +1912,9 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
     Boolean(summary) && summaryText.includes('CLINE_API_KEY_2, CLINE_API_KEY_3') && summaryText.includes('too short') &&
       !/[\u4e00-\u9fff]/.test(JSON.stringify(summary)),
     summaryText.slice(0, 140))
+  check('Z3 摘要带出「状态不明槽位已跳过」一行（英文文案 + ref 名）',
+    summaryText.includes('could not read') && summaryText.includes('CLINE_API_KEY_4'),
+    summaryText.slice(0, 200))
   panel.bundle.mini.dispose()
 }
 
