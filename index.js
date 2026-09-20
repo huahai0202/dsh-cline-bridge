@@ -492,6 +492,15 @@ export function apply(ctx, config) {
       }
 
       let lastText = await response.clone().text()
+      // 上游共享池瞬时限流（OpenRouter 形态：limit_source=upstream_provider_shared_pool）：
+      // 限额在**上游渠道**上、与 Cline key 无关，换 key 解决不了（同一把 key 的兄弟们打的是
+      // 同一个 Parasail 池）。轮换在这里只会白烧 6 次请求还拉高延迟——直接原样交回 pi-ai
+      // 走退避重试（它自己带 retry-after 处理），key 也不记冷却（报文里没有恢复时刻，
+      // markCooling 收到 0 会正确地不编造窗口）。
+      if (lastText.includes('upstream_provider_shared_pool')) {
+        decide(`upstream-pool-429 pass-through to pi-ai retry model=${model}`)
+        return response
+      }
       // 冷却窗口只认服务端给的：报文窗口 → Retry-After 头；两者都没有时用 clineCooldownMs
       // 兜底，而它默认是 0 = 不补（见 defaults.js：不自己编恢复时刻）。
       pool.markCooling(currentKey, model, cooldownMsFromResponse(response, lastText) || clineCooldownMs, lastText)
@@ -540,6 +549,11 @@ export function apply(ctx, config) {
         }
 
         lastText = await retried.clone().text()
+        if (lastText.includes('upstream_provider_shared_pool')) {
+          // 轮换重发也撞上共享池限流：停止轮换（再换也是同一个池），交回 pi-ai 退避。
+          decide(`upstream-pool-429 stop-rotation status=429 model=${model}`)
+          return retried
+        }
         pool.markCooling(next.key, model, cooldownMsFromResponse(retried, lastText) || clineCooldownMs, lastText)
         currentKey = next.key
         response = retried

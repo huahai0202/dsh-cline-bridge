@@ -95,7 +95,13 @@ const server = createServer((req, res) => {
       return
     }
 
-    if (LIMITED_PREFIXES.some((p) => key === p || key.startsWith(p))) {
+        if (key.startsWith('p1') || key.startsWith('p2')) {
+      // OpenRouter 共享池形态：429 + limit_source=upstream_provider_shared_pool
+      res.writeHead(429, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ error: { message: 'Provider returned error', code: 429, metadata: { raw: 'temporarily rate-limited upstream', provider_name: 'Parasail', limit_source: 'upstream_provider_shared_pool' } } }))
+      return
+    }
+if (LIMITED_PREFIXES.some((p) => key === p || key.startsWith(p))) {
       res.writeHead(429, { 'content-type': 'application/json' })
       res.end(
         JSON.stringify({
@@ -1146,6 +1152,22 @@ const since = (n) => seen.slice(n)
   mount({ clineKeys: many, clineMatch: match })
   await lastCtx.__dshClineBridge.ensureExtras({ force: true })
   check('Y7 池规模按 MRU 夹在上限内', ctxSnapshot().length === MAX_POOL_KEYS, `池=${ctxSnapshot().length}`)
+}
+
+// ── Z. 上游共享池 429（limit_source=upstream_provider_shared_pool）─────
+// 限额在上游渠道（如 Parasail 的共享池）上，与 Cline key 无关：换 key 解决不了，
+// 插件应该直接把 429 交回 pi-ai 退避重试，而不是烧 6 把 key 去撞同一个池。
+{
+  mount({ clineKeys: ['p1', 'p2'], clineMatch: match })
+  const n = mark()
+  const r = await call('p1')
+  const attempts = since(n)
+  check('Z1 共享池 429 不触发轮换（只打了首发送那一次）', r.status === 429 && attempts.length === 1, attemptsText(attempts))
+  check('Z2 不追加 x-should-retry（交给 pi-ai 退避重试）', r.noRetry === null, String(r.noRetry))
+  // 且不给 key 记冷却：这是渠道的瞬时状态，把 healthy key 冷藏一整天更糟
+  const snap = lastCtx.__dshClineBridge.clineKeys()
+  const cooled = snap.every((k) => (k.cooling ?? []).length === 0)
+  check('Z3 共享池 429 不记冷却（key 保持可用）', cooled, JSON.stringify(snap.map((s) => ({ label: s.label, cooling: s.cooling }))))
 }
 
 dispose()
