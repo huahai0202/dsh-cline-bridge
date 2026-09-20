@@ -940,6 +940,45 @@ const ctxStatusOf = (options) => lastCtx?.__dshClineBridge?.status?.(options)
   check('P20 重置后统计起点也写进了磁盘', Number(afterResetDisk.totals?.since) === afterReset.json.totals.since, String(afterResetDisk.totals?.since))
 }
 
+// ───────────────── 4j. 重置速度：只清 tokens.ms，其余统计保留 ─────────────────
+{
+  const statePath = join(TEST_STATE_DIR, `state-${++stateSeq}.json`)
+  // 先挂一次，让插件自己建好状态文件（拿到正确的初始形状）
+  const speedConfig = { clineKeys: [SECRET_A, SECRET_B], quotaStatePath: statePath }
+  mount(speedConfig)
+  lastCtx?.__dshClineBridge?.flushQuotaState?.()
+  // 直接在磁盘状态里注入 ms 数据（模拟 v2.9.0 修复前留下的脏耗时）
+  const rawSpeed = readFileSync(statePath, 'utf8')
+  const speedDisk = JSON.parse(rawSpeed)
+  const labelB = label8(SECRET_B)
+  speedDisk.usage = speedDisk.usage ?? {}
+  speedDisk.usage[labelB] = {
+    firstSeenAt: Date.now() - 60000,
+    lastUsedAt: Date.now(),
+    stats: { sent: 5, ok: 5, failed: 0, limited: 0, lastModel: CAP_ONLY_MODEL, lastUsedAt: Date.now(), tokens: { input: 5000, output: 400, total: 5400, cached: 4800, ms: 99999 } },
+    models: { [CAP_ONLY_MODEL]: { sent: 5, ok: 5, failed: 0, limited: 0, lastUsedAt: Date.now(), tokens: { input: 5000, output: 400, total: 5400, cached: 4800, ms: 99999 } } },
+  }
+  writeFileSync(statePath, JSON.stringify(speedDisk))
+  mount({ clineKeys: [SECRET_A, SECRET_B], quotaStatePath: statePath }) // 重新挂载：让插件把注入的 ms 读进内存
+  const beforeSpeed = await callRoute()
+  const keyB = (beforeSpeed.json.keys ?? []).find((k) => k.label === labelB)
+  check('S1 速度重置前 ms 已在统计里', Number(keyB?.stats?.tokens?.ms) === 99999, JSON.stringify(keyB?.stats?.tokens))
+  const speedReset = await callRoute({ path: RESET_PATH, method: 'POST', contentType: 'application/json', body: JSON.stringify({ scope: 'speed' }) })
+  check('S2 scope=speed 返回 200 且带 scope 标记', speedReset.status === 200 && speedReset.json.scope === 'speed', JSON.stringify(speedReset.json))
+  const afterSpeed = await callRoute()
+  const keyBAfter = (afterSpeed.json.keys ?? []).find((k) => k.label === labelB)
+  check('S3 速度重置只清 ms（计数与 token 原样保留）',
+    Number(keyBAfter?.stats?.tokens?.ms) === 0 && keyBAfter?.stats?.sent === 5 && keyBAfter?.stats?.tokens?.input === 5000 && keyBAfter?.models?.[CAP_ONLY_MODEL]?.tokens?.ms === 0,
+    JSON.stringify(keyBAfter?.stats))
+  // 全量重置照常工作（scope 缺省 = 全部归零）
+  await callRoute({ path: RESET_PATH, method: 'POST', contentType: 'application/json', body: '{}' })
+  const afterFull = await callRoute()
+  const keyBFull = (afterFull.json.keys ?? []).find((k) => k.label === labelB)
+  check('S4 空正文重置仍是全量（计数 token ms 都清零）',
+    keyBFull?.stats?.sent === 0 && keyBFull?.stats?.tokens?.input === 0 && Number(keyBFull?.stats?.tokens?.ms ?? 0) === 0,
+    JSON.stringify(keyBFull?.stats))
+}
+
 // ───────────────── 4i. 主 Key 挂载即入池（不必等第一条请求） ─────────────────
 // 以前主 Key 只在随请求头出现时才登记，于是 DSH 重启后面板只有备用 key，
 // 得先发一条请求才变全——这一组钉住「挂载即补齐」。

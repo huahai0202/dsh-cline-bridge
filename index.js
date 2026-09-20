@@ -667,12 +667,22 @@ export function apply(ctx, config) {
   const handleStatsReset = async (req, res) => {
     if (!passWriteGuard(req, res)) return
     if (!isJsonRequest(req)) return sendJson(res, 415, { error: 'content-type must be application/json' })
+    let scope = ''
     try {
       // 空正文也要读完，否则连接会一直半开着
-      await readJsonBody(req, 1024)
+      const body = await readJsonBody(req, 1024)
+      if (body && typeof body === 'object' && body.scope === 'speed') scope = 'speed'
     } catch (error) {
       if (error?.code === 'PAYLOAD_TOO_LARGE') return sendJson(res, 413, { error: String(error.message) })
       // 正文不是 JSON 也无所谓：重置不需要任何入参
+    }
+    if (scope === 'speed') {
+      pool.resetSpeed()
+      diag.lastDecision = 'speed-reset'
+      quotaStore.setDiagnostics({ ...diag })
+      quotaStore.flush()
+      log('速度数据已重置（仅 tokens.ms 归零；计数、token、冷却与额度未动）')
+      return sendJson(res, 200, { ok: true, scope: 'speed', totals: quotaStore.totals(), poolSize: pool.size })
     }
     pool.resetStats()
     diag.clineRequests = 0
@@ -883,6 +893,8 @@ export function apply(ctx, config) {
     /** 累计计数与统计起点（自检用来断言「跨重启没丢」）。 */
     statsTotals: () => quotaStore.totals(),
     resetStats: () => pool.resetStats(),
+    /** 只清速度数据（自检用；与面板「重置速度」按钮同一条路径）。 */
+    resetSpeed: () => pool.resetSpeed(),
     /** 某个模型上选定的「使用中」Key（自检用；只有 8 位标签，不含 key 原文）。 */
     selectedLabel: (model) => pool.selected(model)?.label ?? '',
     setSelection: (model, label) => pool.setSelection(model, label),
