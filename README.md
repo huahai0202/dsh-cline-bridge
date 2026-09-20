@@ -20,7 +20,7 @@
 - **Cline 官方客户端特征头自动注入**（`user-agent: Cline/4.1.16`、`x-client-type: cline-vscode`、`x-platform: vscode`、`http-referer` 等）——请求头无需手动复制；
 - **主 Key 完全由用户在 DSH 设置中配置**，原生透传直通，不设代码层内置 Key 兜底；
 - **可选**多 Key 池：额外提供 Key 后，撞到「每日免费额度」类限流会自动换 Key 重发（未提供额外 Key 时行为与单 Key 完全一致，零影响）；
-- **上游观测（只读）**：同一模型在 Cline 背后常挂十几家上游、由网关按打分动态切换。插件从响应里读出**这次实际是哪家服务的**，按 Key 显示在 Key 表的「上游渠道」列（漂到非预期上游时用警示色）。**不做锁定**——实测该路由会接受 `providerOptions.gateway` 却完全忽略它，注入是静默无效的（详见下文），因此本插件不改写请求体一个字节；
+- **上游观测**：同一模型在 Cline 背后常挂十几家上游、由网关按打分动态切换。插件从响应里读出**这次实际是哪家服务的**，按 Key 显示在 Key 表的「上游渠道」列（漂到非预期上游时用警示色）。**可选锁定**：`pinUpstream` 配置后把 `provider.only` 写进请求体，把某个模型钉在指定上游（实测**真的生效**，详见下文）——不配置时插件对请求体一个字节都不动；
 - **设置页面板**：在 DSH 设置里新增「Cline Key」分区，逐把列出每个 Key 的来源、掩码预览、健康/冷却状态、各模型的恢复倒计时与**跨重启保留**的累计用量（发送 / 成功 / 失败 / 限流、输入输出 token）；
 - **累计统计跨重启保留**：每把 Key 的发送/成功/失败/限流、输入输出 token、按模型明细、最近使用时刻，以及三个累计计数与「最近决策」，都按 8 位哈希标签与冷却一起落盘；面板标出统计起点，顶部另有「重置统计」（两段式确认，只清统计、不碰冷却与凭据）；
 - **面板直接导入 Key**：面板右上角（插件版本卡右边）一个「导入 Key」按钮，粘贴一把或多把即可写进凭据仓库的空闲槽位（`CLINE_API_KEY_2`~`_10`），写完立刻进池、当轮即可参与轮换；重复的自动跳过，可用 `keyImport: false` 关掉整条写入口；
@@ -225,23 +225,67 @@ refs:
 
 ---
 
-## 📌 上游观测：这次实际走的是哪家（只读，不改请求）
+## 📌 上游观测与可选锁定：这次实际走的是哪家
 
 Cline 背后是 **Vercel AI Gateway**。同一个模型往往同时挂在十几家上游上——实测 `cline-free/deepseek-v4.1-flash` 有 **16 家**：`deepseek`、`alibaba`、`baseten`、`fireworks`、`runware`、`relace`、`particle`、`novita`、`togetherai`、`deepinfra`、`wafer`、`parasail`、`gmicloud`、`modal`、`morph`、`boundless`。
 
-网关按自己的「近期可用率 + 延迟」打分**动态选一家**，所以「今天走 deepseek、明天可能走 alibaba」是常态。本插件从响应里读出**这次实际是谁服务的**，显示在面板上——**仅此而已，它不改写你的请求**。
+网关按自己的「近期可用率 + 延迟」打分**动态选一家**，所以「今天走 deepseek、明天可能走 alibaba」是常态。本插件从响应里读出**这次实际是谁服务的**，显示在面板上；**默认不改写你的请求**，配置 `pinUpstream` 后才把指定模型钉在指定上游（见下）。
 
-> **为什么不做「锁定」**：曾经做过（往请求体注入 `providerOptions.gateway.only`），实测后**已移除**。原因是这条路由**会接受这个字段却完全忽略它**：
+> **锁定的正确字段是 `provider.only`，不是 `providerOptions.gateway.only`**（2026-09 修正）。
 >
-> | 模型 | `only` 的效果 |
+> 早期版本往请求体注入 `providerOptions.gateway.only`，实测被**静默忽略**，于是当时的结论是「这条路由锁不住」。这个结论**只对那个字段成立**——标准 OpenRouter 形态的 `provider.only` 在同一路由上**是被强制执行的**：
+>
+> | 注入内容（`z-ai/glm-5.3-flash`） | 实测结果 |
 > | --- | --- |
-> | `deepseek/deepseek-v3.2` | ✅ 认：`only:['bedrock']` → `fallbacksAvailable` 从 2 家清成 `0` |
-> | `cline-free/deepseek-v4.1-flash` | ❌ 无视：`only:['deepseek']` / `['togetherai']` / 连 `['zzz-not-real']` 都与不锁**完全一致**（`final=deepseek`、`fb=15`、只试 1 家） |
-> | `deepseek/deepseek-v4.1-flash` | ❌ 无视（同上） |
+> | `provider: { only: ['Parasail'] }` | ✅ **6/6 全部 Parasail** |
+> | `provider: { only: ['Wafer'] }` / `['Together']` | ✅ 6/6 分别是 Wafer / Together |
+> | `provider: { only: ['zzz-not-real'] }` | ✅ 6/6 `stream_initialization_failed`（**不存在的上游直接报错**，证明字段真的被读） |
+> | 不带 `provider` 字段（对照） | 随机漂：Near AI / Z.AI / Wafer / SiliconFlow / GMICloud / DigitalOcean |
+> | `providerOptions: { gateway: { only: [...] } }` | ❌ 被无视（6 次落到 Cloudflare / Near AI / Wafer / Together） |
 >
-> 也就是说：**同一个网关下确实存在认这个字段的路由，但要盯的这个模型不在其中**。注入是静默无效的，留着只会让人以为锁上了。要锁只能换到认这个字段的模型，而那是模型选择问题，不是插件能解决的。
+> 所以锁定能力已恢复，用 `pinUpstream` 配置（见下）。代价是本插件从此**会在配置锁定时改写请求体**——为此把改写收敛在一个模块（`lib/host/pin.js`）、只加 `provider` 一个字段，并且**不配置锁定时逐字节不改**（回归锁 D1/D2 守着这条边界）。
 >
 > 顺带澄清一个容易混淆的点：`cline-free/*`（免费档）与 `cline-pass/*`（[$9.99/月订阅](https://docs.cline.bot/getting-started/clinepass)）是**两条不同的路由**。`cline-pass/*` 对免费档的 Key 直接返回 **403**（无权限）。
+
+### 锁定上游（可选）：`pinUpstream`
+
+`z-ai/glm-5.3-flash` 实测有 20+ 家上游，网关按打分随机切，速度与稳定性差异很大。锁定后所有请求都走同一家：
+
+```yaml
+- id: dsh-cline-bridge
+  config:
+    pinUpstream:
+      # 简写：只写上游名（allow_fallbacks 默认 false = 严格锁定）
+      'z-ai/glm-5.3-flash': Parasail
+      # 完整写法：该上游不可用时允许网关回退到别家（避免硬失败）
+      # 'cline-free/deepseek-v4.1-flash': { provider: deepseek, allowFallbacks: true }
+```
+
+行为约定：
+
+- **只对表里列出的模型生效**；没列的模型请求体逐字节不变；
+- 请求体里**已有 `provider.only`** 时尊重现状、不覆盖（别的中间件/用户手写优先）；
+- 非 JSON 请求体（流式 body）无从改写，原样放行；
+- **换 Key 重发时同样带锁定**（首发送与重发共用同一份改写后的 body），不会悄悄漂回随机路由；
+- 锁定生效次数与配置摘要写进状态文件的 `diagnostics`（`pinApplied` / `pinnedUpstream`），便于排查；
+- `allow_fallbacks: false` 是**严格锁定**：该上游挂了请求就失败（实测 `only:['zzz-not-real']` 直接报错）。想要「优先这家、挂了再回退」用 `allowFallbacks: true`。
+
+> 为什么默认 `false`：锁定的意义就是可预测——如果允许回退，「锁了 Parasail」在 Parasail 抖动时会静默变成别家，与不锁的差别就只剩「大多数时候是 Parasail」。要可用性优先就显式开 `true`。
+
+### 实测：glm-5.3-flash 的上游与选谁
+
+用固定任务（数到 60）在同一把 Key 上实测，中位数：
+
+| 上游 | 量化 | 成功率 | 首字延迟 | 吞吐 | 价格 in/out/cache（每 M） |
+| --- | --- | --- | --- | --- | --- |
+| **Parasail** | fp8 | 8/8 | **769ms** | **49.3 tok/s** | 0.150 / 0.500 / 0.030 |
+| SiliconFlow | fp8 | 8/8 | 1626ms | 33.3 tok/s | 0.150 / 0.500 / 0.030 |
+| Sail Research | fp8 | 8/8 | 1140ms | 24.0 tok/s | 0.143 / 0.475 / 0.029 |
+| GMICloud | fp8 | 6/12 | 3463ms | 18.7 tok/s | **0.075** / 0.250 / 0.015 |
+| Together | unknown | 12/12 | 797ms | 57.0 tok/s | 0.150 / 0.500 / 0.030 |
+
+> **本插件默认不替你锁任何东西**——上表只是实测数据，`pinUpstream` 需要你自己显式配置。
+> 上面这张表里的 **Parasail 是 fp8 前提下综合最优**（速度、稳定性、943K 最大输出）；Together 更快但是 `quantization: unknown`，DeepInfra/Crusoe 是 fp4，都不满足 fp8 要求。
 
 ### 面板展示
 
@@ -322,7 +366,8 @@ export const PREFERRED_UPSTREAM = { 'cline-free/deepseek-v4.1-flash': 'deepseek'
 | `lib/host/model-id.js` | ~21 | 模型 id 的形状校验（面板芯片 / 状态文件 / 选定路由三处共用同一把尺子） |
 | `lib/host/quota-state.js` | ~374 | 状态落盘：额度冷却 + **用量统计 / 累计计数** + **按模型**的「使用中」选定（同一文件、同一去抖写入器）+ 诊断白名单 + 重试窗口解析（报文文本与 `Retry-After` 头） |
 | `lib/host/request-shape.js` | ~60 | 读请求形状：body 可否重发、模型名、鉴权头读写 |
-| `lib/host/upstream.js` | ~90 | 上游**只读**观测：从响应读出 `provider_metadata.gateway.routing.finalProvider` + 内存台账（model → 上游/时间）+ 面板徽标数据（含「是否漂离预期」与「数据是否陈旧」） |
+| `lib/host/upstream.js` | ~100 | 上游观测：从响应读出上游名——`provider_metadata.gateway.routing.finalProvider`（deepseek 形态）**或 chunk 顶层 `provider`**（glm 形态）+ 内存台账（model / key+model）+ 面板数据（含「是否漂离预期」） |
+| `lib/host/pin.js` | ~80 | **上游锁定**：`pinUpstream` 配置解析 + 往请求体注入 `provider: { only, allow_fallbacks }`（本插件唯一会改写请求体的模块） |
 | `lib/host/credentials.js` | ~87 | 兜底读取 `.credentials.yaml` 的 refs 段；凭据服务缺席时的兜底写入（保留其余内容 + 临时文件改名） |
 | `lib/host/key-import.js` | ~106 | 面板导入：粘贴文本解析、空闲 ref 分配、写入编排（不含 Key 原文的返回值） |
 | `lib/host/usage.js` | ~95 | Token 用量采集（tee 出只读分支扫 usage） |
@@ -370,15 +415,17 @@ node tools/self-check.mjs cline-panel  # 只跑名字匹配的分项
 
 ```bash
 node tools/cline-key-check.mjs       # Cline 多 Key 轮换：本地 mock 服务器复刻 429，无需真实 Key
-node tools/cline-upstream-check.mjs  # 上游观测：响应解析 + 台账 + 面板数据 + 「绝不改写请求体」
+node tools/cline-upstream-check.mjs  # 上游观测 + 可选锁定：响应解析 + 台账 + 面板数据 + 注入边界
 node tools/cline-panel-check.mjs     # 设置页面板：只读/导入/重置路由契约 + 统计持久化 + 浏览器半边真实渲染
 ```
 
-`cline-upstream-check.mjs` 覆盖：`readUpstream` 的形状容错（无 `provider_metadata` / `finalProvider` 为空 / 非 JSON / 空输入一律返回 `null`——**看不到不等于某一家**；缺 `fallbacksAvailable` 时家数为 0 不谎报）、台账的脏输入拒收（模型名 `*` / 空 / 无 provider 不记录）、`upstreamSummary` 的「是否漂离预期」与**陈旧标记**（观测早于最近使用 → `stale`，不把旧结论当成当前状态）。C 组是**端到端**的，其中最要紧的一条是：**发往上游的请求体与原始请求逐字节一致**——这是「本插件不再改写请求」的回归锁（锁定代码在时，这条会因多出 `providerOptions` 而失败）。另有上游漂移如实上报、无元数据时不清空旧观测、不在观测名单的模型不产生数据、**撞 429 换 Key 重发后依然观测到跑通那一次的上游**。
+`cline-upstream-check.mjs` 覆盖：`readUpstream` 的形状容错（无 `provider_metadata` / `finalProvider` 为空 / 非 JSON / 空输入一律返回 `null`——**看不到不等于某一家**；缺 `fallbacksAvailable` 时家数为 0 不谎报）、台账的脏输入拒收（模型名 `*` / 空 / 无 provider 不记录）、`upstreamSummary` 的「是否漂离预期」与**陈旧标记**（观测早于最近使用 → `stale`，不把旧结论当成当前状态）。A13–A16 覆盖**顶层 `provider` 字段**（glm 形态）：只认 `provider_metadata` 的实现对这些模型恒返回 null，面板「上游渠道」列永远是「—」；两种形状同时出现时以 `provider_metadata` 为准。
+
+C 组是**端到端**的，其中最要紧的一条是：**未配置锁定时，发往上游的请求体与原始请求逐字节一致**——这是「默认不改写请求」的回归锁。D 组钉住**锁定的边界**：不配置 `pinUpstream` 时不动（D1）、模型不在表里时不动（D2）、命中时 `provider.only` 真的写进发出去的请求体（D3）、只加这一个字段且原键保留（D4）、`allowFallbacks` 透传（D5）、已有 `provider.only` 不覆盖（D6）、非 JSON 原样放行（D7）、**换 Key 重发那份同样带锁定**（D8）、生效次数进 diagnostics（D9）。另有上游漂移如实上报、无元数据时不清空旧观测、不在观测名单的模型不产生数据、**撞 429 换 Key 重发后依然观测到跑通那一次的上游**。
 
 `cline-panel-check.mjs` 的 **PB 组**在真实渲染树里断言「上游只在 Key 表出现」：模型芯片上**不再挂上游徽标**（渠道来源不在那个位置重复出现），上游只出现在 Key 表的「上游渠道」列里、漂到非预期上游时带警示色、没观测到时显示「—」、英文界面表头走词典。**I 组**断言「缓存命中」列：命中率 = cached/input、命中段宽度与命中率一致、没有输入 token 时显示「—」而不是 0%、合计行也给出整体命中率、且不再出现输出列。
 
-> **为什么这些断言要做成端到端**：`(url, init)` 形态的 `sendWith` 曾经无条件 `{ ...init, headers }`，把传进来的 body 参数**整个丢掉**。该缺陷在引入上游注入功能时才暴露（注入的字段算出来了却发不出去），修法是在 `body !== undefined` 时才覆盖 `body`——**绝不能写成 `body: undefined`**，那会把请求体清空（服务端收到 0 字节）。纯函数层全绿也测不出「算对了但没发出去」，所以断言必须落在 mock 上游真正收到的那份 body 上。锁定代码现已移除，但 `C1`（请求体逐字节一致）继续守着这条路径。
+> **为什么这些断言要做成端到端**：`(url, init)` 形态的 `sendWith` 曾经无条件 `{ ...init, headers }`，把传进来的 body 参数**整个丢掉**。该缺陷在引入上游注入功能时才暴露（注入的字段算出来了却发不出去），修法是在 `body !== undefined` 时才覆盖 `body`——**绝不能写成 `body: undefined`**，那会把请求体清空（服务端收到 0 字节）。纯函数层全绿也测不出「算对了但没发出去」，所以断言必须落在 mock 上游真正收到的那份 body 上。锁定代码已按 `provider.only` 形态恢复，所以 `C1`（未配置锁定时请求体逐字节一致）与 D 组（配置锁定时的注入边界）一起守着这条路径。
 
 `cline-key-check.mjs` 覆盖：换 Key 恢复、按模型冷却、**粘性选 Key（先烧完一把再换下一把）**、三种 Key 来源（config / 环境变量 / 凭据仓库）、单 Key 与瞬时限流下的收尾差异、**冷却窗口只认服务端（报文文本 → `Retry-After` 头，含 HTTP-date、「报文优先」与「拿不到就不记冷却」）**、**额度状态跨重启持久化**、**全池冷却快速失败**、**用量统计跨重启持久化（含粘性延续）**、**面板选定的「使用中」Key（V 组：按模型独立——给一个模型选定不影响另一个、该模型首发送优先用它、撞限流照常轮换、**选定始终跟着实际跑通的那把走**（轮换恢复与 `skipCoolingRequestKey` 直接跳过两种情况都算）、没选定的模型不会被自动选中、跨重启保留、落盘只有 8 位标签）**。
 

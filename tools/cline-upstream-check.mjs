@@ -27,7 +27,11 @@ mkdirSync(TEST_STATE_DIR, { recursive: true })
 let stateSeq = 0
 
 const MONITORED = MONITORED_UPSTREAM_MODELS[0]
-const OTHER = 'z-ai/glm-5.3-flash'
+// 第二个被观测的模型：glm 走的是**顶层 provider 字段**（无 provider_metadata），
+// 与 deepseek 的 provider_metadata.routing 是两种形状，两条都要覆盖（见 A13–A16）。
+const MONITORED_FLAT = 'z-ai/glm-5.3-flash'
+// 「不在观测名单里」的模型：曾经用 glm 当这个角色，glm 加入名单后它就不能再代表「未观测」了。
+const OTHER = 'some-vendor/unmonitored-model'
 
 /** 造一份带网关路由元数据的回包（形状取自实测真实响应）。 */
 const replyWith = (routing) =>
@@ -166,6 +170,30 @@ const call = async (key, model, body) => {
     readUpstream(replyWith({ finalProvider: 'deepseek' }))?.fallbacks === 0)
   check('A12 provider 名两端空白被清掉',
     readUpstream(replyWith({ finalProvider: '  deepseek  ' }))?.provider === 'deepseek')
+
+  // A13–A16：**顶层 provider 字段**（形态三）。实测 `z-ai/glm-5.3-flash` 这条路由
+  // 完全没有 provider_metadata，上游名放在 chunk 顶层的 `provider` 里。只认
+  // provider_metadata 的实现对这些模型恒返回 null——面板「上游渠道」列永远是「—」。
+  const flatChunk = (provider) => chunk({
+    id: 'gen_x', object: 'chat.completion.chunk', model: 'z-ai/glm-5.3-flash',
+    provider, choices: [{ index: 0, delta: { content: 'hi' }, finish_reason: null }],
+  })
+
+  check('A13 流式 chunk 顶层 provider 字段能读出上游（glm 形态）',
+    readUpstream(flatChunk('Parasail') + 'data: [DONE]\n\n')?.provider === 'Parasail',
+    JSON.stringify(readUpstream(flatChunk('Parasail'))))
+  check('A14 顶层 provider 名两端空白被清掉',
+    readUpstream(flatChunk('  Parasail  '))?.provider === 'Parasail')
+  check('A15 顶层 provider 为空串 / 缺失时返回 null（看不到 ≠ 某一家）',
+    readUpstream(flatChunk('')) === null && readUpstream(flatChunk(undefined)) === null)
+  check('A16 provider_metadata 优先于顶层 provider（两种形状同时出现时以 routing 为准）',
+    (() => {
+      const both = chunk({
+        model: 'm', provider: 'Wafer',
+        choices: [{ index: 0, delta: { provider_metadata: { gateway: { routing: { finalProvider: 'Parasail' } } } } }],
+      })
+      return readUpstream(both)?.provider === 'Parasail'
+    })())
 }
 
 // ── B. 观测台账 ──────────────────────────────────────────────────────
@@ -200,10 +228,13 @@ const call = async (key, model, body) => {
   check('B10 没有 provider 的观测不写 key 维度',
     (() => { log.note(MONITORED, { provider: '' }, 'cccc3333'); return log.getForKey('cccc3333', MONITORED) === undefined })())
 
-  check('B11 观测名单只含用户指定的那一个模型',
-    MONITORED_UPSTREAM_MODELS.length === 1 && MONITORED === 'cline-free/deepseek-v4.1-flash',
+  check('B11 观测名单与预期上游表逐一对应（名单里的模型都有预期值）',
+    MONITORED_UPSTREAM_MODELS.length === 2 &&
+      MONITORED_UPSTREAM_MODELS.every((m) => typeof PREFERRED_UPSTREAM[m] === 'string' && PREFERRED_UPSTREAM[m]),
     MONITORED_UPSTREAM_MODELS.join(','))
-  check('B12 预期上游表与观测名单一致', PREFERRED_UPSTREAM[MONITORED] === 'deepseek')
+  check('B12 预期上游表覆盖 deepseek 与 glm（glm 锁定在 Parasail）',
+    PREFERRED_UPSTREAM['cline-free/deepseek-v4.1-flash'] === 'deepseek' &&
+      PREFERRED_UPSTREAM['z-ai/glm-5.3-flash'] === 'Parasail')
 }
 
 // ── C. 端到端：只读观测，请求体一个字节都不改 ────────────────────────
@@ -269,6 +300,84 @@ const call = async (key, model, body) => {
     rows.length === 2 && rows[1].key === 's2' && afterRotate?.provider === 'deepseek' &&
       keyUpstreamOf('k1', MONITORED) === undefined,
     `attempts=${rows.map((r) => r.key).join('→')} s2=${JSON.stringify(afterRotate)} k1=${JSON.stringify(keyUpstreamOf('k1', MONITORED))}`)
+}
+
+// ── D. 上游锁定：provider.only 注入 ─────────────────────────────────
+//
+// 2026-09 实测 `z-ai/glm-5.3-flash`：标准 OpenRouter 形态的 `provider.only` 是**真的
+// 被强制执行**的（`only=["zzz-not-real"]` 会 6/6 报 stream_initialization_failed），
+// 与早期被无视的 `providerOptions.gateway.only` 不同。D 组钉住注入的**边界**：
+// 只在配置了锁定、且模型命中时才改；其余情况一个字节都不动。
+{
+  const GLM = MONITORED_FLAT
+  const PIN = { pinUpstream: { [GLM]: 'Parasail' } }
+  let rows = []
+
+  // D1：没配置锁定时，请求体逐字节不变（既有契约）
+  mount({ clineKeys: ['s1'], clineMatch: match })
+  nextReply = replyWith({ finalProvider: 'deepseek' })
+  let payload = JSON.stringify({ model: MONITORED, messages: [{ role: 'user', content: 'x' }] })
+  let n = mark()
+  await call('s1', MONITORED, payload)
+  check('D1 没配置 pinUpstream 时请求体逐字节不变', since(n)[0]?.body === payload)
+
+  // D2：配置了锁定，但请求的模型不在表里 → 不动
+  mount({ clineKeys: ['s1'], clineMatch: match, ...PIN })
+  n = mark()
+  await call('s1', MONITORED, payload)
+  check('D2 锁定表里没有该模型时请求体逐字节不变', since(n)[0]?.body === payload)
+
+  // D3：命中锁定 → provider.only 真的发到线上
+  payload = JSON.stringify({ model: GLM, messages: [{ role: 'user', content: 'x' }] })
+  n = mark()
+  await call('s1', GLM, payload)
+  let sent = since(n)[0]
+  check('D3 命中锁定时 provider.only 真的写进发出去的请求体',
+    sent?.parsed?.provider?.only?.[0] === 'Parasail' && sent?.parsed?.provider?.allow_fallbacks === false,
+    JSON.stringify(sent?.parsed?.provider))
+
+  // D4：只加这一个字段，其余键原样保留
+  check('D4 注入只加 provider 字段，原有键原样保留（model/messages 不变）',
+    sent?.parsed?.model === GLM && sent?.parsed?.messages?.[0]?.content === 'x' &&
+      Object.keys(sent?.parsed ?? {}).sort().join(',') === 'messages,model,provider',
+    Object.keys(sent?.parsed ?? {}).join(','))
+
+  // D5：allowFallbacks 配置能透传
+  mount({ clineKeys: ['s1'], clineMatch: match, pinUpstream: { [GLM]: { provider: 'Parasail', allowFallbacks: true } } })
+  n = mark()
+  await call('s1', GLM, payload)
+  check('D5 allowFallbacks:true 透传成 allow_fallbacks:true',
+    since(n)[0]?.parsed?.provider?.allow_fallbacks === true)
+
+  // D6：已有 provider.only（用户/别的中间件写的）不被覆盖
+  mount({ clineKeys: ['s1'], clineMatch: match, ...PIN })
+  const own = JSON.stringify({ model: GLM, messages: [], provider: { only: ['Wafer'] } })
+  n = mark()
+  await call('s1', GLM, own)
+  check('D6 请求体已有 provider.only 时不覆盖（尊重现状）',
+    since(n)[0]?.body === own, since(n)[0]?.body)
+
+  // D7：非 JSON body 不炸、原样放行
+  mount({ clineKeys: ['s1'], clineMatch: match, ...PIN })
+  n = mark()
+  await call('s1', GLM, 'not-json')
+  check('D7 非 JSON 请求体原样放行（不抛错）', since(n)[0]?.body === 'not-json')
+
+  // D8：撞 429 换 key 重发时，重发那份**同样带锁定**（否则会悄悄漂回随机路由）
+  nextReply = replyWith({ finalProvider: 'Parasail' })
+  mount({ clineKeys: ['k1', 's2'], clineMatch: match, ...PIN })
+  n = mark()
+  await call('k1', GLM, payload)
+  rows = since(n)
+  check('D8 换 key 重发的请求体同样带锁定（两条都注入）',
+    rows.length === 2 && rows[0].parsed?.provider?.only?.[0] === 'Parasail' &&
+      rows[1].parsed?.provider?.only?.[0] === 'Parasail',
+    `attempts=${rows.length} pins=${rows.map((r) => r.parsed?.provider?.only?.[0]).join(',')}`)
+
+  // D9：锁定生效次数进 diagnostics（排查入口）
+  check('D9 锁定生效次数记进 diagnostics.pinApplied',
+    lastCtx.__dshClineBridge.diagnostics().pinApplied > 0,
+    String(lastCtx.__dshClineBridge.diagnostics().pinApplied))
 }
 
 dispose()

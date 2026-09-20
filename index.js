@@ -26,6 +26,7 @@ import { isPlausibleModelId } from './lib/host/model-id.js'
 import { cooldownMsFromResponse, createQuotaStore, parseRetryWindowMs } from './lib/host/quota-state.js'
 import { matchesClineTarget, readAuthTarget, readKeyOf, readModelOf, replayableBody, writeKeyTo } from './lib/host/request-shape.js'
 import { createUpstreamLog, readUpstream } from './lib/host/upstream.js'
+import { injectPinnedProvider, parsePinUpstream } from './lib/host/pin.js'
 import { normalizeUsage, tapUsage } from './lib/host/usage.js'
 import { createKeyPool } from './lib/host/key-pool.js'
 import { buildStatus, clineApiKeyEnvOf } from './lib/host/status.js'
@@ -73,6 +74,12 @@ export function apply(ctx, config) {
   const fillMissingRequestKey = config?.fillMissingRequestKey !== false
   // 允许导入写入的 ref 名单：与 key-pool 读盘用的是同一份（未列出的 ref 一律不碰）
   const wantedKeyRefs = Array.isArray(config?.clineKeyRefs) ? config.clineKeyRefs : DEFAULT_CLINE_KEY_REFS
+  // 上游锁定（可选）：model → { provider, allowFallbacks }。配置了才会改写请求体，
+  // 没配置时插件对请求体一个字节都不动（与既有契约一致）。实现见 lib/host/pin.js。
+  const pinnedUpstream = parsePinUpstream(config?.pinUpstream)
+  // 锁定摘要进 diagnostics：一眼看出「锁了哪些模型、生效了几次」，与既有排查入口一致。
+  // 没配置锁定时是空串（不占位），配置了则是 `model→provider` 的紧凑列表。
+  const pinSummary = [...pinnedUpstream.entries()].map(([m, p]) => `${m}→${p.provider}`).join(', ')
   // 「这次实际是哪个上游服务的」——只读观测，供面板显示，**不干预路由**。
   //
   // 只放内存、不落状态文件：这是「刚才那次请求观察到的现象」，不是额度/用量那种必须
@@ -131,6 +138,9 @@ export function apply(ctx, config) {
     rotations: 0,
     failFasts: 0,
     lastDecision: '',
+    // 上游锁定（只进状态文件的 diagnostics，面板不读）：配置摘要 + 实际生效次数
+    pinnedUpstream: pinSummary,
+    pinApplied: 0,
   }
   // 跨重启恢复：累计计数与「最近决策」是上次进程留下的，插件更新 / DSH 重启不该把它们清零。
   // 池内每把 key 的用量由 key-pool 在登记时按 8 位标签自行恢复（同一个文件）。
@@ -142,6 +152,8 @@ export function apply(ctx, config) {
   diag.clineRequests = restoredTotals.clineRequests
   diag.rotations = restoredTotals.rotations
   diag.failFasts = restoredTotals.failFasts
+  // pinApplied 是累计计数，跨重启保留；摘要始终以当前 config 为准（改配置立刻反映）
+  diag.pinApplied = Number(restoredDiag.pinApplied) || 0
   diag.lastRequests = Array.isArray(restoredDiag.lastRequests) ? restoredDiag.lastRequests.slice(-3) : []
   const pool = createKeyPool(quotaStore, diag, (message) => log(message))
   // 额外 key 扫描失败不拖垮主链路，但**不再静默**：曾经这里 (以及下面几处) 是
@@ -316,9 +328,9 @@ export function apply(ctx, config) {
         }
       }
 
-      // `(url, init)` 形态下要发出去的请求体：就是 init.body 原样（本插件不再改写请求体；
-      // 保留这个变量是为了让两种形态在 sendWith 调用点写法一致、也便于将来再引入改写时
-      // 不会漏掉这一条分支——那里曾经无条件 `{ ...init, headers }`，把 body 整个丢掉）。
+      // `(url, init)` 形态下要发出去的请求体：默认就是 init.body 原样。
+      // 唯一会改写它的是**上游锁定**（config.pinUpstream，见 lib/host/pin.js）——
+      // 没配置锁定时这里逐字节等于原请求，与既有契约一致。
       const requestBody = init?.body
 
       const model =
@@ -332,6 +344,29 @@ export function apply(ctx, config) {
       // 不进面板载荷）。
       trace.model = model
       if (input instanceof Request) trace.bodyLen = bufferedBody?.byteLength ?? -1
+
+      // ── 上游锁定（可选）────────────────────────────────────────────────
+      // 配置了 pinUpstream[model] 时，把 `provider: { only:[provider], allow_fallbacks }`
+      // 注入请求体，让网关只走指定上游。这是本插件唯一会改写请求体的地方：
+      // 没配置锁定 → outgoingBody 与收到的字节完全相同（回归锁 C1 继续守着这条）。
+      // 注入在**所有**发送路径上生效（首发送 + 换 key 重发都用同一份 outgoingBody），
+      // 否则换 key 重发会悄悄漂回随机路由。
+      const pin = pinnedUpstream.get(model)
+      const outgoingBody = (() => {
+        if (!pin) return input instanceof Request ? bufferedBody : requestBody
+        if (input instanceof Request) {
+          if (bodyBufferFailed || bufferedBody === undefined) return bufferedBody
+          const original = new TextDecoder().decode(bufferedBody)
+          const patched = injectPinnedProvider(original, pin.provider, pin.allowFallbacks)
+          if (patched === original) return bufferedBody
+          diag.pinApplied += 1
+          return new TextEncoder().encode(patched)
+        }
+        if (typeof requestBody !== 'string') return requestBody
+        const patched = injectPinnedProvider(requestBody, pin.provider, pin.allowFallbacks)
+        if (patched !== requestBody) diag.pinApplied += 1
+        return patched
+      })()
 
       // 全池冷却的快速失败：报文里的恢复时刻还在阈值之外时，不再发注定失败的请求，
       // 直接回放服务端原始 429（磁盘上有报文就用原始的，没有则合成一条诚实说明）。
@@ -415,7 +450,7 @@ export function apply(ctx, config) {
 
       let response
       try {
-        response = await sendWith(headers, input instanceof Request ? bufferedBody : requestBody)
+        response = await sendWith(headers, outgoingBody)
       } catch (error) {
         // 传输层异常（abort / DNS / TLS）：与其余路径一样留下决策与日志，不让轨迹停在 inspecting
         decide(`transport-error ${String(error?.message ?? error).slice(0, 80)}`)
@@ -471,7 +506,7 @@ export function apply(ctx, config) {
 
         let retried
         try {
-          retried = await sendWith(nextHeaders, input instanceof Request ? bufferedBody : requestBody)
+          retried = await sendWith(nextHeaders, outgoingBody)
           pool.markSent(next.key, model)
         } catch (error) {
           log(`Cline 换 key 重发失败（key=${next.label}）：${error?.message ?? error}`)
