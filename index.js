@@ -471,10 +471,13 @@ export function apply(ctx, config) {
         } else if (currentKey) pool.markFailed(currentKey, model)
         // 记下这次实际上是哪个上游服务的（只读观测，面板据此显示）。
         // 只在这一条出路做：429/5xx 的报文里没有路由信息，拿了也是白拿。
-        if (response.ok) await observeUpstream(model, response, currentKey ? keyLabel(currentKey) : '')
+        // 先挂用量观察（计时时钟从这里起算），再交给上游观测：observeUpstream 会把响应体
+        // clone().text() 整个读完——若它先跑，tee 的缓冲就把整条流预备好了，之后 tapUsage
+        // 再挂就是瞬时回放，测出 ≈0ms 的假速度（线上实测 238,466 tok/s 即此因）。
+        const tapped = currentKey ? tapUsage(response, (usage, ms) => pool.markTokens(currentKey, model, normalizeUsage(usage), ms)) : response
+        if (response.ok) await observeUpstream(model, tapped, currentKey ? keyLabel(currentKey) : '')
         decide(`pass-through status=${response.status}`)
-        // 顺手把这轮响应的 token 用量记到「key + 模型」上（失败静默，不影响请求）
-        return currentKey ? tapUsage(response, (usage, ms) => pool.markTokens(currentKey, model, normalizeUsage(usage), ms)) : response
+        return tapped
       }
 
       // 重发要求 body 可原样重建（字符串 / 字节），流式 body 只能原样返回。
@@ -523,7 +526,10 @@ export function apply(ctx, config) {
             // 一直标着一把已经限流的 key，而实际在用的是另一把。没选定的模型不受影响。
             if (pool.followRotation(model, next.key)) log(`已把 ${model} 的「使用中」改为 ${next.label}（原选定已限流）`)
             // 重发成功这条也要记上游（首发送撞 429，真正跑通的是这一次）
-            await observeUpstream(model, retried, keyLabel(next.key))
+            // 同首发送路径：先挂用量观察（时钟起算），再做上游观测（会把 body 读空）
+            const tappedRetry = tapUsage(retried, (usage, ms) => pool.markTokens(next.key, model, normalizeUsage(usage), ms))
+            await observeUpstream(model, tappedRetry, keyLabel(next.key))
+            return tappedRetry
           } else {
             // 换 key 后拿到的是 4xx/5xx：这次轮换并没有「恢复」，别把它计成成功，
             // 也别把冷却清掉——留着继续试池里下一把。
