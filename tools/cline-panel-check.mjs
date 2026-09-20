@@ -1474,17 +1474,18 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
   }
 
   const usageDsRow = usageOf(dsView, MASK_A)
-  // 每个数值各占一列（发送|成功|失败|限流、输入|输出），所以 textOf 用空格连接
+  // 每个数值各占一列（发送|成功|失败|限流、输入|缓存命中%），所以 textOf 用空格连接。
+  // deepseek 视图下这把 key：input=12300 cached=800 → 800/12300 = 7%
   check('I1 明细卡按当前模型逐行列出用量（deepseek 视图）',
-    usageDsRow.includes('1 sk-l…4444 16 15 2 1 12.3k 1.2k'), usageDsRow)
-  check('I2 另一把 key 在 glm 视图下有自己的一行',
-    usageOf(tree, MASK_B).includes('2 sk-t…8888 21 21 0 0 21k 2.1k'), usageOf(tree, MASK_B))
+    usageDsRow.includes('1 sk-l…4444 16 15 2 1 12.3k 7%'), usageDsRow)
+  check('I2 另一把 key 在 glm 视图下有自己的一行（21k 输入、0 缓存 → 0%）',
+    usageOf(tree, MASK_B).includes('2 sk-t…8888 21 21 0 0 21k 0%'), usageOf(tree, MASK_B))
   const usageHeadOf = (node) => findNode(usageCardOf(node), (n) => String(n.props?.className ?? '') === '_dsh_ofb_usage_head')
   const usageHeadSpans = usageHeadOf(tree)?.children ?? []
   // 表头与数据行同构：每列一个标签，含义直接可见（不靠悬停），且短标签不会折行
   const usageHeadFlat = usageHeadSpans.map((s) => textOf(s).join('')).join('|')
-  check('I3 明细卡表头逐列标注（Key、发送/成功/失败/限流、输入/输出），与数据列一一对应',
-    usageHeadFlat === 'Key|发送成功失败限流|输入输出|最近使用' &&
+  check('I3 明细卡表头逐列标注（Key、发送/成功/失败/限流、输入/缓存命中），与数据列一一对应',
+    usageHeadFlat === 'Key|发送成功失败限流|输入缓存命中|最近使用' &&
       String(usageHeadSpans[0]?.props?.className ?? '') === '_dsh_ofb_usage_lead' &&
       String(usageHeadSpans[1]?.props?.className ?? '') === '_dsh_ofb_usage_req' &&
       String(usageHeadSpans[2]?.props?.className ?? '') === '_dsh_ofb_tokencell',
@@ -1492,6 +1493,9 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
   check('I3b 明细卡不再重复模型名（它已在筛选芯片上）',
     !usageCardOf(tree) || !JSON.stringify(usageCardOf(tree)).includes('z-ai/glm-5.3-flash'),
     JSON.stringify(usageCardOf(tree) ?? {}).slice(0, 200))
+  check('I3c 「输出」列已被「缓存命中」替换（不再出现输出数字）',
+    usageHeadFlat.includes('缓存命中') && !usageHeadFlat.includes('输出'),
+    usageHeadFlat)
 
   const usageGlm = usageOf(tree, MASK_A)
   check('I4 glm 视图下明细不含 deepseek 的行', usageGlm.includes('3 3 0 0 4.5k') && !usageGlm.includes('deepseek'), usageGlm)
@@ -1501,7 +1505,8 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
   check('I5 该模型上未使用的 key 折叠成一行提示',
     cardText(dsView).includes('其余 1 把在该模型上没用过') && !cardText(dsView).includes(MASK_B),
     cardText(dsView).replace(/\n/g, ' | '))
-  check('I6 切到 glm 时同一把 key 显示 glm 的计数', usageGlm.includes('1 sk-l…4444 3 3 0 0 4.5k 300'), usageGlm)
+  // glm 视图：input=4500 cached=100 → 100/4500 = 2%
+  check('I6 切到 glm 时同一把 key 显示 glm 的计数与命中率', usageGlm.includes('1 sk-l…4444 3 3 0 0 4.5k 2%'), usageGlm)
 
   // ── 上游渠道列（第 1 张表的第 5 列，替代原「请求 / Token」）──
   // 逐 key 显示各自在该模型上的实际上游。没观测到必须是「—」，
@@ -1512,8 +1517,8 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
     const cell = (row?.children ?? [])[4]
     return textOf(cell).join('')
   }
-  check('I7 明细卡显示该模型的输入/输出 token',
-    usageDsRow.includes('12.3k 1.2k'), usageDsRow)
+  check('I7 明细卡显示该模型的输入 token（输出已由缓存命中% 取代）',
+    usageDsRow.includes('12.3k') && !usageDsRow.includes('1.2k'), usageDsRow)
   check('I8 上游列逐 key 各记各的（glm 视图：一把 deepinfra、一把 togetherai）',
     upstreamRowOf(tree, MASK_A) === 'deepinfra' && upstreamRowOf(tree, MASK_B) === 'togetherai',
     `${upstreamRowOf(tree, MASK_A)} / ${upstreamRowOf(tree, MASK_B)}`)
@@ -1539,13 +1544,13 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
     return found
   }
   const fillOf = (bar) => findNode(bar, (n) => String(n.props?.className ?? '') === '_dsh_ofb_bar_fill')
-  // glm 视图下有两行有数据：db694bbf(4.5k+300=4800) 与 761f9875(21k+2.1k=23100)
+  // glm 视图下有两行有数据：db694bbf(input 4.5k) 与 761f9875(input 21k)
   const bars = barsOf(tree)
   check('I11 每行 token 都配一根占比条', bars.length === 2, `bars=${bars.length}`)
   const barWidths = bars.map((bar) => Number.parseFloat(fillOf(bar)?.props?.style?.width ?? '0'))
-  check('I12 用量最大的那行占满整条（条长按卡内最大用量归一）',
+  check('I12 输入量最大的那行占满整条（条长按卡内最大输入量归一）',
     Math.max(...barWidths) === 100 && barWidths.filter((w) => w === 100).length === 1, barWidths.map((w) => w.toFixed(0) + '%').join(' / '))
-  check('I13 条内按 输入:输出 拆成两段',
+  check('I13 条内按 缓存命中:未命中 拆成两段',
     bars.every((bar) => {
       const segs = (fillOf(bar)?.children ?? []).map((c) => String(c.props?.className ?? ''))
       return segs.includes('_dsh_ofb_bar_in') && segs.includes('_dsh_ofb_bar_out')
@@ -1553,16 +1558,50 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
   const inputShare = Number.parseFloat(
     (fillOf(bars[0])?.children ?? []).find((c) => String(c.props?.className ?? '') === '_dsh_ofb_bar_in')?.props?.style?.width ?? '0',
   )
-  check('I14 输入段占比与数值一致（4500/4800）', Math.abs(inputShare - (4500 / 4800) * 100) < 0.2, inputShare.toFixed(1) + '%')
+  // 命中段宽度 = 命中率（cached/input），不再是 input/(input+output)
+  check('I14 命中段占比与命中率一致（100/4500 = 2.2%）', Math.abs(inputShare - (100 / 4500) * 100) < 0.2, inputShare.toFixed(1) + '%')
   check('I15 标题行给出当前模型的合计（请求 + token，取自面板整体文本，因为它在卡片外）',
     (() => {
       const whole = textOf(tree).join('\n')
       return whole.includes('合计') && whole.includes('24/24/0') && whole.includes('25.5k/2.4k')
     })(),
     textOf(tree).filter((s) => s.includes('合计')).join(' '))
-  check('I16 条与数字都带完整数值 title（悬停看精确值）',
-    String(findNode(bars[0], (n) => typeof n.props?.title === 'string')?.props?.title ?? '').includes('输入 ') === true,
+  check('I16 条的 title 讲缓存命中（含精确 cached/input 与口径说明）',
+    (() => {
+      const tip = String(findNode(bars[0], (n) => typeof n.props?.title === 'string')?.props?.title ?? '')
+      return tip.includes('缓存命中') && tip.includes('100') && tip.includes('4500')
+    })(),
     findNode(bars[0], (n) => typeof n.props?.title === 'string')?.props?.title)
+  check('I17 合计行也给出整体缓存命中率（同口径 cached/input）',
+    textOf(tree).filter((s) => s.includes('合计')).join(' ').includes('缓存命中'), textOf(tree).filter((s) => s.includes('合计')).join(' '))
+  check('I18 命中率计算不产生 NaN / Infinity（除零路径有守卫）',
+    (() => {
+      const card = textOf(usageCardOf(tree)).join(' ')
+      return !card.includes('NaN') && !card.includes('Infinity')
+    })(),
+    textOf(usageCardOf(tree)).join(' ').slice(0, 120))
+
+  // I19：模型行存在但 input=0（这类行不会被折叠，能真正走到 rate=null 的分支）。
+  // 断言显示「—」而不是 0% —— 把「没有数据」说成「命中率 0%」是错误信息。
+  {
+    const zeroPayload = {
+      plugin: MODULE_ID, version: PLUGIN_VERSION, updatedAt: Date.now(),
+      models: [{ id: 'z-ai/glm-5.3-flash', lastUsedAt: Date.now() }],
+      currentModel: 'z-ai/glm-5.3-flash',
+      totals: { poolSize: 1, clineRequests: 0, rotations: 0, failFasts: 0 },
+      keys: [{
+        index: 1, label: 'aa11bb22', preview: MASK_A, source: 'request', cooling: [],
+        stats: { sent: 0, ok: 0, failed: 0, limited: 0, lastUsedAt: Date.now(), tokens: {} },
+        models: { 'z-ai/glm-5.3-flash': { sent: 0, ok: 0, failed: 0, limited: 0, lastUsedAt: Date.now(), tokens: { input: 0, output: 0, total: 0, cached: 0 } } },
+      }],
+      recent: [],
+    }
+    const zero = await renderPanel(zeroPayload)
+    const zeroText = textOf(usageCardOf(zero.tree)).join(' ')
+    check('I19 没有输入 token 的行显示「—」而不是 0%（不把「没数据」说成「命中率 0%」）',
+      zeroText.includes('—') && !zeroText.includes('0%'), zeroText)
+    zero.bundle.mini.dispose()
+  }
 
   bundle.mini.dispose()
 }
@@ -1970,108 +2009,87 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
   bundle.mini.dispose()
 }
 
-// ───────────────── 5e. 实际上游徽标（只读观测，非锁定）─────────────────────────
-// 断言的不是「有没有画出徽标」，而是**有没有说假话**：插件不干预路由，所以徽标只能陈述
-// 「这次实际上是哪家服务的」。实测该路由会接受 providerOptions.gateway 却完全忽略它，
-// 因此面板上绝不能出现「已锁定」这类字样。
+// ───────────────── 5e. 上游信息只在 Key 表里出现，芯片上不重复 ─────────────────
+// 上游原先在模型芯片上挂了一枚徽标，用户指出「渠道来源不应该在这个位置重复出现」——
+// Key 表的「上游渠道」列已经按 key 逐个显示，芯片上再标一次是同一信息两处。
+// 这一组就钉住「只在 Key 表里出现」，并保留警示色的语义。
 {
   const PINNED = 'cline-free/deepseek-v4.1-flash'
-  const OTHER = 'z-ai/glm-5.3-flash'
-  const baseKey = {
+  const baseKey = (upstream) => ({
     index: 1, label: 'db694bbf', preview: MASK_A, source: 'request',
-    cooling: [], stats: { sent: 1, ok: 1, failed: 0, limited: 0, lastUsedAt: Date.now(), tokens: {} },
-    models: {},
-  }
-  const payloadWith = (upstream, modelId = PINNED) => ({
+    cooling: [],
+    stats: { sent: 1, ok: 1, failed: 0, limited: 0, lastUsedAt: Date.now(), tokens: {} },
+    models: {
+      [PINNED]: {
+        sent: 1, ok: 1, failed: 0, limited: 0, lastUsedAt: Date.now(),
+        tokens: { input: 1000, output: 10, total: 1010, cached: 500 },
+        ...(upstream ? { upstream: { provider: upstream, fallbacks: 15, at: Date.now() } } : {}),
+      },
+    },
+  })
+  const payloadWith = (upstream, preferred = 'deepseek') => ({
     plugin: MODULE_ID,
     version: PLUGIN_VERSION,
     updatedAt: Date.now(),
-    models: [{ id: modelId, lastUsedAt: Date.now(), ...(upstream ? { upstream } : {}) }],
-    currentModel: modelId,
+    models: [{ id: PINNED, lastUsedAt: Date.now(), upstream: { provider: preferred, preferred, fallbacks: 15, at: Date.now(), stale: false, other: false } }],
+    currentModel: PINNED,
     totals: { poolSize: 1, clineRequests: 1, rotations: 0, failFasts: 0 },
-    keys: [baseKey],
+    keys: [baseKey(upstream)],
   })
   const badgeOf = (tree) => findNode(tree, (n) => String(n.props?.className ?? '').includes('_dsh_ofb_pin'))
+  const upstreamCellOf = (tree) => {
+    const body = findNode(tree, (n) => n.type === 'tbody')
+    const row = (body?.children ?? [])[0]
+    return (row?.children ?? [])[4]
+  }
 
-  // 1) 预期上游：中性样式，写明上游名
+  // 1) 芯片上不再有上游徽标——无论有没有观测数据
   {
-    const { tree, bundle } = await renderPanel(payloadWith({ provider: 'deepseek', fallbacks: 15, at: Date.now(), stale: false, other: false }))
-    const badge = badgeOf(tree)
-    const cls = String(badge?.props?.className ?? '')
-    const text = textOf(badge ?? {}).join('')
-    check('PB1 预期上游显示实际渠道名、中性样式',
-      cls.includes('_dsh_ofb_pin_ok') && text.includes('deepseek'),
-      `class=${cls} text=${text}`)
-    check('PB2 title 说明这是网关汇报的事实、插件不干预路由',
-      String(badge?.props?.title ?? '').includes('不干预路由') && String(badge?.props?.title ?? '').includes('15'),
-      String(badge?.props?.title ?? ''))
+    const { tree, bundle } = await renderPanel(payloadWith('deepseek'))
+    check('PB1 模型芯片上不再挂上游徽标（渠道来源不在这个位置重复出现）',
+      badgeOf(tree) === undefined)
+    check('PB2 芯片仍然只有模型名（筛选功能不受影响）',
+      textOf(findNode(tree, (n) => String(n.props?.className ?? '').includes('_dsh_ofb_chip')) ?? {}).join('') === 'deepseek-v4.1-flash')
     bundle.mini.dispose()
   }
 
-  // 2) 漂到别家：警示样式 + 明确写出变成了谁
+  // 2) 上游只出现在 Key 表的「上游渠道」列
   {
-    const { tree, bundle } = await renderPanel(payloadWith({ provider: 'alibaba', fallbacks: 15, at: Date.now(), stale: false, other: true }))
-    const badge = badgeOf(tree)
-    const cls = String(badge?.props?.className ?? '')
-    const text = textOf(badge ?? {}).join('')
-    check('PB3 上游漂走时用警示样式并写出漂到了哪家',
-      cls.includes('_dsh_ofb_pin_off') && text.includes('alibaba') && text.includes('已变为'),
-      `class=${cls} text=${text}`)
-    check('PB4 任何情况下都不出现「已锁定」这类字样（插件锁不住，写了就是假话）',
-      !text.includes('已锁定') && !String(badge?.props?.title ?? '').includes('已锁定'),
-      `${text} / ${badge?.props?.title ?? ''}`)
+    const { tree, bundle } = await renderPanel(payloadWith('deepseek'))
+    const cell = upstreamCellOf(tree)
+    check('PB3 上游显示在 Key 表的上游渠道列里',
+      textOf(cell ?? {}).join('') === 'deepseek', textOf(cell ?? {}).join(''))
     bundle.mini.dispose()
   }
 
-  // 3) 陈旧观测：title 里说明这是上一次的结果
+  // 3) 不是预期上游时该列用警示色（这是用户真正关心的信号）
   {
-    const { tree, bundle } = await renderPanel(payloadWith({ provider: 'deepseek', fallbacks: 3, at: Date.now() - 60_000, stale: true, other: false }))
-    const badge = badgeOf(tree)
-    check('PB5 陈旧观测在 title 里标明「上一次观察到的结果」',
-      String(badge?.props?.title ?? '').includes('上一次'), String(badge?.props?.title ?? ''))
+    const { tree, bundle } = await renderPanel(payloadWith('alibaba'))
+    const cell = upstreamCellOf(tree)
+    const cls = String(cell?.children?.[0]?.props?.className ?? '')
+    check('PB4 漂到非预期上游时该列带警示色类',
+      cls.includes('_dsh_ofb_up_other') && textOf(cell ?? {}).join('') === 'alibaba',
+      `class=${cls} text=${textOf(cell ?? {}).join('')}`)
     bundle.mini.dispose()
   }
 
-  // 4) 没有观测数据：不渲染徽标（看不到 ≠ 显示成某一家）
+  // 4) 没有观测数据时显示「—」，不猜
   {
     const { tree, bundle } = await renderPanel(payloadWith(undefined))
-    check('PB6 没有观测数据时不渲染徽标（不猜上游）', badgeOf(tree) === undefined)
+    const cell = upstreamCellOf(tree)
+    check('PB5 没有观测数据时该列显示「—」（不猜上游）',
+      textOf(cell ?? {}).join('') === '—' && badgeOf(tree) === undefined,
+      textOf(cell ?? {}).join(''))
     bundle.mini.dispose()
   }
 
-  // 5) 徽标成组挂在芯片上，且只挂在有观测数据的模型上
+  // 5) 英文界面：表头走词典，无中文残留
   {
-    const payload = {
-      plugin: MODULE_ID, version: PLUGIN_VERSION, updatedAt: Date.now(),
-      models: [
-        { id: PINNED, lastUsedAt: Date.now(), upstream: { provider: 'deepseek', fallbacks: 15, at: Date.now(), stale: false, other: false } },
-        { id: OTHER, lastUsedAt: Date.now() - 1000 },
-      ],
-      currentModel: PINNED,
-      totals: { poolSize: 1, clineRequests: 1, rotations: 0, failFasts: 0 },
-      keys: [baseKey],
-    }
-    const { tree, bundle } = await renderPanel(payload)
-    const wraps = []
-    findNode(tree, (n) => { if (String(n.props?.className ?? '') === '_dsh_ofb_chipwrap') wraps.push(n); return false })
-    const texts = wraps.map((w) => textOf(w).join(''))
-    check('PB7 徽标与芯片成组渲染，只挂在有观测数据的模型上',
-      wraps.length === 1 && texts[0].includes('deepseek-v4.1-flash') && texts[0].includes('deepseek'),
-      texts.join(' / ') || '（无成组容器）')
-    bundle.mini.dispose()
-  }
-
-  // 6) 英文界面：徽标文案走词典，无中文残留
-  {
-    const { tree, bundle } = await renderPanel(
-      payloadWith({ provider: 'alibaba', fallbacks: 15, at: Date.now(), stale: false, other: true }),
-      { locale: 'en-US' },
-    )
-    const badge = badgeOf(tree)
-    const text = textOf(badge ?? {}).join('')
-    check('PB8 英文界面徽标用英文文案',
-      text.includes('now via') && !/[\u4e00-\u9fa5]/.test(text + String(badge?.props?.title ?? '')),
-      `${text} / ${badge?.props?.title ?? ''}`)
+    const { tree, bundle } = await renderPanel(payloadWith('alibaba'), { locale: 'en-US' })
+    const headers = findNode(tree, (n) => n.type === 'thead')
+    const headerText = textOf(headers ?? {}).join('|')
+    check('PB6 英文界面表头是 Upstream（无中文残留）',
+      headerText.includes('Upstream') && !/[\u4e00-\u9fa5]/.test(headerText), headerText)
     bundle.mini.dispose()
   }
 }

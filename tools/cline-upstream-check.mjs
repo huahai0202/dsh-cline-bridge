@@ -18,7 +18,8 @@ import { mkdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply } from '../index.js'
-import { createUpstreamLog, readUpstream, upstreamSummary } from '../lib/host/upstream.js'
+import { createUpstreamLog, readUpstream } from '../lib/host/upstream.js'
+import { keyLabel } from '../lib/host/labels.js'
 import { MONITORED_UPSTREAM_MODELS, PREFERRED_UPSTREAM } from '../lib/host/defaults.js'
 
 const TEST_STATE_DIR = join(tmpdir(), `ofb-upstream-state-${process.pid}`)
@@ -90,7 +91,14 @@ function mount(config = {}) {
 
 const mark = () => seen.length
 const since = (n) => seen.slice(n)
-const upstreamRowOf = (model) => (lastCtx.__dshClineBridge.status().models || []).find((m) => m.id === model)
+/** 该模型在载荷里的**模型维度**条目（只有 preferred，没有观测——观测是 per-key 的）。 */
+const modelRowOf = (model) => (lastCtx.__dshClineBridge.status().models || []).find((m) => m.id === model)
+/** 某把原始 key 在某个模型上的观测 —— 这才是面板 Key 表那一列真正读的数据。 */
+const keyUpstreamOf = (rawKey, model) => {
+  const label = keyLabel(rawKey)
+  const key = (lastCtx.__dshClineBridge.status().keys || []).find((k) => k.label === label)
+  return (key?.models || {})[model]?.upstream
+}
 
 const call = async (key, model, body) => {
   const res = await globalThis.fetch(ENDPOINT, {
@@ -160,7 +168,9 @@ const call = async (key, model, body) => {
     readUpstream(replyWith({ finalProvider: '  deepseek  ' }))?.provider === 'deepseek')
 }
 
-// ── B. 观测台账与展示数据 ────────────────────────────────────────────
+// ── B. 观测台账 ──────────────────────────────────────────────────────
+// 台账有两份索引：model（芯片徽标曾用，现仅作记录）与 key+model（Key 表「上游渠道」列用）。
+// 这里钉住「脏输入一律不记」与「按 key 取得到、且不串味」。
 {
   const log = createUpstreamLog()
   check('B1 未观测过时 get 为 undefined', log.get(MONITORED) === undefined)
@@ -176,20 +186,19 @@ const call = async (key, model, body) => {
   log.note('m', null)
   check('B5 没有 provider 的观测不记录', log.get('m') === undefined)
 
-  const good = log.get(MONITORED)
-  check('B6 upstreamSummary：预期上游 → other=false',
-    upstreamSummary(good, 'deepseek', 0)?.other === false)
-  check('B7 upstreamSummary：不是预期上游 → other=true（用户真正关心的信号）',
-    upstreamSummary({ provider: 'alibaba', fallbacks: 15, at: Date.now() }, 'deepseek', 0)?.other === true)
-  check('B8 upstreamSummary：没有观测 → undefined（面板不显示徽标）',
-    upstreamSummary(undefined, 'deepseek', 0) === undefined)
-
-  // stale：观测时刻早于该模型最近一次使用 → 说明本次还没有新数据
-  const t0 = Date.now() - 10_000
-  check('B9 观测早于最近使用 → 标记 stale（不把旧结论当成当前状态）',
-    upstreamSummary({ provider: 'deepseek', fallbacks: 1, at: t0 }, 'deepseek', t0 + 5000)?.stale === true)
-  check('B10 观测晚于最近使用 → 不是 stale',
-    upstreamSummary({ provider: 'deepseek', fallbacks: 1, at: t0 + 5000 }, 'deepseek', t0)?.stale === false)
+  // 按 key 的记录：这是 Key 表那一列的数据源
+  log.note(MONITORED, { provider: 'alibaba', fallbacks: 3 }, 'aaaa1111')
+  check('B6 按 key 取得到该 key 在该模型上的观测',
+    log.getForKey('aaaa1111', MONITORED)?.provider === 'alibaba',
+    JSON.stringify(log.getForKey('aaaa1111', MONITORED)))
+  check('B7 没有标签时不写 key 维度的记录（不编造 key 的结论）',
+    log.getForKey('', MONITORED) === undefined)
+  check('B8 别的 key 取不到（逐 key 各记各的，不串味）',
+    log.getForKey('bbbb2222', MONITORED) === undefined)
+  check('B9 同一 key 在别的模型上取不到（key+模型 两维都要对上）',
+    log.getForKey('aaaa1111', 'z-ai/glm-5.3-flash') === undefined)
+  check('B10 没有 provider 的观测不写 key 维度',
+    (() => { log.note(MONITORED, { provider: '' }, 'cccc3333'); return log.getForKey('cccc3333', MONITORED) === undefined })())
 
   check('B11 观测名单只含用户指定的那一个模型',
     MONITORED_UPSTREAM_MODELS.length === 1 && MONITORED === 'cline-free/deepseek-v4.1-flash',
@@ -215,36 +224,38 @@ const call = async (key, model, body) => {
     rows[0]?.parsed?.providerOptions === undefined,
     JSON.stringify(rows[0]?.parsed?.providerOptions))
 
-  const row = upstreamRowOf(MONITORED)
-  check('C3 面板拿到实际上游（deepseek）',
-    row?.upstream?.provider === 'deepseek' && row.upstream.other === false,
-    JSON.stringify(row?.upstream))
+  // 面板读的是**逐 key** 的观测（Key 表的「上游渠道」列），不是模型维度的。
+  const row = keyUpstreamOf('s1', MONITORED)
+  check('C3 面板拿到这把 key 在該模型上的实际上游（deepseek）',
+    row?.provider === 'deepseek', JSON.stringify(row))
+  check('C3b 模型维度不再下发观测（芯片徽标已移除，只有 preferred）',
+    modelRowOf(MONITORED)?.upstream === undefined && modelRowOf(MONITORED)?.preferred === 'deepseek',
+    JSON.stringify(modelRowOf(MONITORED)))
 
   // 上游漂到别家：面板必须能看出来
   nextReply = replyWith({ finalProvider: 'alibaba', fallbacksAvailable: ['novita'] })
   n = mark()
   await call('s1', MONITORED)
-  const drifted = upstreamRowOf(MONITORED)
-  check('C4 上游漂到 alibaba 时面板如实显示，并标记 other=true',
-    drifted?.upstream?.provider === 'alibaba' && drifted.upstream.other === true,
-    JSON.stringify(drifted?.upstream))
+  const drifted = keyUpstreamOf('s1', MONITORED)
+  check('C4 上游漂到 alibaba 时面板如实显示',
+    drifted?.provider === 'alibaba', JSON.stringify(drifted))
 
-  // 读不到元数据：不显示任何上游（绝不用上一次的结论冒充本次）
+  // 读不到元数据：保留上一次观测（不用空值冒充本次）
   nextReply = JSON.stringify({ data: { choices: [{ message: {} }] } })
   n = mark()
   await call('s1', MONITORED)
-  const noMeta = upstreamRowOf(MONITORED)
-  check('C5 回包没有路由元数据时保留上一次观测（并因最近使用更新而标记 stale）',
-    noMeta?.upstream?.provider === 'alibaba' && noMeta.upstream.stale === true,
-    JSON.stringify(noMeta?.upstream))
+  const noMeta = keyUpstreamOf('s1', MONITORED)
+  check('C5 回包没有路由元数据时保留上一次观测（不清空成空值）',
+    noMeta?.provider === 'alibaba', JSON.stringify(noMeta))
 
   // 不在观测名单里的模型：即使回包有元数据也不记
   nextReply = replyWith({ finalProvider: 'bedrock', fallbacksAvailable: [] })
   n = mark()
   await call('s1', OTHER)
-  const otherRow = upstreamRowOf(OTHER)
+  const otherRow = modelRowOf(OTHER)
   check('C6 不在观测名单里的模型不产生上游数据（只盯指定模型，不外扩）',
-    otherRow !== undefined && otherRow.upstream === undefined,
+    otherRow !== undefined && otherRow.preferred === '' &&
+      keyUpstreamOf('s1', OTHER) === undefined,
     JSON.stringify(otherRow))
 
   // 换 key 重发（429 轮换）后仍然观测到上游
@@ -253,10 +264,11 @@ const call = async (key, model, body) => {
   n = mark()
   await call('k1', MONITORED)
   rows = since(n)
-  const afterRotate = upstreamRowOf(MONITORED)
-  check('C7 撞 429 换 key 重发后依然观测到上游（跑通的是第二次）',
-    rows.length === 2 && rows[1].key === 's2' && afterRotate?.upstream?.provider === 'deepseek',
-    `attempts=${rows.map((r) => r.key).join('→')} upstream=${JSON.stringify(afterRotate?.upstream)}`)
+  const afterRotate = keyUpstreamOf('s2', MONITORED)
+  check('C7 撞 429 换 key 重发后，观测记在**真正跑通的那把** key 上',
+    rows.length === 2 && rows[1].key === 's2' && afterRotate?.provider === 'deepseek' &&
+      keyUpstreamOf('k1', MONITORED) === undefined,
+    `attempts=${rows.map((r) => r.key).join('→')} s2=${JSON.stringify(afterRotate)} k1=${JSON.stringify(keyUpstreamOf('k1', MONITORED))}`)
 }
 
 dispose()
