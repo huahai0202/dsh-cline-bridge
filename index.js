@@ -87,7 +87,7 @@ export function apply(ctx, config) {
   //
   // 为什么只盯一个模型：观测数据要挂在面板的模型芯片上，给每个跑过的模型都挂会变成噪声；
   // 名单见 defaults.MONITORED_UPSTREAM_MODELS。
-  const upstreamLog = createUpstreamLog()
+  let upstreamLog = createUpstreamLog()
   const monitoredUpstream = (model) => MONITORED_UPSTREAM_MODELS.includes(model)
 
   /**
@@ -98,7 +98,11 @@ export function apply(ctx, config) {
   const noteUpstream = (model, bodyText, label) => {
     if (!monitoredUpstream(model)) return
     const upstream = readUpstream(bodyText)
-    if (upstream) upstreamLog.note(model, upstream, label)
+    if (upstream) {
+      upstreamLog.note(model, upstream, label)
+      // 落盘（去抖由 store 统一管）：label\u0000model 为键，key 用 8 位标签不含原文
+      if (label) quotaStore.setUpstream(`${label}\u0000${model}`, upstream)
+    }
   }
 
   /**
@@ -121,12 +125,15 @@ export function apply(ctx, config) {
   const legacyQuotaState = migrateLegacyQuotaState(config)
   // 读盘 / 落盘失败不再静默：把 store 的错误交回日志（它自己不认识日志实现，见 quota-state.js）。
   // 「冷却与统计明明在丢、却没有任何迹象」就是这么来的。
-  const quotaStore = createQuotaStore(resolveQuotaStatePath(config), {
+  
+const quotaStore = createQuotaStore(resolveQuotaStatePath(config), {
     onError: (kind, error) => {
       const detail = error?.message ?? error
       log(kind === 'load' ? `额度状态文件读取失败，已按空状态启动（${detail}）` : `额度状态落盘失败（${detail}）`)
     },
   })
+  // 观测台账在 store 之前创建，这里把磁盘上的观测补灌回去（store 刚从文件恢复）
+  upstreamLog = createUpstreamLog(quotaStore.upstreamAll())
   // 诊断信息随状态文件落盘：池规模、额外 key 来源、各类决策计数（便于线上排查“为什么没换 key”）
   const diag = {
     pluginVersion: PLUGIN_VERSION,

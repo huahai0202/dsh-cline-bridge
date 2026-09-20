@@ -979,6 +979,24 @@ const ctxStatusOf = (options) => lastCtx?.__dshClineBridge?.status?.(options)
     JSON.stringify(keyBFull?.stats))
 }
 
+// ───────────────── 4k. 上游观测跨重启保留（用户要求） ─────────────────
+{
+  const statePath = join(TEST_STATE_DIR, `state-${++stateSeq}.json`)
+  mount({ clineKeys: [SECRET_A], quotaStatePath: statePath })
+  lastCtx?.__dshClineBridge?.flushQuotaState?.()
+  // 在磁盘状态里注入一条上游观测（模拟运行期间记录的观测）
+  const diskUp = JSON.parse(readFileSync(statePath, 'utf8'))
+  const labelA = label8(SECRET_A)
+  diskUp.upstream = { [`${labelA}\u0000z-ai/glm-5.3-flash`]: { provider: 'Parasail', fallbacks: 1, servedModel: '', at: Date.now() - 30000 } }
+  writeFileSync(statePath, JSON.stringify(diskUp))
+  mount({ clineKeys: [SECRET_A], quotaStatePath: statePath }) // 「重启」
+  const up = await callRoute()
+  const row = (up.json.keys ?? []).find((k) => k.label === labelA)
+  check('U1 重启后上游观测保留（key+模型 维度）',
+    row?.models?.['z-ai/glm-5.3-flash']?.upstream?.provider === 'Parasail',
+    JSON.stringify(row?.models?.['z-ai/glm-5.3-flash']?.upstream))
+}
+
 // ───────────────── 4i. 主 Key 挂载即入池（不必等第一条请求） ─────────────────
 // 以前主 Key 只在随请求头出现时才登记，于是 DSH 重启后面板只有备用 key，
 // 得先发一条请求才变全——这一组钉住「挂载即补齐」。
