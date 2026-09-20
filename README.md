@@ -20,6 +20,7 @@
 - **Cline 官方客户端特征头自动注入**（`user-agent: Cline/4.1.16`、`x-client-type: cline-vscode`、`x-platform: vscode`、`http-referer` 等）——请求头无需手动复制；
 - **主 Key 完全由用户在 DSH 设置中配置**，原生透传直通，不设代码层内置 Key 兜底；
 - **可选**多 Key 池：额外提供 Key 后，撞到「每日免费额度」类限流会自动换 Key 重发（未提供额外 Key 时行为与单 Key 完全一致，零影响）；
+- **上游观测（只读）**：同一模型在 Cline 背后常挂十几家上游、由网关按打分动态切换。插件从响应里读出**这次实际是哪家服务的**，在面板芯片上用徽标显示；漂走时变成警示色。**不做锁定**——实测该路由会接受 `providerOptions.gateway` 却完全忽略它，注入是静默无效的（详见下文），因此本插件不改写请求体一个字节；
 - **设置页面板**：在 DSH 设置里新增「Cline Key」分区，逐把列出每个 Key 的来源、掩码预览、健康/冷却状态、各模型的恢复倒计时与**跨重启保留**的累计用量（发送 / 成功 / 失败 / 限流、输入输出 token）；
 - **累计统计跨重启保留**：每把 Key 的发送/成功/失败/限流、输入输出 token、按模型明细、最近使用时刻，以及三个累计计数与「最近决策」，都按 8 位哈希标签与冷却一起落盘；面板标出统计起点，顶部另有「重置统计」（两段式确认，只清统计、不碰冷却与凭据）；
 - **面板直接导入 Key**：面板右上角（插件版本卡右边）一个「导入 Key」按钮，粘贴一把或多把即可写进凭据仓库的空闲槽位（`CLINE_API_KEY_2`~`_10`），写完立刻进池、当轮即可参与轮换；重复的自动跳过，可用 `keyImport: false` 关掉整条写入口；
@@ -224,18 +225,72 @@ refs:
 
 ---
 
+## 📌 上游观测：这次实际走的是哪家（只读，不改请求）
+
+Cline 背后是 **Vercel AI Gateway**。同一个模型往往同时挂在十几家上游上——实测 `cline-free/deepseek-v4.1-flash` 有 **16 家**：`deepseek`、`alibaba`、`baseten`、`fireworks`、`runware`、`relace`、`particle`、`novita`、`togetherai`、`deepinfra`、`wafer`、`parasail`、`gmicloud`、`modal`、`morph`、`boundless`。
+
+网关按自己的「近期可用率 + 延迟」打分**动态选一家**，所以「今天走 deepseek、明天可能走 alibaba」是常态。本插件从响应里读出**这次实际是谁服务的**，显示在面板上——**仅此而已，它不改写你的请求**。
+
+> **为什么不做「锁定」**：曾经做过（往请求体注入 `providerOptions.gateway.only`），实测后**已移除**。原因是这条路由**会接受这个字段却完全忽略它**：
+>
+> | 模型 | `only` 的效果 |
+> | --- | --- |
+> | `deepseek/deepseek-v3.2` | ✅ 认：`only:['bedrock']` → `fallbacksAvailable` 从 2 家清成 `0` |
+> | `cline-free/deepseek-v4.1-flash` | ❌ 无视：`only:['deepseek']` / `['togetherai']` / 连 `['zzz-not-real']` 都与不锁**完全一致**（`final=deepseek`、`fb=15`、只试 1 家） |
+> | `deepseek/deepseek-v4.1-flash` | ❌ 无视（同上） |
+>
+> 也就是说：**同一个网关下确实存在认这个字段的路由，但要盯的这个模型不在其中**。注入是静默无效的，留着只会让人以为锁上了。要锁只能换到认这个字段的模型，而那是模型选择问题，不是插件能解决的。
+>
+> 顺带澄清一个容易混淆的点：`cline-free/*`（免费档）与 `cline-pass/*`（[$9.99/月订阅](https://docs.cline.bot/getting-started/clinepass)）是**两条不同的路由**。`cline-pass/*` 对免费档的 Key 直接返回 **403**（无权限）。
+
+### 面板徽标
+
+被观测的模型（默认只有 `cline-free/deepseek-v4.1-flash`）会在「按模型查看」的芯片上挂一枚徽标：
+
+| 徽标 | 含义 |
+| --- | --- |
+| 中性「上游 deepseek」 | 这次实际由 deepseek 服务（符合预期） |
+| 警示「上游已变为 alibaba」 | 这次实际由 alibaba 服务——**漂走了**，这是你最需要看见的信号 |
+
+悬停可看兜底家数，以及「这是网关汇报的事实、插件不干预路由」。观测结果早于该模型最近一次使用时，title 会注明「这是上一次观察到的结果，本次还没有新数据」——**不把旧结论冒充当前状态**。没有任何观测数据时不渲染徽标（不会猜一个上游名显示）。
+
+### 为什么要显示而不是自动纠正
+
+锁不住的前提下，「看得见」是唯一诚实的选项：徽标把「漂移」从一件你事后才发现的事，变成一件当下就能看见的事。面板每 5 秒刷新，所以下一次请求落到别家时你会立刻看到。
+
+### 边界
+
+- 观测**只读响应**，请求体逐字节不改（有自检断言钉住这一点）。
+- 上游信息来自网关自己的汇报（`provider_metadata.gateway.routing.finalProvider`）；回包里没有这个字段时**不记录**，也绝不沿用旧值冒充本次结果。
+- 观测只存在内存里：它是「刚才那次请求的现象」，不是额度/用量那种要跨重启保留的事实。重启后显示「还没观测到」是诚实的，显示几小时前的旧上游才是错的。
+- 观测只走 Cline 通道（与多 Key 轮换同一个 `matchesClineTarget` 闸门），其他渠道一概不碰。
+
+### 想监控别的模型
+
+`lib/host/defaults.js` 里两张表：
+
+```js
+export const MONITORED_UPSTREAM_MODELS = ['cline-free/deepseek-v4.1-flash']
+export const PREFERRED_UPSTREAM = { 'cline-free/deepseek-v4.1-flash': 'deepseek' }
+```
+
+加模型名进 `MONITORED_UPSTREAM_MODELS` 即可开始观测；`PREFERRED_UPSTREAM` 只决定徽标是否走警示样式（**不代表任何干预**）。
+
+---
+
 ## 🧩 代码结构
 
 主机半边按职责拆分，入口只做装配：
 
 | 文件 | 行数 | 职责 |
 | --- | --- | --- |
-| `index.js` | ~769 | 插件入口：装配各模块 + 实现 fetch 层拦截（Cline 特征头注入 + 换 Key 轮换，轮换成功后选定跟随）+ 面板只读/导入/重置/选定四条路由 |
-| `lib/host/defaults.js` | ~82 | 插件版本、Cline 通道可调常量、DSH 路径解析、旧状态文件迁移 |
+| `index.js` | ~840 | 插件入口：装配各模块 + 实现 fetch 层拦截（Cline 特征头注入 + **上游观测** + 换 Key 轮换，轮换成功后选定跟随）+ 面板只读/导入/重置/选定四条路由 |
+| `lib/host/defaults.js` | ~105 | 插件版本、Cline 通道可调常量、**上游观测名单与预期上游表**、DSH 路径解析、旧状态文件迁移 |
 | `lib/host/labels.js` | ~47 | key 的 8 位哈希标签与首尾掩码预览 |
 | `lib/host/model-id.js` | ~21 | 模型 id 的形状校验（面板芯片 / 状态文件 / 选定路由三处共用同一把尺子） |
 | `lib/host/quota-state.js` | ~374 | 状态落盘：额度冷却 + **用量统计 / 累计计数** + **按模型**的「使用中」选定（同一文件、同一去抖写入器）+ 诊断白名单 + 重试窗口解析（报文文本与 `Retry-After` 头） |
 | `lib/host/request-shape.js` | ~60 | 读请求形状：body 可否重发、模型名、鉴权头读写 |
+| `lib/host/upstream.js` | ~90 | 上游**只读**观测：从响应读出 `provider_metadata.gateway.routing.finalProvider` + 内存台账（model → 上游/时间）+ 面板徽标数据（含「是否漂离预期」与「数据是否陈旧」） |
 | `lib/host/credentials.js` | ~87 | 兜底读取 `.credentials.yaml` 的 refs 段；凭据服务缺席时的兜底写入（保留其余内容 + 临时文件改名） |
 | `lib/host/key-import.js` | ~106 | 面板导入：粘贴文本解析、空闲 ref 分配、写入编排（不含 Key 原文的返回值） |
 | `lib/host/usage.js` | ~95 | Token 用量采集（tee 出只读分支扫 usage） |
@@ -275,16 +330,23 @@ dsh plugin --profile web add github:huahai0202/dsh-cline-bridge
 Cline 的 429 报文形状与面板契约随服务端 / 宿主调整，更新插件后建议跑一遍自检。**平时只需要这一条命令**（它依次跑完全部分项，最后打印汇总表）：
 
 ```bash
-node tools/self-check.mjs              # 一键跑完全部（cline-key + cline-panel）
+node tools/self-check.mjs              # 一键跑完全部（cline-key + cline-upstream + cline-panel）
 node tools/self-check.mjs cline-panel  # 只跑名字匹配的分项
 ```
 
 分项文件各自也能单独运行（定位失败时更顺手）：
 
 ```bash
-node tools/cline-key-check.mjs    # Cline 多 Key 轮换：本地 mock 服务器复刻 429，无需真实 Key
-node tools/cline-panel-check.mjs  # 设置页面板：只读/导入/重置路由契约 + 统计持久化 + 浏览器半边真实渲染
+node tools/cline-key-check.mjs       # Cline 多 Key 轮换：本地 mock 服务器复刻 429，无需真实 Key
+node tools/cline-upstream-check.mjs  # 上游观测：响应解析 + 台账 + 面板数据 + 「绝不改写请求体」
+node tools/cline-panel-check.mjs     # 设置页面板：只读/导入/重置路由契约 + 统计持久化 + 浏览器半边真实渲染
 ```
+
+`cline-upstream-check.mjs` 覆盖：`readUpstream` 的形状容错（无 `provider_metadata` / `finalProvider` 为空 / 非 JSON / 空输入一律返回 `null`——**看不到不等于某一家**；缺 `fallbacksAvailable` 时家数为 0 不谎报）、台账的脏输入拒收（模型名 `*` / 空 / 无 provider 不记录）、`upstreamSummary` 的「是否漂离预期」与**陈旧标记**（观测早于最近使用 → `stale`，不把旧结论当成当前状态）。C 组是**端到端**的，其中最要紧的一条是：**发往上游的请求体与原始请求逐字节一致**——这是「本插件不再改写请求」的回归锁（锁定代码在时，这条会因多出 `providerOptions` 而失败）。另有上游漂移如实上报、无元数据时不清空旧观测、不在观测名单的模型不产生数据、**撞 429 换 Key 重发后依然观测到跑通那一次的上游**。
+
+`cline-panel-check.mjs` 的 **PB 组**在真实渲染树里断言徽标：预期上游 → 中性样式 + 渠道名；漂走 → 警示样式 +「上游已变为 alibaba」；**任何情况下都不出现「已锁定」字样**（插件锁不住，写了就是假话）；陈旧观测在 title 里标明；没有数据时不渲染徽标（不猜上游）；英文界面走词典无中文残留。
+
+> **为什么这些断言要做成端到端**：`(url, init)` 形态的 `sendWith` 曾经无条件 `{ ...init, headers }`，把传进来的 body 参数**整个丢掉**。该缺陷在引入上游注入功能时才暴露（注入的字段算出来了却发不出去），修法是在 `body !== undefined` 时才覆盖 `body`——**绝不能写成 `body: undefined`**，那会把请求体清空（服务端收到 0 字节）。纯函数层全绿也测不出「算对了但没发出去」，所以断言必须落在 mock 上游真正收到的那份 body 上。锁定代码现已移除，但 `C1`（请求体逐字节一致）继续守着这条路径。
 
 `cline-key-check.mjs` 覆盖：换 Key 恢复、按模型冷却、**粘性选 Key（先烧完一把再换下一把）**、三种 Key 来源（config / 环境变量 / 凭据仓库）、单 Key 与瞬时限流下的收尾差异、**冷却窗口只认服务端（报文文本 → `Retry-After` 头，含 HTTP-date、「报文优先」与「拿不到就不记冷却」）**、**额度状态跨重启持久化**、**全池冷却快速失败**、**用量统计跨重启持久化（含粘性延续）**、**面板选定的「使用中」Key（V 组：按模型独立——给一个模型选定不影响另一个、该模型首发送优先用它、撞限流照常轮换、**选定始终跟着实际跑通的那把走**（轮换恢复与 `skipCoolingRequestKey` 直接跳过两种情况都算）、没选定的模型不会被自动选中、跨重启保留、落盘只有 8 位标签）**。
 

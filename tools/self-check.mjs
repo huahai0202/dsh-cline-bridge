@@ -19,6 +19,7 @@ const root = join(here, '..')
 
 const CHECKS = [
   { name: 'cline-key', file: 'cline-key-check.mjs', what: 'Cline 多 Key 轮换、粘性选 Key、冷却与持久化' },
+  { name: 'cline-upstream', file: 'cline-upstream-check.mjs', what: '上游观测（只读）：从响应读出实际上游 + 绝不改写请求体 + 面板数据' },
   { name: 'cline-panel', file: 'cline-panel-check.mjs', what: '设置面板：只读/导入/重置路由契约 + 统计持久化 + 浏览器半边渲染' },
 ]
 

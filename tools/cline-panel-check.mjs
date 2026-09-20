@@ -1952,6 +1952,112 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
   bundle.mini.dispose()
 }
 
+// ───────────────── 5e. 实际上游徽标（只读观测，非锁定）─────────────────────────
+// 断言的不是「有没有画出徽标」，而是**有没有说假话**：插件不干预路由，所以徽标只能陈述
+// 「这次实际上是哪家服务的」。实测该路由会接受 providerOptions.gateway 却完全忽略它，
+// 因此面板上绝不能出现「已锁定」这类字样。
+{
+  const PINNED = 'cline-free/deepseek-v4.1-flash'
+  const OTHER = 'z-ai/glm-5.3-flash'
+  const baseKey = {
+    index: 1, label: 'db694bbf', preview: MASK_A, source: 'request',
+    cooling: [], stats: { sent: 1, ok: 1, failed: 0, limited: 0, lastUsedAt: Date.now(), tokens: {} },
+    models: {},
+  }
+  const payloadWith = (upstream, modelId = PINNED) => ({
+    plugin: MODULE_ID,
+    version: PLUGIN_VERSION,
+    updatedAt: Date.now(),
+    models: [{ id: modelId, lastUsedAt: Date.now(), ...(upstream ? { upstream } : {}) }],
+    currentModel: modelId,
+    totals: { poolSize: 1, clineRequests: 1, rotations: 0, failFasts: 0 },
+    keys: [baseKey],
+  })
+  const badgeOf = (tree) => findNode(tree, (n) => String(n.props?.className ?? '').includes('_dsh_ofb_pin'))
+
+  // 1) 预期上游：中性样式，写明上游名
+  {
+    const { tree, bundle } = await renderPanel(payloadWith({ provider: 'deepseek', fallbacks: 15, at: Date.now(), stale: false, other: false }))
+    const badge = badgeOf(tree)
+    const cls = String(badge?.props?.className ?? '')
+    const text = textOf(badge ?? {}).join('')
+    check('PB1 预期上游显示实际渠道名、中性样式',
+      cls.includes('_dsh_ofb_pin_ok') && text.includes('deepseek'),
+      `class=${cls} text=${text}`)
+    check('PB2 title 说明这是网关汇报的事实、插件不干预路由',
+      String(badge?.props?.title ?? '').includes('不干预路由') && String(badge?.props?.title ?? '').includes('15'),
+      String(badge?.props?.title ?? ''))
+    bundle.mini.dispose()
+  }
+
+  // 2) 漂到别家：警示样式 + 明确写出变成了谁
+  {
+    const { tree, bundle } = await renderPanel(payloadWith({ provider: 'alibaba', fallbacks: 15, at: Date.now(), stale: false, other: true }))
+    const badge = badgeOf(tree)
+    const cls = String(badge?.props?.className ?? '')
+    const text = textOf(badge ?? {}).join('')
+    check('PB3 上游漂走时用警示样式并写出漂到了哪家',
+      cls.includes('_dsh_ofb_pin_off') && text.includes('alibaba') && text.includes('已变为'),
+      `class=${cls} text=${text}`)
+    check('PB4 任何情况下都不出现「已锁定」这类字样（插件锁不住，写了就是假话）',
+      !text.includes('已锁定') && !String(badge?.props?.title ?? '').includes('已锁定'),
+      `${text} / ${badge?.props?.title ?? ''}`)
+    bundle.mini.dispose()
+  }
+
+  // 3) 陈旧观测：title 里说明这是上一次的结果
+  {
+    const { tree, bundle } = await renderPanel(payloadWith({ provider: 'deepseek', fallbacks: 3, at: Date.now() - 60_000, stale: true, other: false }))
+    const badge = badgeOf(tree)
+    check('PB5 陈旧观测在 title 里标明「上一次观察到的结果」',
+      String(badge?.props?.title ?? '').includes('上一次'), String(badge?.props?.title ?? ''))
+    bundle.mini.dispose()
+  }
+
+  // 4) 没有观测数据：不渲染徽标（看不到 ≠ 显示成某一家）
+  {
+    const { tree, bundle } = await renderPanel(payloadWith(undefined))
+    check('PB6 没有观测数据时不渲染徽标（不猜上游）', badgeOf(tree) === undefined)
+    bundle.mini.dispose()
+  }
+
+  // 5) 徽标成组挂在芯片上，且只挂在有观测数据的模型上
+  {
+    const payload = {
+      plugin: MODULE_ID, version: PLUGIN_VERSION, updatedAt: Date.now(),
+      models: [
+        { id: PINNED, lastUsedAt: Date.now(), upstream: { provider: 'deepseek', fallbacks: 15, at: Date.now(), stale: false, other: false } },
+        { id: OTHER, lastUsedAt: Date.now() - 1000 },
+      ],
+      currentModel: PINNED,
+      totals: { poolSize: 1, clineRequests: 1, rotations: 0, failFasts: 0 },
+      keys: [baseKey],
+    }
+    const { tree, bundle } = await renderPanel(payload)
+    const wraps = []
+    findNode(tree, (n) => { if (String(n.props?.className ?? '') === '_dsh_ofb_chipwrap') wraps.push(n); return false })
+    const texts = wraps.map((w) => textOf(w).join(''))
+    check('PB7 徽标与芯片成组渲染，只挂在有观测数据的模型上',
+      wraps.length === 1 && texts[0].includes('deepseek-v4.1-flash') && texts[0].includes('deepseek'),
+      texts.join(' / ') || '（无成组容器）')
+    bundle.mini.dispose()
+  }
+
+  // 6) 英文界面：徽标文案走词典，无中文残留
+  {
+    const { tree, bundle } = await renderPanel(
+      payloadWith({ provider: 'alibaba', fallbacks: 15, at: Date.now(), stale: false, other: true }),
+      { locale: 'en-US' },
+    )
+    const badge = badgeOf(tree)
+    const text = textOf(badge ?? {}).join('')
+    check('PB8 英文界面徽标用英文文案',
+      text.includes('now via') && !/[\u4e00-\u9fa5]/.test(text + String(badge?.props?.title ?? '')),
+      `${text} / ${badge?.props?.title ?? ''}`)
+    bundle.mini.dispose()
+  }
+}
+
 rmSync(TEST_STATE_DIR, { recursive: true, force: true })
 
 console.log(results.join('\n'))

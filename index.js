@@ -13,6 +13,7 @@ import {
   DEFAULT_CLINE_COOLDOWN_MS,
   DEFAULT_FAIL_FAST_MIN_MS,
   MAX_ROTATE_ATTEMPTS,
+  MONITORED_UPSTREAM_MODELS,
   PLUGIN_VERSION,
   TERMINAL_CAP_RE,
   TERMINAL_WINDOW_MS,
@@ -24,6 +25,7 @@ import { keyLabel } from './lib/host/labels.js'
 import { isPlausibleModelId } from './lib/host/model-id.js'
 import { cooldownMsFromResponse, createQuotaStore, parseRetryWindowMs } from './lib/host/quota-state.js'
 import { matchesClineTarget, readAuthTarget, readKeyOf, readModelOf, replayableBody, writeKeyTo } from './lib/host/request-shape.js'
+import { createUpstreamLog, readUpstream } from './lib/host/upstream.js'
 import { normalizeUsage, tapUsage } from './lib/host/usage.js'
 import { createKeyPool } from './lib/host/key-pool.js'
 import { buildStatus, clineApiKeyEnvOf } from './lib/host/status.js'
@@ -71,6 +73,39 @@ export function apply(ctx, config) {
   const fillMissingRequestKey = config?.fillMissingRequestKey !== false
   // 允许导入写入的 ref 名单：与 key-pool 读盘用的是同一份（未列出的 ref 一律不碰）
   const wantedKeyRefs = Array.isArray(config?.clineKeyRefs) ? config.clineKeyRefs : DEFAULT_CLINE_KEY_REFS
+  // 「这次实际是哪个上游服务的」——只读观测，供面板显示，**不干预路由**。
+  //
+  // 只放内存、不落状态文件：这是「刚才那次请求观察到的现象」，不是额度/用量那种必须
+  // 跨重启保留的事实。上游随时会漂，把过期结论写进盘再读出来只会误导。
+  //
+  // 为什么只盯一个模型：观测数据要挂在面板的模型芯片上，给每个跑过的模型都挂会变成噪声；
+  // 名单见 defaults.MONITORED_UPSTREAM_MODELS。
+  const upstreamLog = createUpstreamLog()
+  const monitoredUpstream = (model) => MONITORED_UPSTREAM_MODELS.includes(model)
+
+  /**
+   * 从一次响应的文本里记下实际上游。失败一律静默——观测绝不能影响请求本身。
+   * `bodyText` 由调用方传入（它已经 clone 过一份给用量采集，这里直接用那份文本）。
+   */
+  const noteUpstream = (model, bodyText) => {
+    if (!monitoredUpstream(model)) return
+    const upstream = readUpstream(bodyText)
+    if (upstream) upstreamLog.note(model, upstream)
+  }
+
+  /**
+   * 读一次响应并把上游记下来。这是唯一的调用入口，避免各处自己 clone/parse。
+   * 429 报文里没有路由信息，所以只在真正拿到 2xx 的出路调用。
+   */
+  const observeUpstream = async (model, response) => {
+    if (!monitoredUpstream(model)) return
+    try {
+      noteUpstream(model, await response.clone().text())
+    } catch {
+      // 观测失败不影响请求
+    }
+  }
+
   // 导入正文字节上限：面板是手工粘贴几十把 Key 的量级，64KB 绰绰有余
   const MAX_IMPORT_BODY = 64 * 1024
   // 插件更名（opencode-free-bridge → dsh-cline-bridge）后第一次启动：把旧名状态文件搬过来，
@@ -280,6 +315,11 @@ export function apply(ctx, config) {
         }
       }
 
+      // `(url, init)` 形态下要发出去的请求体：就是 init.body 原样（本插件不再改写请求体；
+      // 保留这个变量是为了让两种形态在 sendWith 调用点写法一致、也便于将来再引入改写时
+      // 不会漏掉这一条分支——那里曾经无条件 `{ ...init, headers }`，把 body 整个丢掉）。
+      const requestBody = init?.body
+
       const model =
         input instanceof Request
           ? readModelOf(bufferedBody ? new TextDecoder().decode(bufferedBody) : undefined)
@@ -361,12 +401,20 @@ export function apply(ctx, config) {
           })
           return originalFetch.call(this, rebuilt)
         }
-        return originalFetch.call(this, input, { ...init, headers: sendHeaders })
+        // `(url, init)` 形态：body 只在**真的带了值**时才覆盖 init.body。绝不能传
+        // `body: undefined`——那会把原有的请求体抹掉（与 Request 分支同一个坑）。
+        // 这里原先无条件 `{ ...init, headers }`，等于丢掉传进来的 body：上游锁定改写出来的
+        // 请求体因此发不出去（轮换重发本来也该用这份副本）。
+        return originalFetch.call(this, input, {
+          ...init,
+          headers: sendHeaders,
+          ...(body !== undefined ? { body } : {}),
+        })
       }
 
       let response
       try {
-        response = await sendWith(headers, bufferedBody)
+        response = await sendWith(headers, input instanceof Request ? bufferedBody : requestBody)
       } catch (error) {
         // 传输层异常（abort / DNS / TLS）：与其余路径一样留下决策与日志，不让轨迹停在 inspecting
         decide(`transport-error ${String(error?.message ?? error).slice(0, 80)}`)
@@ -385,15 +433,20 @@ export function apply(ctx, config) {
           // 否则面板会指着一把没在用的 Key（用户报的「标记没跟着换」就是这条）。
           if (pool.followRotation(model, currentKey)) log(`已把 ${model} 的「使用中」改为 ${keyLabel(currentKey)}（实际在用）`)
         } else if (currentKey) pool.markFailed(currentKey, model)
+        // 记下这次实际上是哪个上游服务的（只读观测，面板据此显示）。
+        // 只在这一条出路做：429/5xx 的报文里没有路由信息，拿了也是白拿。
+        if (response.ok) await observeUpstream(model, response)
         decide(`pass-through status=${response.status}`)
         // 顺手把这轮响应的 token 用量记到「key + 模型」上（失败静默，不影响请求）
         return currentKey ? tapUsage(response, (usage) => pool.markTokens(currentKey, model, normalizeUsage(usage))) : response
       }
 
-      // 重发要求 body 可原样重建（字符串 / 字节），流式 body 只能原样返回
+      // 重发要求 body 可原样重建（字符串 / 字节），流式 body 只能原样返回。
+      // `requestBody` 就是实际发出去的那份（`(url, init)` 形态下它可能被改写，虽然本插件
+      // 现在不再改写请求体，但按「实际发出去的」判断永远是对的）。
       const replayable = input instanceof Request
         ? !bodyBufferFailed && (bufferedBody !== undefined || !input.body)
-        : replayableBody(init?.body)
+        : replayableBody(requestBody)
       if (!replayable || !currentKey) {
         decide(`cannot-rotate replayable=${replayable} keyPresent=${Boolean(currentKey)} status=${response.status}`)
         return response
@@ -417,7 +470,7 @@ export function apply(ctx, config) {
 
         let retried
         try {
-          retried = await sendWith(nextHeaders, bufferedBody)
+          retried = await sendWith(nextHeaders, input instanceof Request ? bufferedBody : requestBody)
           pool.markSent(next.key, model)
         } catch (error) {
           log(`Cline 换 key 重发失败（key=${next.label}）：${error?.message ?? error}`)
@@ -433,6 +486,8 @@ export function apply(ctx, config) {
             // 这个模型在面板上若有「使用中」的选定，让它跟着挪到真正跑通的这把：否则面板会
             // 一直标着一把已经限流的 key，而实际在用的是另一把。没选定的模型不受影响。
             if (pool.followRotation(model, next.key)) log(`已把 ${model} 的「使用中」改为 ${next.label}（原选定已限流）`)
+            // 重发成功这条也要记上游（首发送撞 429，真正跑通的是这一次）
+            await observeUpstream(model, retried)
           } else {
             // 换 key 后拿到的是 4xx/5xx：这次轮换并没有「恢复」，别把它计成成功，
             // 也别把冷却清掉——留着继续试池里下一把。
@@ -706,6 +761,8 @@ export function apply(ctx, config) {
             return settingsService
           },
           clineMatch,
+          // 上游观测台账（只读）：面板据此显示「实际走哪家」
+          upstreamLog,
         },
         options,
       ),
