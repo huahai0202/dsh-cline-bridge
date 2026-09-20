@@ -1586,10 +1586,10 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
       return tip.includes('输入') && tip.includes('4500') && tip.includes('输出')
     })(),
     findNode(bars[0], (n) => typeof n.props?.title === 'string')?.props?.title)
-  check('I17 合计行给出整体加权速度（Σoutput/Σms = 2400/120s = 20.0）',
+  check('I17 合计行不显示速度（跨 key 加权平均没有「哪把快」的信息量，用户要求移除）',
     (() => {
-      const whole = textOf(tree).filter((s) => s.includes('合计')).join(' ')
-      return whole.includes('速度') && whole.includes('20.0')
+      const total = textOf(tree).filter((s) => s.includes('合计')).join(' ')
+      return total.includes('25.5k/2.4k') && !total.includes('速度')
     })(), textOf(tree).filter((s) => s.includes('合计')).join(' '))
   check('I18 速度计算不产生 NaN / Infinity（除零路径有守卫）',
     (() => {
