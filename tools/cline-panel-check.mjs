@@ -1406,17 +1406,17 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
       {
         index: 1, label: 'db694bbf', preview: MASK_A, source: 'request',
         cooling: [{ model: DEEPSEEK, readyAt: Date.now() + 21 * 3600 * 1000, readyInMin: 1260 }],
-        stats: { sent: 19, ok: 18, limited: 1, lastModel: GLM, lastUsedAt: Date.now() - 4000, tokens: { input: 16800, output: 1500, total: 18300, cached: 900 } },
+        stats: { sent: 19, ok: 18, limited: 1, lastModel: GLM, lastUsedAt: Date.now() - 4000, tokens: { input: 16800, output: 1500, total: 18300, cached: 900, ms: 180000 } },
         models: {
-          [DEEPSEEK]: { sent: 16, ok: 15, failed: 2, limited: 1, lastUsedAt: Date.now() - 3600_000, tokens: { input: 12300, output: 1200, total: 13500, cached: 800 }, upstream: { provider: 'deepseek', fallbacks: 15, at: Date.now() } },
-          [GLM]: { sent: 3, ok: 3, limited: 0, lastUsedAt: Date.now() - 4000, tokens: { input: 4500, output: 300, total: 4800, cached: 100 }, upstream: { provider: 'deepinfra', fallbacks: 4, at: Date.now() } },
+          [DEEPSEEK]: { sent: 16, ok: 15, failed: 2, limited: 1, lastUsedAt: Date.now() - 3600_000, tokens: { input: 12300, output: 1200, total: 13500, cached: 800, ms: 120000 }, upstream: { provider: 'deepseek', fallbacks: 15, at: Date.now() } },
+          [GLM]: { sent: 3, ok: 3, limited: 0, lastUsedAt: Date.now() - 4000, tokens: { input: 4500, output: 300, total: 4800, cached: 100, ms: 60000 }, upstream: { provider: 'deepinfra', fallbacks: 4, at: Date.now() } },
         },
       },
       {
         index: 2, label: '761f9875', preview: MASK_B, source: '.credentials.yaml: CLINE_API_KEY_2',
         cooling: [],
-        stats: { sent: 21, ok: 21, limited: 0, lastModel: GLM, lastUsedAt: Date.now() - 9000, tokens: { input: 21000, output: 2100, total: 23100, cached: 0 } },
-        models: { [GLM]: { sent: 21, ok: 21, limited: 0, lastUsedAt: Date.now() - 9000, tokens: { input: 21000, output: 2100, total: 23100, cached: 0 }, upstream: { provider: 'togetherai', fallbacks: 4, at: Date.now() } } },
+        stats: { sent: 21, ok: 21, limited: 0, lastModel: GLM, lastUsedAt: Date.now() - 9000, tokens: { input: 21000, output: 2100, total: 23100, cached: 0, ms: 60000 } },
+        models: { [GLM]: { sent: 21, ok: 21, limited: 0, lastUsedAt: Date.now() - 9000, tokens: { input: 21000, output: 2100, total: 23100, cached: 0, ms: 60000 }, upstream: { provider: 'togetherai', fallbacks: 4, at: Date.now() } } },
       },
     ],
     recent: [{ at: new Date().toISOString(), model: GLM, decision: 'pass-through status=200', bodyLen: 1000, poolSize: 2 }],
@@ -1490,18 +1490,18 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
   }
 
   const usageDsRow = usageOf(dsView, MASK_A)
-  // 每个数值各占一列（发送|成功|失败|限流、输入|缓存命中%），所以 textOf 用空格连接。
-  // deepseek 视图下这把 key：input=12300 cached=800 → 800/12300 = 7%
+  // 每个数值各占一列（发送|成功|失败|限流、输入|速度 tok/s），所以 textOf 用空格连接。
+  // deepseek 视图下这把 key：output=1200 ms=120000 → 10.0 tok/s
   check('I1 明细卡按当前模型逐行列出用量（deepseek 视图）',
-    usageDsRow.includes('1 sk-l…4444 16 15 2 1 12.3k 7%'), usageDsRow)
-  check('I2 另一把 key 在 glm 视图下有自己的一行（21k 输入、0 缓存 → 0%）',
-    usageOf(tree, MASK_B).includes('2 sk-t…8888 21 21 0 0 21k 0%'), usageOf(tree, MASK_B))
+    usageDsRow.includes('1 sk-l…4444 16 15 2 1 12.3k 10.0'), usageDsRow)
+  check('I2 另一把 key 在 glm 视图下有自己的一行（21k 输入、35.0 tok/s）',
+    usageOf(tree, MASK_B).includes('2 sk-t…8888 21 21 0 0 21k 35.0'), usageOf(tree, MASK_B))
   const usageHeadOf = (node) => findNode(usageCardOf(node), (n) => String(n.props?.className ?? '') === '_dsh_ofb_usage_head')
   const usageHeadSpans = usageHeadOf(tree)?.children ?? []
   // 表头与数据行同构：每列一个标签，含义直接可见（不靠悬停），且短标签不会折行
   const usageHeadFlat = usageHeadSpans.map((s) => textOf(s).join('')).join('|')
-  check('I3 明细卡表头逐列标注（Key、发送/成功/失败/限流、输入/缓存命中），与数据列一一对应',
-    usageHeadFlat === 'Key|发送成功失败限流|输入缓存命中|最近使用' &&
+  check('I3 明细卡表头逐列标注（Key、发送/成功/失败/限流、输入/速度），与数据列一一对应',
+    usageHeadFlat === 'Key|发送成功失败限流|输入速度|最近使用' &&
       String(usageHeadSpans[0]?.props?.className ?? '') === '_dsh_ofb_usage_lead' &&
       String(usageHeadSpans[1]?.props?.className ?? '') === '_dsh_ofb_usage_req' &&
       String(usageHeadSpans[2]?.props?.className ?? '') === '_dsh_ofb_tokencell',
@@ -1509,8 +1509,8 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
   check('I3b 明细卡不再重复模型名（它已在筛选芯片上）',
     !usageCardOf(tree) || !JSON.stringify(usageCardOf(tree)).includes('z-ai/glm-5.3-flash'),
     JSON.stringify(usageCardOf(tree) ?? {}).slice(0, 200))
-  check('I3c 「输出」列已被「缓存命中」替换（不再出现输出数字）',
-    usageHeadFlat.includes('缓存命中') && !usageHeadFlat.includes('输出'),
+  check('I3c 「缓存命中」列已被「速度」替换（不再出现命中率）',
+    usageHeadFlat.includes('速度') && !usageHeadFlat.includes('缓存命中'),
     usageHeadFlat)
 
   const usageGlm = usageOf(tree, MASK_A)
@@ -1521,8 +1521,8 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
   check('I5 该模型上未使用的 key 折叠成一行提示',
     cardText(dsView).includes('其余 1 把在该模型上没用过') && !cardText(dsView).includes(MASK_B),
     cardText(dsView).replace(/\n/g, ' | '))
-  // glm 视图：input=4500 cached=100 → 100/4500 = 2%
-  check('I6 切到 glm 时同一把 key 显示 glm 的计数与命中率', usageGlm.includes('1 sk-l…4444 3 3 0 0 4.5k 2%'), usageGlm)
+  // glm 视图：output=300 ms=60000 → 5.0 tok/s
+  check('I6 切到 glm 时同一把 key 显示 glm 的计数与速度', usageGlm.includes('1 sk-l…4444 3 3 0 0 4.5k 5.0'), usageGlm)
 
   // ── 上游渠道列（第 1 张表的第 5 列，替代原「请求 / Token」）──
   // 逐 key 显示各自在该模型上的实际上游。没观测到必须是「—」，
@@ -1533,7 +1533,7 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
     const cell = (row?.children ?? [])[4]
     return textOf(cell).join('')
   }
-  check('I7 明细卡显示该模型的输入 token（输出已由缓存命中% 取代）',
+  check('I7 明细卡显示该模型的输入 token（与速度并排两列）',
     usageDsRow.includes('12.3k') && !usageDsRow.includes('1.2k'), usageDsRow)
   check('I8 上游列逐 key 各记各的（glm 视图：一把 deepinfra、一把 togetherai）',
     upstreamRowOf(tree, MASK_A) === 'deepinfra' && upstreamRowOf(tree, MASK_B) === 'togetherai',
@@ -1566,39 +1566,40 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
   const barWidths = bars.map((bar) => Number.parseFloat(fillOf(bar)?.props?.style?.width ?? '0'))
   check('I12 输入量最大的那行占满整条（条长按卡内最大输入量归一）',
     Math.max(...barWidths) === 100 && barWidths.filter((w) => w === 100).length === 1, barWidths.map((w) => w.toFixed(0) + '%').join(' / '))
-  check('I13 条内按 缓存命中:未命中 拆成两段',
+  check('I13 条是单段纯输入占比（缓存分段已随「缓存命中」列一起移除）',
     bars.every((bar) => {
       const segs = (fillOf(bar)?.children ?? []).map((c) => String(c.props?.className ?? ''))
-      return segs.includes('_dsh_ofb_bar_in') && segs.includes('_dsh_ofb_bar_out')
+      return segs.length === 1 && segs[0] === '_dsh_ofb_bar_in'
     }), JSON.stringify(bars.map((bar) => (fillOf(bar)?.children ?? []).map((c) => String(c.props?.className ?? '').replace('_dsh_ofb_bar_', '')))))
-  const inputShare = Number.parseFloat(
-    (fillOf(bars[0])?.children ?? []).find((c) => String(c.props?.className ?? '') === '_dsh_ofb_bar_in')?.props?.style?.width ?? '0',
-  )
-  // 命中段宽度 = 命中率（cached/input），不再是 input/(input+output)
-  check('I14 命中段占比与命中率一致（100/4500 = 2.2%）', Math.abs(inputShare - (100 / 4500) * 100) < 0.2, inputShare.toFixed(1) + '%')
+  // 速度列的第二格数字：deepseek 视图第一行 output=1200 ms=120000 → 10.0
+  const speedCell = Number.parseFloat(usageOf(dsView, MASK_A).split('12.3k ')[1] ?? '')
+  check('I14 速度列 = 累计输出 ÷ 累计流式秒数（1200/120s = 10.0）', Math.abs(speedCell - 10) < 0.05, String(speedCell))
   check('I15 标题行给出当前模型的合计（请求 + token，取自面板整体文本，因为它在卡片外）',
     (() => {
       const whole = textOf(tree).join('\n')
       return whole.includes('合计') && whole.includes('24/24/0') && whole.includes('25.5k/2.4k')
     })(),
     textOf(tree).filter((s) => s.includes('合计')).join(' '))
-  check('I16 条的 title 讲缓存命中（含精确 cached/input 与口径说明）',
+  check('I16 条的 title 给出精确 输入/输出（悬停可见原始数）',
     (() => {
       const tip = String(findNode(bars[0], (n) => typeof n.props?.title === 'string')?.props?.title ?? '')
-      return tip.includes('缓存命中') && tip.includes('100') && tip.includes('4500')
+      return tip.includes('输入') && tip.includes('4500') && tip.includes('输出')
     })(),
     findNode(bars[0], (n) => typeof n.props?.title === 'string')?.props?.title)
-  check('I17 合计行也给出整体缓存命中率（同口径 cached/input）',
-    textOf(tree).filter((s) => s.includes('合计')).join(' ').includes('缓存命中'), textOf(tree).filter((s) => s.includes('合计')).join(' '))
-  check('I18 命中率计算不产生 NaN / Infinity（除零路径有守卫）',
+  check('I17 合计行给出整体加权速度（Σoutput/Σms = 2400/120s = 20.0）',
+    (() => {
+      const whole = textOf(tree).filter((s) => s.includes('合计')).join(' ')
+      return whole.includes('速度') && whole.includes('20.0')
+    })(), textOf(tree).filter((s) => s.includes('合计')).join(' '))
+  check('I18 速度计算不产生 NaN / Infinity（除零路径有守卫）',
     (() => {
       const card = textOf(usageCardOf(tree)).join(' ')
       return !card.includes('NaN') && !card.includes('Infinity')
     })(),
     textOf(usageCardOf(tree)).join(' ').slice(0, 120))
 
-  // I19：模型行存在但 input=0（这类行不会被折叠，能真正走到 rate=null 的分支）。
-  // 断言显示「—」而不是 0% —— 把「没有数据」说成「命中率 0%」是错误信息。
+  // I19：模型行存在但无流式耗时（ms=0，如纯非流式流量）——真正走到 tps=null 的分支。
+  // 断言显示「—」而不是 0 —— 把「没有数据」说成「速度 0」是错误信息。
   {
     const zeroPayload = {
       plugin: MODULE_ID, version: PLUGIN_VERSION, updatedAt: Date.now(),
@@ -1608,14 +1609,14 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
       keys: [{
         index: 1, label: 'aa11bb22', preview: MASK_A, source: 'request', cooling: [],
         stats: { sent: 0, ok: 0, failed: 0, limited: 0, lastUsedAt: Date.now(), tokens: {} },
-        models: { 'z-ai/glm-5.3-flash': { sent: 0, ok: 0, failed: 0, limited: 0, lastUsedAt: Date.now(), tokens: { input: 0, output: 0, total: 0, cached: 0 } } },
+        models: { 'z-ai/glm-5.3-flash': { sent: 0, ok: 0, failed: 0, limited: 0, lastUsedAt: Date.now(), tokens: { input: 0, output: 0, total: 0, cached: 0, ms: 0 } } },
       }],
       recent: [],
     }
     const zero = await renderPanel(zeroPayload)
     const zeroText = textOf(usageCardOf(zero.tree)).join(' ')
-    check('I19 没有输入 token 的行显示「—」而不是 0%（不把「没数据」说成「命中率 0%」）',
-      zeroText.includes('—') && !zeroText.includes('0%'), zeroText)
+    check('I19 没有耗时数据的行速度显示「—」而不是 0（不把「没数据」说成「速度 0」）',
+      zeroText.includes('—') && !zeroText.includes('NaN'), zeroText)
     zero.bundle.mini.dispose()
   }
 

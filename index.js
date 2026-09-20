@@ -474,7 +474,7 @@ export function apply(ctx, config) {
         if (response.ok) await observeUpstream(model, response, currentKey ? keyLabel(currentKey) : '')
         decide(`pass-through status=${response.status}`)
         // 顺手把这轮响应的 token 用量记到「key + 模型」上（失败静默，不影响请求）
-        return currentKey ? tapUsage(response, (usage) => pool.markTokens(currentKey, model, normalizeUsage(usage))) : response
+        return currentKey ? tapUsage(response, (usage, ms) => pool.markTokens(currentKey, model, normalizeUsage(usage), ms)) : response
       }
 
       // 重发要求 body 可原样重建（字符串 / 字节），流式 body 只能原样返回。
@@ -530,7 +530,7 @@ export function apply(ctx, config) {
             pool.markFailed(next.key, model)
             decide(`rotate-failed ${keyLabel(currentKey)}→${next.label} status=${retried.status} model=${model}`)
           }
-          return tapUsage(retried, (usage) => pool.markTokens(next.key, model, normalizeUsage(usage)))
+          return tapUsage(retried, (usage, ms) => pool.markTokens(next.key, model, normalizeUsage(usage), ms))
         }
 
         lastText = await retried.clone().text()
