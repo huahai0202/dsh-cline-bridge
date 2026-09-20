@@ -1319,6 +1319,22 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
     textOf(coolingCell).join(' ').includes('h') && findNode(coolingCell, (n) => String(n.props?.className ?? '') === '_dsh_ofb_cooling_line') !== undefined,
     textOf(coolingCell).join(' | '))
 
+  // 回归（用户实测：上游渠道盖住了恢复时间）：冷却格内容超宽时会越界压进隔壁列——
+  // td 的 overflow:hidden 对表格单元格不生效，防护必须在格内自己完成。
+  // 锁三件事：冷却行允许格内折行（flex-wrap）、恢复时刻自带裁剪壳与完整时刻的 title、
+  // 倒计时 flex:none（不被压缩变形）。
+  const coolingLine = findNode(coolingCell, (n) => String(n.props?.className ?? '') === '_dsh_ofb_cooling_line')
+  const coolingStamp = findNode(coolingCell, (n) => String(n.props?.className ?? '').includes('_dsh_ofb_clip'))
+  const coolingLineCss = /_dsh_ofb_cooling_line \{([^}]*)\}/.exec(css)?.[1] ?? ''
+  const remainingCss = /_dsh_ofb_remaining \{([^}]*)\}/.exec(css)?.[1] ?? ''
+  check('C29b 冷却格内容绝不越界：行内可折行（flex-wrap）、时刻带裁剪壳+title、倒计时不被压缩',
+    coolingLine !== undefined && coolingLineCss.includes('flex-wrap: wrap') &&
+      coolingStamp !== undefined && Boolean(coolingStamp.props?.title) &&
+      remainingCss.includes('flex: none'),
+    'wrap=' + coolingLineCss.includes('flex-wrap: wrap') +
+      ' clip=' + (coolingStamp !== undefined) + ' title=' + Boolean(coolingStamp?.props?.title) +
+      ' flexNone=' + remainingCss.includes('flex: none'))
+
   // Key 单元格：只有掩码预览一行，且带裁剪类（长 key 不会换行撑高）
   const keyCellItems = rowCells[1]?.children?.[0]?.children ?? []
   const clipped = (node) => String(node?.props?.className ?? '').includes('_dsh_ofb_clip')
