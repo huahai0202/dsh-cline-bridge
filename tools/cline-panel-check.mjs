@@ -1265,12 +1265,13 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
   check('C12 渲染出模型筛选条、恢复倒计时与该模型的用量明细', /2[01]h\d\dm/.test(text) && text.includes('deepseek-v4.1-flash') && text.includes('16.8k'), (/[0-9]+h[0-9]{2}m/.exec(text) ?? ['none'])[0])
   check('C13 渲染出状态药丸（可用/冷却中）', text.includes('冷却中') && text.includes('可用'))
   check('C14 表格里没有「来源」这一列', !table_headers(tree).some((h) => /来源|source/i.test(h)) && !text.includes('.credentials.yaml: CLINE_API_KEY_2') && !text.includes('DSH 请求头'), table_headers(tree).join(' | '))
-  check('C15 渲染出用量计数 发送/成功/失败/限流', text.includes('12/11/2/1') && text.includes('4/4/0/0'))
+  check('C15 表格第 5 列是「上游渠道」（原「请求 / Token」列已按用户要求替换）',
+    table_headers(tree)[4] === '上游渠道', table_headers(tree).join(' | '))
   check('C16 渲染出统计卡数值', text.includes('61') && text.includes(PLUGIN_VERSION), PLUGIN_VERSION)
   check('C17 渲染出最近决策', text.includes('最近决策') && text.includes('rotated a→b'))
   check('C18 面板里没有「运行参数」卡片', !text.includes('运行参数') && !text.includes('凭据文件') && !text.includes('15分钟') && !text.includes('Runtime parameters'))
   check('C19 面板里没有掩码说明文字', !text.includes('首尾各 4 位') && !text.includes('掩码预览'))
-  check('C20 表格表头恰好是这 7 列', table_headers(tree).join('|') === '#|Key|状态|冷却 / 恢复|请求 / Token|最近使用|使用', table_headers(tree).join(' | '))
+  check('C20 表格表头恰好是这 7 列', table_headers(tree).join('|') === '#|Key|状态|冷却 / 恢复|上游渠道|最近使用|使用', table_headers(tree).join(' | '))
 
   // 关键 DOM 结构：表格确实有 2 行数据
   const table = findNode(tree, (n) => n.type === 'table')
@@ -1376,7 +1377,12 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
     plugin: MODULE_ID,
     version: PLUGIN_VERSION,
     updatedAt: Date.now(),
-    models: [{ id: GLM, lastUsedAt: Date.now() }, { id: DEEPSEEK, lastUsedAt: Date.now() - 3600_000 }],
+    // 模型维度的观测（芯片徽标用）：当前模型 glm 的预期上游是 deepseek，但实际漂到了 alibaba。
+    // 注意这是**模型维度**的事实，只喂给芯片徽标；表格里每行的上游必须来自各自的 models 明细。
+    models: [
+      { id: GLM, lastUsedAt: Date.now(), upstream: { provider: 'alibaba', preferred: 'deepseek', fallbacks: 15, at: Date.now(), stale: false, other: true } },
+      { id: DEEPSEEK, lastUsedAt: Date.now() - 3600_000, upstream: { provider: 'deepseek', preferred: 'deepseek', fallbacks: 15, at: Date.now(), stale: false, other: false } },
+    ],
     currentModel: GLM,
     totals: { poolSize: 2, readyKeys: 1, coolingKeys: 1, clineRequests: 40, rotations: 2, failFasts: 0 },
     extras: {},
@@ -1386,15 +1392,15 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
         cooling: [{ model: DEEPSEEK, readyAt: Date.now() + 21 * 3600 * 1000, readyInMin: 1260 }],
         stats: { sent: 19, ok: 18, limited: 1, lastModel: GLM, lastUsedAt: Date.now() - 4000, tokens: { input: 16800, output: 1500, total: 18300, cached: 900 } },
         models: {
-          [DEEPSEEK]: { sent: 16, ok: 15, failed: 2, limited: 1, lastUsedAt: Date.now() - 3600_000, tokens: { input: 12300, output: 1200, total: 13500, cached: 800 } },
-          [GLM]: { sent: 3, ok: 3, limited: 0, lastUsedAt: Date.now() - 4000, tokens: { input: 4500, output: 300, total: 4800, cached: 100 } },
+          [DEEPSEEK]: { sent: 16, ok: 15, failed: 2, limited: 1, lastUsedAt: Date.now() - 3600_000, tokens: { input: 12300, output: 1200, total: 13500, cached: 800 }, upstream: { provider: 'deepseek', fallbacks: 15, at: Date.now() } },
+          [GLM]: { sent: 3, ok: 3, limited: 0, lastUsedAt: Date.now() - 4000, tokens: { input: 4500, output: 300, total: 4800, cached: 100 }, upstream: { provider: 'deepinfra', fallbacks: 4, at: Date.now() } },
         },
       },
       {
         index: 2, label: '761f9875', preview: MASK_B, source: '.credentials.yaml: CLINE_API_KEY_2',
         cooling: [],
         stats: { sent: 21, ok: 21, limited: 0, lastModel: GLM, lastUsedAt: Date.now() - 9000, tokens: { input: 21000, output: 2100, total: 23100, cached: 0 } },
-        models: { [GLM]: { sent: 21, ok: 21, limited: 0, lastUsedAt: Date.now() - 9000, tokens: { input: 21000, output: 2100, total: 23100, cached: 0 } } },
+        models: { [GLM]: { sent: 21, ok: 21, limited: 0, lastUsedAt: Date.now() - 9000, tokens: { input: 21000, output: 2100, total: 23100, cached: 0 }, upstream: { provider: 'togetherai', fallbacks: 4, at: Date.now() } } },
       },
     ],
     recent: [{ at: new Date().toISOString(), model: GLM, decision: 'pass-through status=200', bodyLen: 1000, poolSize: 2 }],
@@ -1404,10 +1410,16 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
   const renderedText = () => textOf(tree).join('\n')
   const chipsOf = (node) => {
     const found = []
+    // 只收「芯片按钮」本身：芯片可能被 `_dsh_ofb_chipwrap` 包住（配了上游时里面还有徽标），
+    // 而那个容器的 className 也含 `_dsh_ofb_chip` 子串——不排除它会把同一个芯片数两次。
+    const isChip = (cls) => {
+      const parts = String(cls).split(/\s+/)
+      return parts.includes('_dsh_ofb_chip') || parts.includes('_dsh_ofb_chip_on')
+    }
     const walk = (current) => {
       if (!current || typeof current !== 'object') return
       if (Array.isArray(current)) return current.forEach(walk)
-      if (String(current.props?.className ?? '').includes('_dsh_ofb_chip')) found.push(current)
+      if (isChip(current.props?.className ?? '')) found.push(current)
       ;(current.children ?? []).forEach(walk)
     }
     walk(node)
@@ -1431,8 +1443,8 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
   const rowA = rowText(tree, MASK_A)
   check('F1 deepseek 上被限的 key 在 glm 视图下显示「可用」', rowA.includes('可用') && !rowA.includes('冷却中'), rowA.replace(/\n/g, ' | '))
   check('F2 glm 视图下不出现 deepseek 的冷却记录', !tableText(tree).includes('deepseek'), tableText(tree).replace(/\n/g, ' | ').slice(0, 120))
-  check('F3 用量按模型分开：glm 视图显示 glm 的计数', rowA.includes('3/3/0'), rowA.replace(/\n/g, ' | '))
-  check('F4 另一把 key 显示自己的 glm 计数', rowText(tree, MASK_B).includes('21/21/0'), rowText(tree, MASK_B).replace(/\n/g, ' | '))
+  check('F3 glm 视图下该 key 的上游来自它自己的 glm 明细（deepinfra）', rowA.includes('deepinfra'), rowA.replace(/\n/g, ' | '))
+  check('F4 另一把 key 显示它自己在 glm 上的上游（togetherai）', rowText(tree, MASK_B).includes('togetherai'), rowText(tree, MASK_B).replace(/\n/g, ' | '))
   check('F5 概览卡随筛选变化（该模型可用 / 该模型冷却）', renderedText().includes('该模型可用') && renderedText().includes('该模型冷却'), textOf(tree).filter((s) => s.includes('该模型')).join(' | '))
 
   const chips = chipsOf(tree).map((c) => textOf(c).join(''))
@@ -1446,11 +1458,10 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
   const dsView = await clickChip('deepseek-v4.1-flash')
   const dsRow = rowText(dsView, MASK_A)
   check('F8 切到 deepseek 后该 key 显示冷却中并给出恢复倒计时', dsRow.includes('冷却中') && /2[01]h\d\dm/.test(dsRow), dsRow.replace(/\n/g, ' | '))
-  check('F9 切到 deepseek 后用量是 deepseek 的计数', dsRow.includes('16/15/2/1'), dsRow.replace(/\n/g, ' | '))
+  check('F9 切到 deepseek 后该 key 的上游换成它在 deepseek 上的（deepseek）', dsRow.includes('deepseek'), dsRow.replace(/\n/g, ' | '))
   check('F10 切回 glm 后该 key 恢复「可用」', rowText(tree, MASK_A).includes('可用'), rowText(tree, MASK_A).replace(/\n/g, ' | '))
   const dsOther = rowText(dsView, MASK_B)
-  check('F11 另一把在 deepseek 上没跑过：0/0/0 且无冷却，最近使用显示「从未」', dsOther.includes('0/0/0') && dsOther.includes('可用') && dsOther.includes('从未'), dsOther.replace(/\n/g, ' | '))
-
+  check('F11 另一把没在 deepseek 上跑过：上游显示「—」、可用、最近使用「从未」', dsOther.includes('—') && dsOther.includes('可用') && dsOther.includes('从未'), dsOther.replace(/\n/g, ' | '))
   // ── 按模型用量明细卡（用户要求：显示每个 key 的每个模型的用量）──
   // 面板恒定在某个模型的筛选下，所以这张卡每把 key 就一行：key 预览 + 数字，
   // 模型名不重复出现（它写在筛选芯片上），哈希标签也不再出现（内部标识）。
@@ -1492,21 +1503,28 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
     cardText(dsView).replace(/\n/g, ' | '))
   check('I6 切到 glm 时同一把 key 显示 glm 的计数', usageGlm.includes('1 sk-l…4444 3 3 0 0 4.5k 300'), usageGlm)
 
-  // ── Token 用量（用户真正要的是这个）──
-  const tokenRowOf = (node, label) => {
+  // ── 上游渠道列（第 1 张表的第 5 列，替代原「请求 / Token」）──
+  // 逐 key 显示各自在该模型上的实际上游。没观测到必须是「—」，
+  // 绝不退回别的模型的结论、也不假装知道。
+  const upstreamRowOf = (node, label) => {
     const body = findNode(node, (n) => n.type === 'tbody')
     const row = (body?.children ?? []).find((tr) => JSON.stringify(tr).includes(label))
     const cell = (row?.children ?? [])[4]
-    return textOf(cell).join(' | ')
+    return textOf(cell).join('')
   }
   check('I7 明细卡显示该模型的输入/输出 token',
     usageDsRow.includes('12.3k 1.2k'), usageDsRow)
-  check('I8 表格用量列第二行是该模型的 token（glm 视图）',
-    tokenRowOf(tree, MASK_A).includes('4.5k/300'), tokenRowOf(tree, MASK_A))
-  check('I9 切到 deepseek 后表格 token 跟着换成 deepseek 的',
-    tokenRowOf(dsView, MASK_A).includes('12.3k/1.2k'), tokenRowOf(dsView, MASK_A))
-  check('I10 该模型上没用过的 key：token 显示 0/0，不能退回全局总计',
-    tokenRowOf(dsView, MASK_B) === '0/0/0/0 | 0/0', tokenRowOf(dsView, MASK_B))
+  check('I8 上游列逐 key 各记各的（glm 视图：一把 deepinfra、一把 togetherai）',
+    upstreamRowOf(tree, MASK_A) === 'deepinfra' && upstreamRowOf(tree, MASK_B) === 'togetherai',
+    `${upstreamRowOf(tree, MASK_A)} / ${upstreamRowOf(tree, MASK_B)}`)
+  check('I9 切到 deepseek 后该 key 的上游跟着换成它在 deepseek 上的',
+    upstreamRowOf(dsView, MASK_A) === 'deepseek', upstreamRowOf(dsView, MASK_A))
+  check('I10 该模型上没观测过的 key：上游显示「—」，不退回别的模型的结论',
+    upstreamRowOf(dsView, MASK_B) === '—', upstreamRowOf(dsView, MASK_B))
+  // 模型维度的观测（alibaba）绝不能漏到每一行——那会把「模型漂了」显示成「每把 key 都漂了」
+  check('I10b 芯片徽标用模型维度的观测，但表格各行用各自 key 的数据（互不串味）',
+    upstreamRowOf(tree, MASK_A) !== 'alibaba' && upstreamRowOf(tree, MASK_B) !== 'alibaba',
+    `${upstreamRowOf(tree, MASK_A)} / ${upstreamRowOf(tree, MASK_B)}`)
 
   // ── 可视化：占比条与合计 ──
   const barsOf = (node) => {
@@ -1715,8 +1733,8 @@ async function renderPanel(payload, { fetchError = null, locale = 'zh-CN' } = {}
   }
   const headers = table_headers(tree)
   let useButtons = collectUseButtons(tree)
-  check('X1 表格末尾新增「使用」列，每行一个按钮',
-    headers.join('|') === '#|Key|状态|冷却 / 恢复|请求 / Token|最近使用|使用' && useButtons.length === 2,
+  check('X1 表格末尾有「使用」列，每行一个按钮（且第 5 列已是上游渠道）',
+    headers.join('|') === '#|Key|状态|冷却 / 恢复|上游渠道|最近使用|使用' && useButtons.length === 2,
     `${headers.join('|')} buttons=${useButtons.length}`)
   const activeButton = useButtons.find((n) => String(n.props.className).includes('_on'))
   check('X2 当前模型选中的那把显示「使用中」并带 aria-pressed（其余显示「使用」）',

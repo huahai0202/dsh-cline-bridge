@@ -86,21 +86,22 @@ export function apply(ctx, config) {
   /**
    * 从一次响应的文本里记下实际上游。失败一律静默——观测绝不能影响请求本身。
    * `bodyText` 由调用方传入（它已经 clone 过一份给用量采集，这里直接用那份文本）。
+   * `label` 是这次实际发出去的那把 key 的 8 位标签：面板要按 key 显示「这把在走哪家」。
    */
-  const noteUpstream = (model, bodyText) => {
+  const noteUpstream = (model, bodyText, label) => {
     if (!monitoredUpstream(model)) return
     const upstream = readUpstream(bodyText)
-    if (upstream) upstreamLog.note(model, upstream)
+    if (upstream) upstreamLog.note(model, upstream, label)
   }
 
   /**
    * 读一次响应并把上游记下来。这是唯一的调用入口，避免各处自己 clone/parse。
    * 429 报文里没有路由信息，所以只在真正拿到 2xx 的出路调用。
    */
-  const observeUpstream = async (model, response) => {
+  const observeUpstream = async (model, response, label) => {
     if (!monitoredUpstream(model)) return
     try {
-      noteUpstream(model, await response.clone().text())
+      noteUpstream(model, await response.clone().text(), label)
     } catch {
       // 观测失败不影响请求
     }
@@ -435,7 +436,7 @@ export function apply(ctx, config) {
         } else if (currentKey) pool.markFailed(currentKey, model)
         // 记下这次实际上是哪个上游服务的（只读观测，面板据此显示）。
         // 只在这一条出路做：429/5xx 的报文里没有路由信息，拿了也是白拿。
-        if (response.ok) await observeUpstream(model, response)
+        if (response.ok) await observeUpstream(model, response, currentKey ? keyLabel(currentKey) : '')
         decide(`pass-through status=${response.status}`)
         // 顺手把这轮响应的 token 用量记到「key + 模型」上（失败静默，不影响请求）
         return currentKey ? tapUsage(response, (usage) => pool.markTokens(currentKey, model, normalizeUsage(usage))) : response
@@ -487,7 +488,7 @@ export function apply(ctx, config) {
             // 一直标着一把已经限流的 key，而实际在用的是另一把。没选定的模型不受影响。
             if (pool.followRotation(model, next.key)) log(`已把 ${model} 的「使用中」改为 ${next.label}（原选定已限流）`)
             // 重发成功这条也要记上游（首发送撞 429，真正跑通的是这一次）
-            await observeUpstream(model, retried)
+            await observeUpstream(model, retried, keyLabel(next.key))
           } else {
             // 换 key 后拿到的是 4xx/5xx：这次轮换并没有「恢复」，别把它计成成功，
             // 也别把冷却清掉——留着继续试池里下一把。

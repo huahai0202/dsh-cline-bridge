@@ -103,22 +103,60 @@ const call = async (key, model, body) => {
 }
 
 // ── A. readUpstream：只认实测过的形状，读不到就返回 null ─────────────
+//
+// A2–A4 是最要紧的：生产走的是**流式**（DSH 用 stream:true），而流式响应有两处和非流式
+// 不一样——① chunk **没有 `data` 包裹**（choices 直接在顶层）；② 路由挂在 **`delta`** 上
+// 而不是 `message` 上。早期实现只认「非流式那一种」，导致功能对真实流量**静默失效**；
+// 而所有用 stream:false 写的探针全绿，极难发现。这几条就是那次事故的回归锁。
 {
-  check('A1 正常回包能读出实际上游与兜底家数',
+  const routing = { finalProvider: 'deepseek', fallbacksAvailable: ['alibaba', 'novita'] }
+  const chunk = (o) => 'data: ' + JSON.stringify(o) + '\n\n'
+  // 真实流式 chunk 的形状：无 data 包裹 + 路由挂 delta
+  const streamChunk = (r) => chunk({
+    id: 'gen_x',
+    object: 'chat.completion.chunk',
+    model: 'deepseek/deepseek-v4.1-flash',
+    choices: [{ index: 0, delta: { provider_metadata: { gateway: { routing: r } } } }],
+  })
+
+  check('A1 非流式回包（data.choices[0].message）能读出上游',
     (() => {
       const u = readUpstream(replyWith({ finalProvider: 'deepseek', fallbacksAvailable: ['a', 'b', 'c'] }))
       return u?.provider === 'deepseek' && u.fallbacks === 3
     })())
 
-  check('A2 没有 provider_metadata 时返回 null（看不到 ≠ 某一家）',
+  check('A2 真实流式 chunk（无 data 包裹 + 路由挂 delta）能读出上游',
+    (() => {
+      const u = readUpstream(streamChunk(routing) + 'data: [DONE]\n\n')
+      return u?.provider === 'deepseek' && u.fallbacks === 2 && u.servedModel === 'deepseek/deepseek-v4.1-flash'
+    })(), JSON.stringify(readUpstream(streamChunk(routing))))
+
+  check('A3 流式路由在中间 chunk 时也能找到（不只扫首尾）',
+    (() => {
+      const text = chunk({ choices: [{ delta: { content: 'Hi' } }] })
+        + streamChunk(routing)
+        + chunk({ choices: [{ delta: { content: '!' }, finish_reason: 'stop' }] })
+        + 'data: [DONE]\n\n'
+      return readUpstream(text)?.provider === 'deepseek'
+    })())
+
+  check('A4 坏 chunk 不阻断后续 chunk 的解析',
+    readUpstream('data: not-json\n\n' + streamChunk(routing))?.provider === 'deepseek')
+
+  check('A5 只有 [DONE] 的流返回 null（不猜）', readUpstream('data: [DONE]\n\n') === null)
+  check('A6 流式 chunk 里没有路由信息时返回 null',
+    readUpstream(chunk({ choices: [{ delta: { content: 'hi' } }] }) + 'data: [DONE]\n\n') === null)
+  check('A7 流式里 finalProvider 为空串时返回 null',
+    readUpstream(streamChunk({ finalProvider: '', fallbacksAvailable: ['a'] })) === null)
+
+  check('A8 没有 provider_metadata 时返回 null（看不到 ≠ 某一家）',
     readUpstream(JSON.stringify({ data: { choices: [{ message: {} }] } })) === null)
-  check('A3 finalProvider 为空串时返回 null', readUpstream(replyWith({ finalProvider: '' })) === null)
-  check('A4 非 JSON 返回 null 且不抛错', readUpstream('not json') === null)
-  check('A5 空/非字符串输入返回 null',
+  check('A9 非 JSON 返回 null 且不抛错', readUpstream('not json') === null)
+  check('A10 空/非字符串输入返回 null',
     readUpstream('') === null && readUpstream(undefined) === null && readUpstream(123) === null)
-  check('A6 没有 fallbacksAvailable 时家数为 0（不谎报有兜底）',
+  check('A11 没有 fallbacksAvailable 时家数为 0（不谎报有兜底）',
     readUpstream(replyWith({ finalProvider: 'deepseek' }))?.fallbacks === 0)
-  check('A7 provider 名两端空白被清掉',
+  check('A12 provider 名两端空白被清掉',
     readUpstream(replyWith({ finalProvider: '  deepseek  ' }))?.provider === 'deepseek')
 }
 
