@@ -101,7 +101,7 @@ export function apply(ctx, config) {
     if (upstream) {
       upstreamLog.note(model, upstream, label)
       // 落盘（去抖由 store 统一管）：label\u0000model 为键，key 用 8 位标签不含原文
-      if (label) quotaStore.setUpstream(`${label}\u0000${model}`, upstream)
+      if (label) quotaStore.setUpstream(`${label}\u0000${model}`, { ...upstream, at: Date.now() })
     }
   }
 
