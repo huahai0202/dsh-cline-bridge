@@ -229,10 +229,10 @@ const call = async (key, model, body) => {
     (() => { log.note(MONITORED, { provider: '' }, 'cccc3333'); return log.getForKey('cccc3333', MONITORED) === undefined })())
 
   check('B11 观测名单与预期上游表逐一对应（名单里的模型都有预期值）',
-    MONITORED_UPSTREAM_MODELS.length === 2 &&
+    MONITORED_UPSTREAM_MODELS.length === 3 &&
       MONITORED_UPSTREAM_MODELS.every((m) => typeof PREFERRED_UPSTREAM[m] === 'string' && PREFERRED_UPSTREAM[m]),
     MONITORED_UPSTREAM_MODELS.join(','))
-  check('B12 预期上游表覆盖 deepseek 与 glm（glm 锁定在 Parasail）',
+  check('B12 预期上游表覆盖 deepseek、glm 与 kimi（glm 锁定在 Parasail，kimi 预期 baseten）',
     PREFERRED_UPSTREAM['cline-free/deepseek-v4.1-flash'] === 'deepseek' &&
       PREFERRED_UPSTREAM['z-ai/glm-5.3-flash'] === 'Parasail')
 }
