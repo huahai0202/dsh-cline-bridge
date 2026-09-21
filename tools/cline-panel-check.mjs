@@ -719,7 +719,7 @@ const ctxStatusOf = (options) => lastCtx?.__dshClineBridge?.status?.(options)
 // 槽位用尽：明确拒绝并说明原因，而不是静默丢掉
 {
   const credsFile = join(TEST_STATE_DIR, `import-full-${++credsSeq}.yaml`)
-  for (let i = 2; i <= 10; i++) writeCredentialRefToFile(credsFile, `CLINE_API_KEY_${i}`, `sk-filler-${i}-`.padEnd(40, 'z'))
+  for (let i = 2; i <= 12; i++) writeCredentialRefToFile(credsFile, `CLINE_API_KEY_${i}`, `sk-filler-${i}-`.padEnd(40, 'z'))
   mount({ clineKeys: [], credentialsFile: credsFile })
   const full = await importPost({ body: JSON.stringify({ keys: SECRET_C }) })
   check('L20 空闲槽位用尽时明确拒绝（no-free-ref）',
@@ -773,8 +773,8 @@ const ctxStatusOf = (options) => lastCtx?.__dshClineBridge?.status?.(options)
   check('L27 全部槽位状态不明时一把都不导入',
     blind.status === 200 && blind.json?.imported?.length === 0 && blind.json?.rejected?.[0]?.reason === 'no-free-ref',
     JSON.stringify(blind.json ?? {}).slice(0, 120))
-  check('L28 回包如实列出状态不明的槽位（9 个）',
-    blind.json?.refsUnknown?.length === 9 && blind.json.refsUnknown.every((ref) => /^CLINE_API_KEY_\d+$/.test(ref)),
+  check('L28 回包如实列出状态不明的槽位（11 个）',
+    blind.json?.refsUnknown?.length === 11 && blind.json.refsUnknown.every((ref) => /^CLINE_API_KEY_\d+$/.test(ref)),
     JSON.stringify(blind.json?.refsUnknown))
   check('L29 一个槽位都没写（文件根本没被创建）', setCalls === 0 && !existsSync(credsFile), `setCalls=${setCalls}`)
   check('L30 回包依然不含 Key 原文', !blind.body.includes(SECRET_C))
