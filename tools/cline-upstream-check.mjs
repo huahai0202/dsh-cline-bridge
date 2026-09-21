@@ -232,7 +232,7 @@ const call = async (key, model, body) => {
     MONITORED_UPSTREAM_MODELS.length === 3 &&
       MONITORED_UPSTREAM_MODELS.every((m) => typeof PREFERRED_UPSTREAM[m] === 'string' && PREFERRED_UPSTREAM[m]),
     MONITORED_UPSTREAM_MODELS.join(','))
-  check('B12 预期上游表覆盖 deepseek、glm 与 kimi（glm 锁定在 Parasail，kimi 预期 baseten）',
+  check('B12 预期上游表覆盖 deepseek、glm 与 kimi（glm 锁定在 Parasail，kimi 预期 Cline 自托管端点）',
     PREFERRED_UPSTREAM['cline-free/deepseek-v4.1-flash'] === 'deepseek' &&
       PREFERRED_UPSTREAM['z-ai/glm-5.3-flash'] === 'Parasail')
 }

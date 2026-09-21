@@ -1,6 +1,6 @@
 {
   "name": "dsh-cline-bridge",
-  "version": "2.9.4",
+  "version": "2.9.5",
   "description": "Cline channel bridge for DeepSeek Harness (DSH): official client headers, read-only upstream (provider) reporting, multi-key failover that survives the per-key daily free limit, and a settings panel with cross-restart per-key usage stats.",
   "type": "module",
   "main": "index.js",
