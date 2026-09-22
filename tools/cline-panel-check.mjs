@@ -106,6 +106,10 @@ let lastCtx
 const routes = []
 // 插件通过 ctx.inject(['credentials']) 订阅的监听器（凭据变更 → 立刻重扫 Key 池）
 const credentialListeners = []
+// 插件通过 ctx.inject(['settings']) 订阅的监听器（0.1.7+ 的条目变更 → 主 Key 热重挂）
+const settingsListeners = []
+// 最近一次挂载的设置值表（describe() 的源）：测试直接改它再发事件，模拟「用户改了设置」
+let lastSettingsValues
 let credsSeq = 0
 
 /** 凭据服务的替身：读写都落到一个真实临时文件上（用插件自己的读写函数），
@@ -152,7 +156,23 @@ function mount(config = {}) {
   dispose()
   routes.length = 0
   credentialListeners.length = 0
+  settingsListeners.length = 0
   const settingsValues = { 'llm-pi-ai': SETTINGS_TABLE, 'agent-default-model': AGENT_DEFAULT, ...(config.__settingsValues ?? {}) }
+  lastSettingsValues = settingsValues
+  // 默认给新版设置服务（DSH 0.1.7+ 的 SettingsForms：只有表单式 describe()，没有 get(ns)）；
+  // __legacySettings 切回旧版 get(ns) 直读——两条读取路径都要被锁死。
+  const settingsService = config.__legacySettings
+    ? { get: (ns) => settingsValues[ns] }
+    : {
+        describe: () =>
+          Object.entries(settingsValues).map(([ns, value]) => ({
+            ns,
+            value,
+            autoGenerate: true,
+            revision: 1,
+            applies: 'live',
+          })),
+      }
   // 每次挂载一个全新的凭据文件：导入测试之间不互相污染（config 里显式给了就用它的）
   const credentialsFile = config.credentialsFile ?? join(TEST_STATE_DIR, `creds-${++credsSeq}.yaml`)
   // __credentials 允许测试注入「会出故障」的凭据服务（比如 resolve 全部抛错），
@@ -169,8 +189,9 @@ function mount(config = {}) {
         if (config.__noSettings) return undefined // 模拟 settings 服务缺席
         return callback({
           effect: (factory) => factory(),
-          get: (name) => (name === 'settings' ? { get: (ns) => settingsValues[ns] } : undefined),
-          settings: { get: (ns) => settingsValues[ns] },
+          get: (name) => (name === 'settings' ? settingsService : undefined),
+          settings: settingsService,
+          on: (event, fn) => { if (event === 'settings/document-updated') settingsListeners.push(fn) },
         })
       }
       if (deps.includes('credentials')) {
@@ -1023,6 +1044,73 @@ const ctxStatusOf = (options) => lastCtx?.__dshClineBridge?.status?.(options)
     String(keys.find((k) => k.label === label8(SECRET_B))?.source))
   check('W4 载荷里依然没有 key 原文', !r.body.includes(SECRET_A) && !r.body.includes(SECRET_B))
   check('W5 settings 缺席时也不报错（静默跳过）', r.status === 200, `status=${r.status}`)
+}
+
+// ───────────────── 4j. 设置服务新旧两代 API 的兼容 ─────────────────
+// DSH 0.1.7 把设置服务从 settings.get(ns) 换成表单式 SettingsForms.describe()。
+// 上面的 G/W 组走的都是新版（mount 默认 describe() 形态），这里锁旧版路径不死。
+{
+  // 注意 baseURL 必须命中本用例的 clineMatch（与 G 组同判据），否则配置模型本就不该列出
+  mount({
+    __legacySettings: true,
+    __settingsValues: {
+      'llm-pi-ai': {
+        providers: {
+          cline: { displayName: 'Cline', apiKeyEnv: 'CLINE_API_KEY', baseURL: `http://${match}/api/v1`, models: [{ id: 'cline-free/deepseek-v4.1-flash' }, { id: 'z-ai/glm-5.3-flash' }] },
+        },
+      },
+    },
+  })
+  const legacy = await callRoute()
+  const legacyIds = (legacy.json.models ?? []).map((m) => m.id)
+  check('X1 旧版 settings.get(ns) 路径仍能列出配置模型',
+    legacyIds.includes('cline-free/deepseek-v4.1-flash') && legacyIds.includes('z-ai/glm-5.3-flash'),
+    legacyIds.join(' | '))
+  check('X2 旧版路径下默认筛选仍能读 agent-default-model',
+    legacy.json.currentModel === 'z-ai/glm-5.3-flash', String(legacy.json.currentModel))
+}
+
+// ───────────────── 4k. settings/document-updated：主 Key 热重挂 ─────────────────
+// 新版设置服务在条目变更时发事件：用户把 Cline 提供方的 apiKeyEnv 改到另一个 ref 时，
+// 插件要立刻把新主 Key 挂进池子，而不是等重启 / 等下一条请求。
+{
+  const credsFile = join(TEST_STATE_DIR, `main-key-live-${++stateSeq}.yaml`)
+  // CLINE_MAIN_ROTATED 不在额外 key 名单（CLINE_API_KEY_2..12）里：它若能出现在池子里，
+  // 只可能是「主 Key 热重挂」这一条路径带进来的。
+  writeFileSync(credsFile, 'version: 1\nrefs:\n  CLINE_API_KEY: "' + SECRET_A + '"\n  CLINE_MAIN_ROTATED: "' + SECRET_C + '"\n', 'utf8')
+  // 设置表里的 Cline baseURL 必须命中本用例的 clineMatch（与 4i 同理），否则找不到主 Key 的 ref
+  mount({
+    clineKeys: [],
+    credentialsFile: credsFile,
+    __settingsValues: {
+      'llm-pi-ai': { providers: { cline: { displayName: 'Cline', apiKeyEnv: 'CLINE_API_KEY', baseURL: `http://${match}/api/v1`, models: [{ id: 'cline-free/deepseek-v4.1-flash' }] } } },
+    },
+  })
+  await new Promise((r) => setTimeout(r, 30)) // 主 Key 的解析挂在微任务上，等它落地
+  const before = await callRoute()
+  check('Y1 挂载即入池走的是新版 describe() 路径',
+    (before.json.keys ?? []).some((k) => k.label === label8(SECRET_A)),
+    JSON.stringify((before.json.keys ?? []).map((k) => k.label)))
+  check('Y2 插件订阅了 settings/document-updated（恰好一条）', settingsListeners.length === 1, `listeners=${settingsListeners.length}`)
+
+  // 用户把 Cline 提供方的 apiKeyEnv 改到 CLINE_MAIN_ROTATED → 服务发事件 → 插件热重挂
+  lastSettingsValues['llm-pi-ai'] = {
+    providers: { cline: { displayName: 'Cline', apiKeyEnv: 'CLINE_MAIN_ROTATED', baseURL: `http://${match}/api/v1`, models: [{ id: 'cline-free/deepseek-v4.1-flash' }] } },
+  }
+  for (const fn of settingsListeners) fn('llm-pi-ai')
+  await new Promise((r) => setTimeout(r, 30))
+  const after = await callRoute()
+  const labels = (after.json.keys ?? []).map((k) => k.label)
+  check('Y3 apiKeyEnv 变更后新主 Key 立刻进池（不等重启）',
+    labels.includes(label8(SECRET_C)) && labels.includes(label8(SECRET_A)), labels.join(' | '))
+
+  // 无关命名空间的变更不该触发重挂（过滤按 ns 精确匹配）
+  for (const fn of settingsListeners) fn('agent-default-model')
+  await new Promise((r) => setTimeout(r, 30))
+  const afterUnrelated = await callRoute()
+  check('Y4 无关命名空间的变更不搅乱池子',
+    (afterUnrelated.json.keys ?? []).map((k) => k.label).join(',') === labels.join(','),
+    (afterUnrelated.json.keys ?? []).map((k) => k.label).join(','))
 }
 
 // 主机半边测完再关 mock 服务器（G 组还要发请求，不能提前关）

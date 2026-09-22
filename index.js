@@ -29,6 +29,7 @@ import { createUpstreamLog, readUpstream } from './lib/host/upstream.js'
 import { injectPinnedProvider, parsePinUpstream } from './lib/host/pin.js'
 import { normalizeUsage, tapUsage } from './lib/host/usage.js'
 import { createKeyPool } from './lib/host/key-pool.js'
+import { readSettingsValue } from './lib/host/settings-table.js'
 import { buildStatus, clineApiKeyEnvOf } from './lib/host/status.js'
 import { isTrustedRequest, readJsonBody, sendJson, sendJsonConditional } from './lib/host/http.js'
 import { readCredentialRefsFromFile, writeCredentialRefToFile } from './lib/host/credentials.js'
@@ -181,6 +182,12 @@ const quotaStore = createQuotaStore(resolveQuotaStatePath(config), {
   let settingsService
   ctx.inject(['settings'], (settingsCtx) => {
     settingsService = settingsCtx.get('settings') ?? settingsCtx.settings
+    // 新版设置服务（0.1.7+ 的 SettingsForms）在条目变更时发 settings/document-updated：
+    // 用户在 DSH 设置里改了 Cline 提供方的 apiKeyEnv / 模型表后立刻重挂主 Key，
+    // 不必等凭据事件或重启。旧版服务没有这条事件，挂上后永不触发，无害。
+    settingsCtx.on?.('settings/document-updated', (ns) => {
+      if (ns === 'llm-pi-ai') scheduleMainKeyRegistration()
+    })
     scheduleMainKeyRegistration()
   })
 
@@ -243,13 +250,10 @@ const quotaStore = createQuotaStore(resolveQuotaStatePath(config), {
     })
   }
 
-  /** settings 快照只读一次；服务缺席或命名空间未注册时返回 undefined，绝不抛错。 */
+  /** settings 快照只读一次；服务缺席或命名空间未注册时返回 undefined，绝不抛错。
+   *  新旧两代设置服务 API 的兼容读取在 settings-table.js 里（旧版 get(ns)，新版 describe()）。 */
   function safeSettingsTable() {
-    try {
-      return settingsService?.get?.('llm-pi-ai')
-    } catch {
-      return undefined
-    }
+    return readSettingsValue(settingsService, 'llm-pi-ai')
   }
 
   globalThis.fetch = async function (input, init) {
