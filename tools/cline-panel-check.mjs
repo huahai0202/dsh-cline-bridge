@@ -44,6 +44,13 @@ const SECRET_D = 'sk-import-DDDD5555EEEE6666FFFF7777AAAA8888'
 const MASK_C = `${SECRET_C.slice(0, 4)}…${SECRET_C.slice(-4)}`
 const MASK_D = `${SECRET_D.slice(0, 4)}…${SECRET_D.slice(-4)}`
 
+// 桌面版外壳（Electron）转发来的请求形状：页面在自定义协议 `dsh-app://app` 下，
+// Chromium 不发 Referer，外壳（forwardWebRequest）又删掉 origin 与 sec-fetch-site，
+// 只留 Host 的会话 cookie 与 Electron 版 UA。这两条 UA 把「外壳」与「普通浏览器」
+// 钉进 H7b–H7e / L34–L35 / P14b 的信任校验断言里。
+const ELECTRON_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.7871.212 Electron/44.0.0 Safari/537.36'
+const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.7871.212 Safari/537.36'
+
 /** SECRET_A 只在这个模型上撞每日上限；换到别的模型它仍然可用。 */
 const CAP_ONLY_MODEL = 'cline-free/deepseek-v4.1-flash'
 
@@ -330,8 +337,17 @@ const ctxStatusOf = (options) => lastCtx?.__dshClineBridge?.status?.(options)
 
   const untrusted = await callRoute({ referer: 'http://evil.example/x' })
   check('H6 非同源 Referer 被拒（403）', untrusted.status === 403, `status=${untrusted.status}`)
-  const noReferer = await callRoute({ referer: '' })
-  check('H7 缺失 Referer 也被拒（403）', noReferer.status === 403, `status=${noReferer.status}`)
+  const noReferer = await callRoute({ referer: '', headers: { 'user-agent': BROWSER_UA } })
+  check('H7 缺失 Referer 的普通浏览器请求仍被拒（403）', noReferer.status === 403, `status=${noReferer.status}`)
+  const desktopShell = await callRoute({ referer: '', headers: { 'user-agent': ELECTRON_UA, 'sec-fetch-mode': 'cors' } })
+  check('H7b 桌面版外壳形状（无 Referer/Origin、Electron UA）放行（200）',
+    desktopShell.status === 200 && desktopShell.json?.plugin === 'dsh-cline-bridge', `status=${desktopShell.status}`)
+  const desktopReferer = await callRoute({ referer: 'dsh-app://app/index.html' })
+  check('H7c 桌面版自定义协议 Referer 也放行（200）', desktopReferer.status === 200, `status=${desktopReferer.status}`)
+  const desktopWithOrigin = await callRoute({ referer: '', headers: { 'user-agent': ELECTRON_UA, origin: 'http://evil.example' } })
+  check('H7d 桌面版 UA 但带跨站 Origin 被拒（403）', desktopWithOrigin.status === 403, `status=${desktopWithOrigin.status}`)
+  const desktopCrossSite = await callRoute({ referer: '', headers: { 'user-agent': ELECTRON_UA, 'sec-fetch-site': 'cross-site' } })
+  check('H7e 桌面版 UA 但声明 cross-site 被拒（403）', desktopCrossSite.status === 403, `status=${desktopCrossSite.status}`)
   const wrongMethod = await callRoute({ method: 'POST' })
   check('H8 非 GET/HEAD 被拒（405）', wrongMethod.status === 405, `status=${wrongMethod.status}`)
   const head = await callRoute({ method: 'HEAD' })
@@ -772,6 +788,19 @@ const ctxStatusOf = (options) => lastCtx?.__dshClineBridge?.status?.(options)
   check('L25 凭据变更后立刻重扫池子（不必等 TTL 节流）', keys.some((k) => k.label === label8(SECRET_C)), keys.map((k) => k.label).join(','))
 }
 
+// 桌面版外壳（Electron，dsh-app://app）的写路由：Chromium 对自定义协议页面不发 Referer，
+// 外壳转发时又删掉 origin 与 sec-fetch-site。只读面板放行了，写路由也必须放行，
+// 否则桌面版里「导入 Key / 重置统计 / 选定」三个按钮全部点不动。
+{
+  const credsFile = join(TEST_STATE_DIR, `import-desktop-${++credsSeq}.yaml`)
+  mount({ clineKeys: [SECRET_A], credentialsFile: credsFile, skipCoolingRequestKey: true })
+  const desktop = await importPost({ referer: '', headers: { 'user-agent': ELECTRON_UA, 'sec-fetch-mode': 'cors' }, body: JSON.stringify({ keys: SECRET_C }) })
+  check('L34 桌面版外壳形状（无 Referer/Origin、Electron UA）也能导入（200）',
+    desktop.status === 200 && desktop.json?.imported?.length === 1, `status=${desktop.status} imported=${desktop.json?.imported?.length}`)
+  check('L35 桌面版外壳的导入同样落到凭据文件',
+    readCredentialRefsFromFile(credsFile, ['CLINE_API_KEY_2']).get('CLINE_API_KEY_2') === SECRET_C)
+}
+
 // 解析器的边角：引号包裹、Bearer 前缀、逗号/分号分隔
 {
   const parsed = parseKeyInput('"sk-quoted1111"\nBearer sk-bearer2222\nsk-aaaa1111,sk-bbbb2222;sk-cccc3333')
@@ -944,6 +973,8 @@ const ctxStatusOf = (options) => lastCtx?.__dshClineBridge?.status?.(options)
   await new Promise((r) => setTimeout(r, 5))
   const reset = await callRoute({ path: RESET_PATH, method: 'POST', contentType: 'application/json', body: '{}' })
   check('P14 重置返回 200 且计数清零', reset.status === 200 && reset.json.totals.clineRequests === 0 && reset.json.totals.rotations === 0 && reset.json.totals.failFasts === 0, JSON.stringify(reset.json.totals))
+  const desktopReset = await callRoute({ path: RESET_PATH, method: 'POST', contentType: 'application/json', referer: '', headers: { 'user-agent': ELECTRON_UA }, body: '{}' })
+  check('P14b 桌面版外壳形状（无 Referer、Electron UA）下重置也放行（200）', desktopReset.status === 200, `status=${desktopReset.status}`)
   const afterReset = await callRoute()
   check('P15 重置后每把 key 的计数与 token 归零',
     (afterReset.json.keys ?? []).every((k) => k.stats.sent === 0 && k.stats.ok === 0 && k.stats.limited === 0 && k.stats.tokens.input === 0 && k.models?.[CAP_ONLY_MODEL]?.tokens?.input === 0),

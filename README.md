@@ -214,14 +214,16 @@ refs:
 >
 > | 路由 | 用途 | 闸门 |
 > | --- | --- | --- |
-> | `GET /dsh-cline-bridge/keys` | **只读**：把池状态交给浏览器半边渲染 | 同源 `Referer` 校验；只允许 `GET`/`HEAD`。只下发哈希标签、掩码预览、来源标签、冷却时刻与计数——**不回显 `config.clineKeys`**，也不含任何 Key 原文；掩码只在内存里现算，磁盘状态文件里连掩码都没有。带 `ETag`，内容未变时回 `304` |
-> | `POST /dsh-cline-bridge/keys/import` | **写**：把面板里粘贴的 Key 写进备用槽位 | 同源 `Referer` 校验；只允许 `POST`；必须 `application/json`（挡住表单/文本这类无需预检的跨站简单请求）；正文上限 64KB；可用 `keyImport: false` 整条关掉。回包只有 ref、哈希标签与掩码 |
+> | `GET /dsh-cline-bridge/keys` | **只读**：把池状态交给浏览器半边渲染 | 本机信任校验（见下）；只允许 `GET`/`HEAD`。只下发哈希标签、掩码预览、来源标签、冷却时刻与计数——**不回显 `config.clineKeys`**，也不含任何 Key 原文；掩码只在内存里现算，磁盘状态文件里连掩码都没有。带 `ETag`，内容未变时回 `304` |
+> | `POST /dsh-cline-bridge/keys/import` | **写**：把面板里粘贴的 Key 写进备用槽位 | 同一套本机信任校验；只允许 `POST`；必须 `application/json`（挡住表单/文本这类无需预检的跨站简单请求）；正文上限 64KB；可用 `keyImport: false` 整条关掉。回包只有 ref、哈希标签与掩码 |
 > | `POST /dsh-cline-bridge/keys/stats/reset` | **写**：把累计统计归零 | 与导入同一套闸门（`keyImport: false` 一并关掉）。只动统计，不动冷却，也不动凭据 |
 > | `POST /dsh-cline-bridge/keys/select` | **写**：为某个模型选定 / 取消「使用中」的 Key | 与导入同一套闸门（`keyImport: false` 一并关掉）；正文上限 1KB。正文是 `{ model, label }`：模型名必须像模型（`???` / `*` 一律 400），标签必须是**池内已知的 8 位标签**，空标签＝取消该模型的选定（幂等）；回包只有模型名与标签，且在只读载荷（`selection`：model → 标签）里同步可见。不写凭据、不改 DSH 配置 |
 >
-> 四条路由都只在 `ctx.inject(['webServer'], …)` 的子 fiber 里注册，headless / acp / desktop 这些没有 `webServer` 的 profile 里它们一起缺席，主链路（fetch 补丁）不受影响。全程用 `node tools/cline-panel-check.mjs` 断言：回包不含 Key 原文、写路由的每道闸门、以及磁盘状态文件里连掩码都没有。
+> 四条路由都只在 `ctx.inject(['webServer'], …)` 的子 fiber 里注册，headless / acp 这些没有 `webServer` 的 profile 里它们一起缺席，主链路（fetch 补丁）不受影响。全程用 `node tools/cline-panel-check.mjs` 断言：回包不含 Key 原文、写路由的每道闸门、以及磁盘状态文件里连掩码都没有。
 >
-> **不门控主链路**：路由等待 `webServer` 用的是 `ctx.inject([...])` 子 fiber，而不是模块级 `export const inject = ['webServer']`。后者会把整个插件（包括 fetch 补丁）门控在 webServer 上，让 headless / acp / desktop 等没有 webServer 的 profile 连渠道桥接一起失效。
+> **本机信任校验（两种请求形状）**：网页半边（`dsh web`）的请求走同源 `Referer`——`Referer` 的 host 必须等于请求的 `Host`。桌面版（Electron）的页面在自定义协议 `dsh-app://app` 下，Chromium 对自定义协议页面**不发 `Referer`**，外壳转发时还会删掉 `origin` 与 `sec-fetch-site`，只留 Host 的会话 cookie 与 Electron 版 UA——那时改用「无 `Referer`、无 `Origin`、非跨站 fetch 元数据、UA 是 `Electron/`」四项一起放行（v2.9.9 起）。对网页仍然关着：跨站请求必然带 `Origin`（CORS 模式）或 `sec-fetch-site: cross-site`，`no-referrer` 的跨站页面又伪造不了 UA。
+>
+> **不门控主链路**：路由等待 `webServer` 用的是 `ctx.inject([...])` 子 fiber，而不是模块级 `export const inject = ['webServer']`。后者会把整个插件（包括 fetch 补丁）门控在 webServer 上，让 headless / acp 等没有 webServer 的 profile 连渠道桥接一起失效。
 
 ---
 
@@ -465,7 +467,7 @@ Y 组是 v2.4.3 这一轮修复的回归锁：
 
 `cline-panel-check.mjs` 覆盖：
 
-- **主机半边**：路由只在 `ctx.inject(['webServer'])` 里注册（不门控主链路）、同源校验与 `GET`/`HEAD` 限制、载荷**不含任何 Key 原文**且只带首尾掩码、`maskKeyPreview: false` 时连片段也不下发、**磁盘状态文件里连掩码都没有**、用量计数与来源标签正确。
+- **主机半边**：路由只在 `ctx.inject(['webServer'])` 里注册（不门控主链路）、本机信任校验与 `GET`/`HEAD` 限制（同源 `Referer` 放行；无 `Referer` 的普通浏览器请求与跨站 `Origin`/`sec-fetch-site` 拒绝；**桌面版外壳形状——无 `Referer`/`Origin`、Electron UA——放行**，H7b–H7e / L34–L35 / P14b）、载荷**不含任何 Key 原文**且只带首尾掩码、`maskKeyPreview: false` 时连片段也不下发、**磁盘状态文件里连掩码都没有**、用量计数与来源标签正确。
 - **条件请求与载荷瘦身（H35–H42）**：只读路由回带 `ETag`；同一份载荷带 `If-None-Match` 再取回 **304**（不重传正文）；ETag 不匹配照常回 200；**内容一变旧 ETag 立即失效**（否则面板会停在旧数据上）；脏模型名（`???` / `---` / `*` / 超长 / 含换行）既不会变成筛选芯片、也不会成为当前模型；载荷里不再出现客户端从未读取的 `bodyLen` / `poolSize` / `extras` / `updatedAt`。
 - **导入写路由（L 组）**：非 `POST` → 405、非同源 → 403、非 JSON → 415、坏 JSON → 400、空正文 → 400、超 64KB → 413；正常导入落最小空闲槽位、**凭据文件里真的写对了**、池子**立刻**可见（不等 TTL）、回包只有 ref/标签/掩码、重复导入不占新槽位、脏输入按太短/太长/重复分类、槽位用尽回 `no-free-ref`、**凭据服务缺席时直写文件且保留 records 段**、凭据变更事件触发立刻重扫；**槽位状态不明时（L27–L33）**：凭据服务 `resolve` 全部抛错且文件兜底被关（`readCredentialsFile: false`）→ 一把都不导入、一个槽位都不写、回包如实列出 9 个 `refsUnknown`；文件兜底读得到时以文件为准——被占用的 `_2` 原值保留、新 Key 落到下一个空闲槽位 `_3`。
 - **统计持久化与重置（P 组）**：请求跑完后状态文件里出现按 8 位标签索引的 `usage` 与 `totals`（且**不含原文与掩码**）；换一个全新实例读同一份文件后，累计计数、每把 Key 的发送/成功/失败/限流、key 级与按模型的 token、统计起点、最近决策**全部还在**；重置路由的三道闸门，以及重置后「计数/token/最近决策归零、统计起点改到当下、冷却与额度不动、结果已落盘」。
